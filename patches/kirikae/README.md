@@ -96,3 +96,9 @@ A GPU cannot render into BC/ETC2/EAC/ASTC formats, so a block-compressed texture
 reuses an image of the same format class and is otherwise uploaded from memory. With
 KIRIKAE_TRACE_GPU on, each texture bind also logs which image it resolved to and whether
 that image is GPU-written. Runtime unit tests: 198 pass.
+
+## 0008 - rt: texture dump with raw bytes, header, and size matching (diagnostic)
+
+`KIRIKAE_TEX_DUMP=dir:` plus `KIRIKAE_TEX_DUMP_SIZE=WxH` dumps every texture of that size
+on each upload: decoded bytes (.bin), raw guest memory (.raw) and the texture header (.txt),
+so a bad texture can be decoded offline under other layouts.

@@ -1,0 +1,34 @@
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index 8ca8053..71ed7b2 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -268,14 +268,26 @@ impl Renderer {
+                 *level = crate::gpu::astc::decode(level, *w, *h, format.block_w, format.block_h);
+             }
+         }
++        // KIRIKAE_TEX_DUMP=dir:addr+addr picks textures by address; KIRIKAE_TEX_DUMP_SIZE=WxH
++        // (with KIRIKAE_TEX_DUMP=dir:) also picks every texture of that size. Each upload writes
++        // the decoded bytes (.bin), the raw guest bytes (.raw) and the header (.txt).
+         if let Some(spec) = crate::env_var!("KIRIKAE_TEX_DUMP")
+             && let Some((dir, cpu)) = spec.to_string_lossy().rsplit_once(':')
+-            && cpu.split('+').any(|c| u64::from_str_radix(c, 16).is_ok_and(|a| a == key.cpu || a == header.address))
++            && (cpu.split('+').any(|c| u64::from_str_radix(c, 16).is_ok_and(|a| a == key.cpu || a == header.address))
++                || crate::env_var!("KIRIKAE_TEX_DUMP_SIZE").is_some_and(|s| s.to_string_lossy() == format!("{}x{}", header.width, header.height)))
+         {
+             let frame = crate::display::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
++            let dir = std::path::Path::new(dir);
++            let stem = format!("{:x}_{:?}_{}x{}_f{frame}", header.address, key.format, key.width, key.height);
+             let bytes: Vec<u8> = data.iter().flat_map(|(_, _, l)| l.iter().copied()).collect();
+-            let name = format!("{:x}_{:?}_{}x{}_f{frame}.bin", header.address, key.format, key.width, key.height);
+-            let _ = std::fs::write(std::path::Path::new(dir).join(name), bytes);
++            let _ = std::fs::write(dir.join(format!("{stem}.bin")), bytes);
++            if let Some(raw) = texture_source(gpu, mem, header, format) {
++                let _ = std::fs::write(dir.join(format!("{stem}.raw")), raw);
++            }
++            let info = format!("address {:#x} cpu {:#x}\nlayout {:?}\nsize {}x{}x{} type {} levels {} ({}..={})\nformat {:?} block {}x{} {} bytes\ncomponents {:#x} data_type {} srgb {}\n",
++                header.address, key.cpu, header.layout, header.width, header.height, header.depth, header.texture_type, header.levels, header.min_level, header.max_level,
++                format.vk, format.block_w, format.block_h, format.block_bytes, header.components, header.data_type, header.srgb);
++            let _ = std::fs::write(dir.join(format!("{stem}.txt")), info);
+         }
+         self.upload_layers(key, levels as usize, &data);
+     }
