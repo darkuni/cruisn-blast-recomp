@@ -1,0 +1,42 @@
+diff --git a/crates/recomp/src/discover.rs b/crates/recomp/src/discover.rs
+index b5abfb6..a715580 100644
+--- a/crates/recomp/src/discover.rs
++++ b/crates/recomp/src/discover.rs
+@@ -278,8 +278,15 @@ pub fn build_function(space: &CodeSpace, entry: u64, entries: &BTreeSet<u64>) ->
+             continue;
+         }
+         let Some(insn) = space.lift(addr) else { continue };
++        // Falling into another function's entry (code after a noreturn call, or a
++        // function laid out right behind this one) leaves through the dispatcher
++        // instead of absorbing that function's body.
+         match insn.control() {
+-            Control::Fallthrough => work.push(insn.next()),
++            Control::Fallthrough => {
++                if internal(insn.next()) {
++                    work.push(insn.next());
++                }
++            }
+             Control::Jump(t) => {
+                 if internal(t) {
+                     leaders.insert(t);
+@@ -291,12 +298,16 @@ pub fn build_function(space: &CodeSpace, entry: u64, entries: &BTreeSet<u64>) ->
+                     leaders.insert(t);
+                     work.push(t);
+                 }
+-                leaders.insert(insn.next());
+-                work.push(insn.next());
++                if internal(insn.next()) {
++                    leaders.insert(insn.next());
++                    work.push(insn.next());
++                }
+             }
+             Control::Call(_) | Control::CallIndirect => {
+-                leaders.insert(insn.next());
+-                work.push(insn.next());
++                if internal(insn.next()) {
++                    leaders.insert(insn.next());
++                    work.push(insn.next());
++                }
+             }
+             Control::JumpIndirect => {
+                 for t in jump_table(space, addr).map_or_else(Vec::new, |(targets, _)| targets) {
