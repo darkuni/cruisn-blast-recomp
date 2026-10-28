@@ -21,3 +21,9 @@ link failed with R_X86_64_GOTPCREL out of range.
 
 With the patch those edges leave through the dispatcher, which enters the compiled
 function at that address, so control flow is unchanged. Kirikae's recompiler tests pass.
+
+## 0002 - rt: KIRIKAE_TRACE_FS and KIRIKAE_TRACE_EXIT
+
+Diagnostics. `KIRIKAE_TRACE_FS=1` logs each RomFS lookup (GetEntryType, OpenFile,
+OpenDirectory) and its result. `KIRIKAE_TRACE_EXIT=1` prints a guest frame-pointer
+backtrace when the game calls svcExitProcess. Off by default.

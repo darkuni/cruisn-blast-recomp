@@ -52,6 +52,28 @@ python3 tools/nsp_extract.py "update.nsp" --keys prod.keys --base "base.nsp" --o
 python3 tools/nsp_extract.py "base.nsp" --keys prod.keys --info
 ```
 
+## Building on Windows
+
+Needs git, Rust (rustup), Visual Studio Build Tools (C++ workload) and a Vulkan 1.3 GPU.
+From the folder holding `extracted_v2\` (full RomFS extracted) and `tools\`:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1
+powershell -ExecutionPolicy Bypass -File tools\run.ps1
+```
+
+`build_windows.ps1` clones Kirikae at `patches/kirikae/BASE_COMMIT`, applies the patches,
+builds it, and recompiles `extracted_v2` with `tools\cruisn-blast.profile`
+(generate it with `tools/il2cpp_profile.py`). `run.ps1` runs the result with exit
+backtraces and stats on, logging to `run.log`.
+
+## Status
+
+- Recompiles: 247,518 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links
+- Boots through Nintendo SDK init (about 100 threads, 17 services) under the recompiled code
+- Then Unity's `nnMain` returns and the process exits cleanly; the interpreter-only run
+  exits at the same point. Suspected cause on the headless test box: incomplete RomFS
+
 ## Plan
 
 1. Extract base + update (ExeFS, RomFS incl. patch RomFS)

@@ -1,0 +1,55 @@
+diff --git a/crates/rt/src/horizon.rs b/crates/rt/src/horizon.rs
+index fa7a372..b657889 100644
+--- a/crates/rt/src/horizon.rs
++++ b/crates/rt/src/horizon.rs
+@@ -72,6 +72,30 @@ fn dispatch(c: &mut Cpu, imm: u16) {
+         0x05 => unmap_memory(c),
+         0x06 => query_memory(c),
+         0x07 => {
++            if std::env::var_os("KIRIKAE_TRACE_EXIT").is_some() {
++                let p = c.process();
++                let mut msg = format!(
++                    "kirikae: svcExitProcess on thread {} at pc={} lr={}\n",
++                    c.thread.id,
++                    p.describe(c.pc),
++                    p.describe(c.x[30])
++                );
++                let mut fp = c.x[29];
++                for _ in 0..32 {
++                    let Some(rec) = p.memory.read(fp, 16) else { break };
++                    let next = u64::from_le_bytes(rec[..8].try_into().unwrap());
++                    let lr = u64::from_le_bytes(rec[8..].try_into().unwrap());
++                    if lr == 0 {
++                        break;
++                    }
++                    msg += &format!("    called from {}\n", p.describe(lr));
++                    if next <= fp {
++                        break;
++                    }
++                    fp = next;
++                }
++                eprint!("{msg}");
++            }
+             c.process().terminate(0);
+             c.halt();
+         }
+diff --git a/crates/rt/src/services/fs.rs b/crates/rt/src/services/fs.rs
+index 70abe19..0042ba4 100644
+--- a/crates/rt/src/services/fs.rs
++++ b/crates/rt/src/services/fs.rs
+@@ -250,7 +250,14 @@ impl Service for RomFileSystem {
+     fn call(&self, c: &mut Cpu, req: &Request) -> Reply {
+         match req.cmd {
+             7..=9 => match rom_path(c, req.x.first()) {
+-                Some(path) => self.lookup(req, &path),
++                Some(path) => {
++                    let r = self.lookup(req, &path);
++                    if std::env::var_os("KIRIKAE_TRACE_FS").is_some() {
++                        let op = ["GetEntryType", "OpenFile", "OpenDirectory"][req.cmd as usize - 7];
++                        eprintln!("fs: romfs {op}({path:?}) -> {:#x}", r.result);
++                    }
++                    r
++                }
+                 None => Reply::err(PATH_NOT_FOUND),
+             },
+             10 => Reply::ok(),
