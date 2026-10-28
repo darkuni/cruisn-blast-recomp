@@ -25,6 +25,22 @@ Tools and runtime only. Bring your own dump and your own console keys. Nothing f
 | `subsdk0` | Identical between v0 and v2.0.0 |
 | `rtld` | Dynamic loader |
 
+## IL2CPP dump (v2.0.0)
+
+Il2CppDumper 6.7.46 runs clean against the v2.0.0 `main` NSO + metadata (no manual offsets needed):
+
+- Metadata / IL2CPP version 24.4
+- CodeRegistration `0x48FD9B8`, MetadataRegistration `0x48FF178`
+- 104,127 methods with addresses, 73 assemblies, 1,963 types in Assembly-CSharp
+- Middleware: FMOD (FMODUnity), Universal Render Pipeline, TextMeshPro, Odin serializer (Sirenix), ProBuilder
+
+```
+DOTNET_ROLL_FORWARD=Major dotnet Il2CppDumper.dll extracted_v2/exefs/main \
+  extracted_v2/romfs/Data/Managed/Metadata/global-metadata.dat il2cpp_dump
+```
+
+Output stays local (gitignored).
+
 ## Tools
 
 `tools/nsp_extract.py` - decrypts an NSP with your `prod.keys` and pulls ExeFS and RomFS.
