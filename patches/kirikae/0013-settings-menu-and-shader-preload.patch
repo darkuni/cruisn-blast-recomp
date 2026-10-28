@@ -1,0 +1,3053 @@
+diff --git a/crates/rt/src/bindings.rs b/crates/rt/src/bindings.rs
+new file mode 100644
+index 0000000..425326e
+--- /dev/null
++++ b/crates/rt/src/bindings.rs
+@@ -0,0 +1,327 @@
++//! Keyboard and controller bindings for the Switch controls, changed from the settings menu
++//! and stored in the `[keyboard]` / `[controller]` sections of the settings file.
++//!
++//! Controller inputs use Xbox-style (SDL game controller) names: a b x y, leftshoulder,
++//! rightshoulder, lefttrigger, righttrigger, start, back, leftstick, rightstick, dpup dpdown
++//! dpleft dpright, and stick directions leftx- leftx+ lefty- (up) lefty+ (down), same for right.
++
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use winit::keyboard::KeyCode;
++
++use crate::input::{PadState, STICK_MAX, button};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Out {
++    Button(u64),
++    Left(i32, i32),
++    Right(i32, i32),
++}
++
++pub struct Control {
++    pub id: &'static str,
++    pub label: &'static str,
++    pub key_default: &'static str,
++    pub pad_default: &'static str,
++    pub out: Out,
++}
++
++pub static CONTROLS: &[Control] = &[
++    Control { id: "a", label: "A", key_default: "Z Space", pad_default: "a", out: Out::Button(button::A) },
++    Control { id: "b", label: "B", key_default: "X", pad_default: "b", out: Out::Button(button::B) },
++    Control { id: "x", label: "X", key_default: "C", pad_default: "x", out: Out::Button(button::X) },
++    Control { id: "y", label: "Y", key_default: "V", pad_default: "y", out: Out::Button(button::Y) },
++    Control { id: "l", label: "L", key_default: "E", pad_default: "leftshoulder", out: Out::Button(button::L) },
++    Control { id: "r", label: "R", key_default: "U", pad_default: "rightshoulder", out: Out::Button(button::R) },
++    Control { id: "zl", label: "ZL", key_default: "Q", pad_default: "lefttrigger", out: Out::Button(button::ZL) },
++    Control { id: "zr", label: "ZR", key_default: "O", pad_default: "righttrigger", out: Out::Button(button::ZR) },
++    Control { id: "plus", label: "+ (Plus)", key_default: "Enter", pad_default: "start", out: Out::Button(button::PLUS) },
++    Control { id: "minus", label: "- (Minus)", key_default: "Backspace", pad_default: "back", out: Out::Button(button::MINUS) },
++    Control { id: "dpad_up", label: "D-pad up", key_default: "T", pad_default: "dpup", out: Out::Button(button::UP) },
++    Control { id: "dpad_down", label: "D-pad down", key_default: "G", pad_default: "dpdown", out: Out::Button(button::DOWN) },
++    Control { id: "dpad_left", label: "D-pad left", key_default: "F", pad_default: "dpleft", out: Out::Button(button::LEFT) },
++    Control { id: "dpad_right", label: "D-pad right", key_default: "H", pad_default: "dpright", out: Out::Button(button::RIGHT) },
++    Control { id: "lstick_up", label: "Left stick up", key_default: "W Up", pad_default: "lefty-", out: Out::Left(0, 1) },
++    Control { id: "lstick_down", label: "Left stick down", key_default: "S Down", pad_default: "lefty+", out: Out::Left(0, -1) },
++    Control { id: "lstick_left", label: "Left stick left", key_default: "A Left", pad_default: "leftx-", out: Out::Left(-1, 0) },
++    Control { id: "lstick_right", label: "Left stick right", key_default: "D Right", pad_default: "leftx+", out: Out::Left(1, 0) },
++    Control { id: "lstick_click", label: "Left stick click", key_default: "LShift", pad_default: "leftstick", out: Out::Button(button::STICK_L) },
++    Control { id: "rstick_up", label: "Right stick up", key_default: "I", pad_default: "righty-", out: Out::Right(0, 1) },
++    Control { id: "rstick_down", label: "Right stick down", key_default: "K", pad_default: "righty+", out: Out::Right(0, -1) },
++    Control { id: "rstick_left", label: "Right stick left", key_default: "J", pad_default: "rightx-", out: Out::Right(-1, 0) },
++    Control { id: "rstick_right", label: "Right stick right", key_default: "L", pad_default: "rightx+", out: Out::Right(1, 0) },
++    Control { id: "rstick_click", label: "Right stick click", key_default: "M", pad_default: "rightstick", out: Out::Button(button::STICK_R) },
++];
++
++/// Key names written to the settings file and shown in the menu. Esc, F1 and F11 are kept
++/// for the menu and fullscreen.
++const KEY_NAMES: &[(KeyCode, &str)] = {
++    use KeyCode as K;
++    &[
++        (K::KeyA, "A"), (K::KeyB, "B"), (K::KeyC, "C"), (K::KeyD, "D"), (K::KeyE, "E"), (K::KeyF, "F"), (K::KeyG, "G"),
++        (K::KeyH, "H"), (K::KeyI, "I"), (K::KeyJ, "J"), (K::KeyK, "K"), (K::KeyL, "L"), (K::KeyM, "M"), (K::KeyN, "N"),
++        (K::KeyO, "O"), (K::KeyP, "P"), (K::KeyQ, "Q"), (K::KeyR, "R"), (K::KeyS, "S"), (K::KeyT, "T"), (K::KeyU, "U"),
++        (K::KeyV, "V"), (K::KeyW, "W"), (K::KeyX, "X"), (K::KeyY, "Y"), (K::KeyZ, "Z"),
++        (K::Digit0, "0"), (K::Digit1, "1"), (K::Digit2, "2"), (K::Digit3, "3"), (K::Digit4, "4"),
++        (K::Digit5, "5"), (K::Digit6, "6"), (K::Digit7, "7"), (K::Digit8, "8"), (K::Digit9, "9"),
++        (K::ArrowUp, "Up"), (K::ArrowDown, "Down"), (K::ArrowLeft, "Left"), (K::ArrowRight, "Right"),
++        (K::Space, "Space"), (K::Enter, "Enter"), (K::Backspace, "Backspace"), (K::Tab, "Tab"), (K::CapsLock, "CapsLock"),
++        (K::ShiftLeft, "LShift"), (K::ShiftRight, "RShift"), (K::ControlLeft, "LCtrl"), (K::ControlRight, "RCtrl"),
++        (K::AltLeft, "LAlt"), (K::AltRight, "RAlt"),
++        (K::Insert, "Insert"), (K::Delete, "Delete"), (K::Home, "Home"), (K::End, "End"), (K::PageUp, "PageUp"), (K::PageDown, "PageDown"),
++        (K::Minus, "Minus"), (K::Equal, "Equal"), (K::BracketLeft, "["), (K::BracketRight, "]"), (K::Semicolon, ";"),
++        (K::Quote, "'"), (K::Comma, ","), (K::Period, "."), (K::Slash, "/"), (K::Backslash, "\\"), (K::Backquote, "`"),
++        (K::F2, "F2"), (K::F3, "F3"), (K::F4, "F4"), (K::F5, "F5"), (K::F6, "F6"), (K::F7, "F7"), (K::F8, "F8"),
++        (K::F9, "F9"), (K::F10, "F10"), (K::F12, "F12"),
++        (K::Numpad0, "Num0"), (K::Numpad1, "Num1"), (K::Numpad2, "Num2"), (K::Numpad3, "Num3"), (K::Numpad4, "Num4"),
++        (K::Numpad5, "Num5"), (K::Numpad6, "Num6"), (K::Numpad7, "Num7"), (K::Numpad8, "Num8"), (K::Numpad9, "Num9"),
++        (K::NumpadAdd, "NumAdd"), (K::NumpadSubtract, "NumSub"), (K::NumpadMultiply, "NumMul"), (K::NumpadDivide, "NumDiv"),
++        (K::NumpadEnter, "NumEnter"), (K::NumpadDecimal, "NumDot"),
++    ]
++};
++
++pub fn key_name(code: KeyCode) -> Option<&'static str> {
++    KEY_NAMES.iter().find(|(k, _)| *k == code).map(|(_, n)| *n)
++}
++
++fn key_code(name: &str) -> Option<KeyCode> {
++    KEY_NAMES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(k, _)| *k)
++}
++
++/// Raw controller state in XInput layout (buttons bits, triggers 0-255, sticks with up positive).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct RawPad {
++    pub buttons: u16,
++    pub lt: u8,
++    pub rt: u8,
++    pub lx: i16,
++    pub ly: i16,
++    pub rx: i16,
++    pub ry: i16,
++}
++
++pub mod xb {
++    pub const DPUP: u16 = 0x0001;
++    pub const DPDOWN: u16 = 0x0002;
++    pub const DPLEFT: u16 = 0x0004;
++    pub const DPRIGHT: u16 = 0x0008;
++    pub const START: u16 = 0x0010;
++    pub const BACK: u16 = 0x0020;
++    pub const LSTICK: u16 = 0x0040;
++    pub const RSTICK: u16 = 0x0080;
++    pub const LB: u16 = 0x0100;
++    pub const RB: u16 = 0x0200;
++    pub const A: u16 = 0x1000;
++    pub const B: u16 = 0x2000;
++    pub const X: u16 = 0x4000;
++    pub const Y: u16 = 0x8000;
++}
++
++const PAD_BUTTONS: &[(&str, u16)] = &[
++    ("a", xb::A),
++    ("b", xb::B),
++    ("x", xb::X),
++    ("y", xb::Y),
++    ("leftshoulder", xb::LB),
++    ("rightshoulder", xb::RB),
++    ("start", xb::START),
++    ("back", xb::BACK),
++    ("leftstick", xb::LSTICK),
++    ("rightstick", xb::RSTICK),
++    ("dpup", xb::DPUP),
++    ("dpdown", xb::DPDOWN),
++    ("dpleft", xb::DPLEFT),
++    ("dpright", xb::DPRIGHT),
++];
++
++const LEFT_DEAD: i32 = 7849;
++const RIGHT_DEAD: i32 = 8689;
++
++fn axis(v: i16, dead: i32) -> f32 {
++    let v = (v as i32).clamp(-STICK_MAX, STICK_MAX);
++    if v.abs() < dead { 0.0 } else { (v.abs() - dead) as f32 / (STICK_MAX - dead) as f32 * v.signum() as f32 }
++}
++
++/// How far an input is pressed, 0 to 1.
++pub fn input_value(raw: &RawPad, name: &str) -> f32 {
++    if let Some((_, bit)) = PAD_BUTTONS.iter().find(|(n, _)| *n == name) {
++        return if raw.buttons & bit != 0 { 1.0 } else { 0.0 };
++    }
++    let dir = |v: f32, neg: bool| if neg { (-v).max(0.0) } else { v.max(0.0) };
++    match name {
++        "lefttrigger" => raw.lt as f32 / 255.0,
++        "righttrigger" => raw.rt as f32 / 255.0,
++        "leftx-" | "leftx+" => dir(axis(raw.lx, LEFT_DEAD), name.ends_with('-')),
++        // SDL convention: y- is up; XInput reports up as positive
++        "lefty-" | "lefty+" => dir(axis(raw.ly, LEFT_DEAD), name.ends_with('+')),
++        "rightx-" | "rightx+" => dir(axis(raw.rx, RIGHT_DEAD), name.ends_with('-')),
++        "righty-" | "righty+" => dir(axis(raw.ry, RIGHT_DEAD), name.ends_with('+')),
++        _ => 0.0,
++    }
++}
++
++pub fn known_input(name: &str) -> bool {
++    PAD_BUTTONS.iter().any(|(n, _)| *n == name)
++        || matches!(name, "lefttrigger" | "righttrigger" | "leftx-" | "leftx+" | "lefty-" | "lefty+" | "rightx-" | "rightx+" | "righty-" | "righty+")
++}
++
++/// The input that went from released to firmly pressed between two polls, for binding.
++pub fn newly_pressed(prev: &RawPad, now: &RawPad) -> Option<&'static str> {
++    const ALL: &[&str] = &[
++        "a", "b", "x", "y", "leftshoulder", "rightshoulder", "start", "back", "leftstick", "rightstick", "dpup", "dpdown", "dpleft", "dpright",
++        "lefttrigger", "righttrigger", "leftx-", "leftx+", "lefty-", "lefty+", "rightx-", "rightx+", "righty-", "righty+",
++    ];
++    ALL.iter().copied().find(|n| input_value(now, n) > 0.75 && input_value(prev, n) <= 0.4)
++}
++
++/// Swap A/B and X/Y on the raw pad (Nintendo layout by position).
++pub fn swap_face(raw: &mut RawPad) {
++    let b = raw.buttons;
++    let pick = |from: u16, to: u16| if b & from != 0 { to } else { 0 };
++    raw.buttons = (b & !(xb::A | xb::B | xb::X | xb::Y)) | pick(xb::A, xb::B) | pick(xb::B, xb::A) | pick(xb::X, xb::Y) | pick(xb::Y, xb::X);
++}
++
++static VERSION: AtomicU64 = AtomicU64::new(1);
++
++struct Resolved {
++    version: u64,
++    keys: Vec<(Vec<KeyCode>, Out)>,
++    pad: Vec<(Vec<String>, Out)>,
++}
++
++static RESOLVED: Mutex<Option<Resolved>> = Mutex::new(None);
++
++fn names(stored: Option<&String>, default: &str) -> Vec<String> {
++    match stored.map(|s| s.trim()) {
++        Some("none") | Some("") => Vec::new(),
++        Some(s) => s.split_whitespace().map(str::to_string).collect(),
++        None => default.split_whitespace().map(str::to_string).collect(),
++    }
++}
++
++fn with_resolved<R>(f: impl FnOnce(&Resolved) -> R) -> R {
++    let mut r = RESOLVED.lock().unwrap();
++    let v = VERSION.load(Ordering::Relaxed);
++    if r.as_ref().is_none_or(|r| r.version != v) {
++        let (keys, pad) = (crate::settings::keys(), crate::settings::pad());
++        *r = Some(Resolved {
++            version: v,
++            keys: CONTROLS.iter().map(|c| (names(keys.get(c.id), c.key_default).iter().filter_map(|n| key_code(n)).collect(), c.out)).collect(),
++            pad: CONTROLS.iter().map(|c| (names(pad.get(c.id), c.pad_default).into_iter().filter(|n| known_input(n)).collect(), c.out)).collect(),
++        });
++    }
++    f(r.as_ref().unwrap())
++}
++
++fn combine(outs: impl Iterator<Item = (Out, f32)>) -> PadState {
++    let (mut buttons, mut l, mut r) = (0u64, [0f32; 4], [0f32; 4]);
++    let slot = |x: i32, y: i32| match (x, y) {
++        (-1, 0) => 0,
++        (1, 0) => 1,
++        (0, 1) => 2,
++        _ => 3,
++    };
++    for (out, v) in outs {
++        match out {
++            Out::Button(b) if v > 0.1 => buttons |= b,
++            Out::Button(_) => {}
++            Out::Left(x, y) => l[slot(x, y)] = l[slot(x, y)].max(v),
++            Out::Right(x, y) => r[slot(x, y)] = r[slot(x, y)].max(v),
++        }
++    }
++    let stick = |s: [f32; 4]| {
++        let (x, y) = (s[1] - s[0], s[2] - s[3]);
++        // full digital diagonals (keys) stay on the unit circle; analog values pass through
++        let k = if x.abs() >= 1.0 && y.abs() >= 1.0 { std::f32::consts::FRAC_1_SQRT_2 } else { 1.0 };
++        let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
++        ((x * k * STICK_MAX as f32) as i32, (y * k * STICK_MAX as f32) as i32)
++    };
++    PadState { buttons, left: stick(l), right: stick(r) }
++}
++
++pub fn keyboard(pressed: &dyn Fn(KeyCode) -> bool) -> PadState {
++    with_resolved(|r| combine(r.keys.iter().map(|(keys, out)| (*out, if keys.iter().any(|k| pressed(*k)) { 1.0 } else { 0.0 }))))
++}
++
++pub fn pad(raw: &RawPad) -> PadState {
++    with_resolved(|r| combine(r.pad.iter().map(|(ins, out)| (*out, ins.iter().map(|n| input_value(raw, n)).fold(0.0, f32::max)))))
++}
++
++/// Shown in the menu.
++pub fn key_binding(i: usize) -> String {
++    let keys = crate::settings::keys();
++    names(keys.get(CONTROLS[i].id), CONTROLS[i].key_default).join(" ")
++}
++
++pub fn pad_binding(i: usize) -> String {
++    let pad = crate::settings::pad();
++    names(pad.get(CONTROLS[i].id), CONTROLS[i].pad_default).join(" ")
++}
++
++fn store(map: &mut std::collections::BTreeMap<String, String>, i: usize, value: &str, default: &str) {
++    let id = CONTROLS[i].id.to_string();
++    if value == default {
++        map.remove(&id);
++    } else {
++        map.insert(id, if value.is_empty() { "none".into() } else { value.into() });
++    }
++}
++
++pub fn set_key(i: usize, name: &str) {
++    crate::settings::update(|f| store(&mut f.keys, i, name, CONTROLS[i].key_default));
++    VERSION.fetch_add(1, Ordering::Relaxed);
++}
++
++pub fn set_pad(i: usize, name: &str) {
++    crate::settings::update(|f| store(&mut f.pad, i, name, CONTROLS[i].pad_default));
++    VERSION.fetch_add(1, Ordering::Relaxed);
++}
++
++pub fn reset_keys() {
++    crate::settings::update(|f| f.keys.clear());
++    VERSION.fetch_add(1, Ordering::Relaxed);
++}
++
++pub fn reset_pad() {
++    crate::settings::update(|f| f.pad.clear());
++    VERSION.fetch_add(1, Ordering::Relaxed);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn default_keyboard_matches_the_old_map() {
++        let held = [KeyCode::KeyZ, KeyCode::ArrowUp, KeyCode::KeyD, KeyCode::KeyL];
++        let s = keyboard(&|k| held.contains(&k));
++        assert_eq!(s.buttons, button::A);
++        assert!(s.left.0 > 20000 && s.left.0 == s.left.1, "diagonal: {:?}", s.left);
++        assert_eq!(s.right, (STICK_MAX, 0));
++    }
++
++    #[test]
++    fn default_pad_by_label_and_analog_sticks() {
++        let raw = RawPad { buttons: xb::A | xb::START, rt: 200, lx: -STICK_MAX as i16, ly: 16000, ..Default::default() };
++        let s = pad(&raw);
++        assert_eq!(s.buttons, button::A | button::PLUS | button::ZR);
++        assert_eq!(s.left.0, -STICK_MAX);
++        assert!(s.left.1 > 8000 && s.left.1 < 16000, "{:?}", s.left);
++        let mut swapped = raw;
++        swap_face(&mut swapped);
++        assert_eq!(pad(&swapped).buttons, button::B | button::PLUS | button::ZR);
++    }
++
++    #[test]
++    fn capture_names() {
++        let prev = RawPad::default();
++        assert_eq!(newly_pressed(&prev, &RawPad { buttons: xb::RB, ..prev }), Some("rightshoulder"));
++        assert_eq!(newly_pressed(&prev, &RawPad { ly: 30000, ..prev }), Some("lefty-"));
++        assert_eq!(newly_pressed(&prev, &RawPad { lt: 250, ..prev }), Some("lefttrigger"));
++        assert_eq!(newly_pressed(&prev, &RawPad { lt: 100, ..prev }), None);
++        assert_eq!(key_name(KeyCode::ShiftLeft), Some("LShift"));
++        assert_eq!(key_code("lshift"), Some(KeyCode::ShiftLeft));
++        assert_eq!(key_name(KeyCode::F1), None);
++    }
++}
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index 461ace7..e373329 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -46,6 +46,27 @@ pub fn take_longest_frame() -> std::time::Duration {
+ pub enum Shown {
+     Frame(Frame),
+     Gpu,
++    Fullscreen(bool),
++    Quit,
++}
++
++fn send(event: Shown) -> bool {
++    if let Some(Some(proxy)) = PROXY.get() {
++        return proxy.lock().unwrap().send_event(event).is_ok();
++    }
++    false
++}
++
++/// Switch the window to borderless fullscreen or back (any thread).
++pub fn apply_fullscreen(on: bool) {
++    send(Shown::Fullscreen(on));
++}
++
++/// Quit from the settings menu (any thread).
++pub fn quit() {
++    if !send(Shown::Quit) {
++        std::process::exit(0);
++    }
+ }
+ 
+ static PROXY: OnceLock<Option<Mutex<EventLoopProxy<Shown>>>> = OnceLock::new();
+@@ -243,6 +264,16 @@ impl ApplicationHandler<Shown> for App {
+                 }
+             }
+             Shown::Frame(_) => {}
++            Shown::Fullscreen(on) => {
++                if let Some(w) = &self.window {
++                    w.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
++                }
++            }
++            Shown::Quit => {
++                self.p.terminate(0);
++                self.p.gpu.shutdown();
++                _el.exit();
++            }
+             Shown::Gpu => {
+                 self.gpu = true;
+                 self.frame = None;
+@@ -263,15 +294,53 @@ impl ApplicationHandler<Shown> for App {
+             WindowEvent::ModifiersChanged(m) => self.alt = m.state().alt_key(),
+             WindowEvent::KeyboardInput { event, .. } => {
+                 use winit::keyboard::{KeyCode, PhysicalKey};
++                use crate::overlay::{self as ov, Nav};
+                 if let PhysicalKey::Code(code) = event.physical_key {
+-                    let toggle = code == KeyCode::F11 || (self.alt && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter));
+-                    if toggle {
+-                        if event.state.is_pressed() && !event.repeat {
++                    let pressed = event.state.is_pressed();
++                    let fresh = pressed && !event.repeat;
++                    // binding a key or controller input in the settings menu
++                    if pressed && ov::capturing() != 0 {
++                        if matches!(code, KeyCode::Escape | KeyCode::F1 | KeyCode::F11) {
++                            ov::key_captured(None);
++                        } else if fresh && ov::capturing() == 1 {
++                            ov::key_captured(crate::bindings::key_name(code));
++                        }
++                        return;
++                    }
++                    if code == KeyCode::F11 || (self.alt && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)) {
++                        if fresh {
+                             self.toggle_fullscreen();
+                         }
+                         return;
+                     }
+-                    crate::input::key(code, event.state.is_pressed());
++                    if matches!(code, KeyCode::F1 | KeyCode::Escape) {
++                        if fresh {
++                            if ov::is_open() && code == KeyCode::Escape { ov::input(Nav::Back) } else { ov::toggle() }
++                        }
++                        return;
++                    }
++                    if ov::is_open() {
++                        if pressed {
++                            let nav = match code {
++                                KeyCode::ArrowUp => Some(Nav::Up),
++                                KeyCode::ArrowDown => Some(Nav::Down),
++                                KeyCode::ArrowLeft => Some(Nav::Left),
++                                KeyCode::ArrowRight => Some(Nav::Right),
++                                KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::KeyX => Some(Nav::Ok),
++                                KeyCode::Backspace | KeyCode::KeyZ => Some(Nav::Back),
++                                _ => None,
++                            };
++                            if code == KeyCode::Delete && fresh {
++                                ov::clear_binding();
++                            } else if let Some(n) = nav {
++                                ov::input(n);
++                            }
++                        } else {
++                            crate::input::key(code, false);
++                        }
++                        return;
++                    }
++                    crate::input::key(code, pressed);
+                 }
+             }
+             WindowEvent::Focused(false) => crate::input::release_all(),
+@@ -289,8 +358,9 @@ impl ApplicationHandler<Shown> for App {
+ impl App {
+     fn toggle_fullscreen(&mut self) {
+         if let Some(w) = &self.window {
+-            let next = if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
+-            w.set_fullscreen(next);
++            let on = w.fullscreen().is_none();
++            w.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
++            crate::settings::update(|f| f.settings.fullscreen = on);
+         }
+     }
+ 
+diff --git a/crates/rt/src/gpu/vulkan/mod.rs b/crates/rt/src/gpu/vulkan/mod.rs
+index 8ba9127..9ecef0f 100644
+--- a/crates/rt/src/gpu/vulkan/mod.rs
++++ b/crates/rt/src/gpu/vulkan/mod.rs
+@@ -15,6 +15,7 @@ mod draw;
+ mod guest_writes;
+ mod images;
+ mod pipeline;
++mod preload;
+ mod present;
+ mod readback;
+ mod submit;
+@@ -22,6 +23,7 @@ mod textures;
+ mod tiling;
+ mod volumes;
+ mod lines;
++mod overlay;
+ 
+ pub use images::{Surface, color_surface};
+ pub use present::Presented;
+@@ -119,6 +121,9 @@ pub struct Renderer {
+     retired: Vec<ImageKey>,
+     pipeline_cache: vk::PipelineCache,
+     compiler: Option<PipelineCompiler>,
++    preload: preload::PreloadState,
++    overlay: Option<overlay::OverlayGpu>,
++    overlay_failed: bool,
+     cache_file: Option<std::path::PathBuf>,
+     cache_saved: (u64, std::time::Instant),
+     cache_saver: Option<std::thread::JoinHandle<()>>,
+@@ -173,6 +178,7 @@ unsafe impl Send for Renderer {}
+ 
+ impl Drop for Renderer {
+     fn drop(&mut self) {
++        self.stop_preload();
+         if let Some(mut c) = self.compiler.take() {
+             for (key, r) in c.stop() {
+                 if let Ok(p) = r {
+@@ -181,6 +187,12 @@ impl Drop for Renderer {
+             }
+         }
+         self.save_pipeline_cache(true);
++        unsafe {
++            let _ = self.device.device_wait_idle();
++        }
++        self.destroy_overlay();
++        let modules: std::collections::HashSet<vk::ShaderModule> =
++            self.shaders.values().map(|s| s.module).chain(self.preload.spirv_by_module.keys().copied()).chain(self.preload.module_by_spirv.values().copied()).collect();
+         unsafe {
+             let d = &self.device;
+             let _ = d.device_wait_idle();
+@@ -192,8 +204,8 @@ impl Drop for Renderer {
+                 d.destroy_pipeline_layout(*layout, None);
+                 d.destroy_descriptor_set_layout(*set, None);
+             }
+-            for s in self.shaders.values() {
+-                d.destroy_shader_module(s.module, None);
++            for m in &modules {
++                d.destroy_shader_module(*m, None);
+             }
+             for s in self.samplers.values() {
+                 d.destroy_sampler(*s, None);
+@@ -415,7 +427,7 @@ impl Renderer {
+             .or_else(|_| unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })?;
+         let compiler = PipelineCompiler::new(&device, pipeline_cache);
+ 
+-        Ok(Renderer {
++        let mut renderer = Renderer {
+             entry,
+             instance,
+             device,
+@@ -498,6 +510,9 @@ impl Renderer {
+             retired: Vec::new(),
+             pipeline_cache,
+             compiler,
++            preload: Default::default(),
++            overlay: None,
++            overlay_failed: false,
+             cache_file,
+             cache_saved: (0, std::time::Instant::now()),
+             cache_saver: None,
+@@ -505,7 +520,9 @@ impl Renderer {
+             name,
+             stats: RenderStats::default(),
+             trace_state: String::new(),
+-        })
++        };
++        renderer.start_preload();
++        Ok(renderer)
+     }
+ 
+     fn clock_start(&self) -> std::time::Instant {
+diff --git a/crates/rt/src/gpu/vulkan/overlay.rs b/crates/rt/src/gpu/vulkan/overlay.rs
+new file mode 100644
+index 0000000..8ff646a
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/overlay.rs
+@@ -0,0 +1,354 @@
++//! Draws the settings menu (crate::overlay) over the presented frame.
++
++use ash::vk;
++
++use super::{Renderer, find_memory};
++use crate::overlay::{FONT_H, FONT_W, Vertex};
++
++const VS: &[u8] = include_bytes!("overlay_vs.spv");
++const FS: &[u8] = include_bytes!("overlay_fs.spv");
++const FONT: &[u8] = include_bytes!("overlay_font.r8");
++
++struct HostBuffer {
++    buffer: vk::Buffer,
++    memory: vk::DeviceMemory,
++    ptr: *mut u8,
++    size: u64,
++}
++
++pub(super) struct OverlayGpu {
++    format: vk::Format,
++    pipeline: vk::Pipeline,
++    layout: vk::PipelineLayout,
++    set_layout: vk::DescriptorSetLayout,
++    pool: vk::DescriptorPool,
++    set: vk::DescriptorSet,
++    sampler: vk::Sampler,
++    font: vk::Image,
++    font_memory: vk::DeviceMemory,
++    font_view: vk::ImageView,
++    staging: HostBuffer,
++    vertices: Vec<Option<HostBuffer>>,
++}
++
++fn words(bytes: &[u8]) -> Vec<u32> {
++    bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
++}
++
++unsafe fn host_buffer(device: &ash::Device, props: &vk::PhysicalDeviceMemoryProperties, size: u64, usage: vk::BufferUsageFlags) -> Result<HostBuffer, vk::Result> {
++    unsafe {
++        let buffer = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage), None)?;
++        let req = device.get_buffer_memory_requirements(buffer);
++        let ty = find_memory(props, req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
++        let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
++        device.bind_buffer_memory(buffer, memory, 0)?;
++        let ptr = device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
++        Ok(HostBuffer { buffer, memory, ptr, size })
++    }
++}
++
++unsafe fn free(device: &ash::Device, b: HostBuffer) {
++    unsafe {
++        device.destroy_buffer(b.buffer, None);
++        device.free_memory(b.memory, None);
++    }
++}
++
++impl OverlayGpu {
++    /// Creates everything and records the font upload into `cmd`.
++    unsafe fn new(device: &ash::Device, props: &vk::PhysicalDeviceMemoryProperties, cmd: vk::CommandBuffer, format: vk::Format, in_flight: usize) -> Result<OverlayGpu, vk::Result> {
++        unsafe {
++            let bindings = [
++                vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(1).stage_flags(vk::ShaderStageFlags::FRAGMENT),
++                vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(vk::DescriptorType::SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::FRAGMENT),
++            ];
++            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?;
++            let push = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, offset: 0, size: 16 }];
++            let sets = [set_layout];
++            let layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sets).push_constant_ranges(&push), None)?;
++            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE, descriptor_count: 1 }, vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER, descriptor_count: 1 }];
++            let pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)?;
++            let set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&sets))?[0];
++            let sampler = device.create_sampler(
++                &vk::SamplerCreateInfo::default()
++                    .mag_filter(vk::Filter::LINEAR)
++                    .min_filter(vk::Filter::LINEAR)
++                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
++                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
++                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
++                None,
++            )?;
++            let font = device.create_image(
++                &vk::ImageCreateInfo::default()
++                    .image_type(vk::ImageType::TYPE_2D)
++                    .format(vk::Format::R8_UNORM)
++                    .extent(vk::Extent3D { width: FONT_W, height: FONT_H, depth: 1 })
++                    .mip_levels(1)
++                    .array_layers(1)
++                    .samples(vk::SampleCountFlags::TYPE_1)
++                    .tiling(vk::ImageTiling::OPTIMAL)
++                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
++                    .initial_layout(vk::ImageLayout::UNDEFINED),
++                None,
++            )?;
++            let req = device.get_image_memory_requirements(font);
++            let ty = find_memory(props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
++                .or_else(|| find_memory(props, req.memory_type_bits, vk::MemoryPropertyFlags::empty()))
++                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
++            let font_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
++            device.bind_image_memory(font, font_memory, 0)?;
++            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
++            let font_view = device.create_image_view(&vk::ImageViewCreateInfo::default().image(font).view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::R8_UNORM).subresource_range(range), None)?;
++            let staging = host_buffer(device, props, FONT.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
++            std::ptr::copy_nonoverlapping(FONT.as_ptr(), staging.ptr, FONT.len());
++            let to_dst = [vk::ImageMemoryBarrier::default()
++                .old_layout(vk::ImageLayout::UNDEFINED)
++                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
++                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
++                .image(font)
++                .subresource_range(range)];
++            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
++            let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
++            let copy = [vk::BufferImageCopy::default().image_subresource(sub).image_extent(vk::Extent3D { width: FONT_W, height: FONT_H, depth: 1 })];
++            device.cmd_copy_buffer_to_image(cmd, staging.buffer, font, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copy);
++            let to_read = [vk::ImageMemoryBarrier::default()
++                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
++                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
++                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
++                .dst_access_mask(vk::AccessFlags::SHADER_READ)
++                .image(font)
++                .subresource_range(range)];
++            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_read);
++            let image_info = [vk::DescriptorImageInfo::default().image_view(font_view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
++            let sampler_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
++            let writes = [
++                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(&image_info),
++                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::SAMPLER).image_info(&sampler_info),
++            ];
++            device.update_descriptor_sets(&writes, &[]);
++            let pipeline = Self::pipeline(device, layout, format)?;
++            Ok(OverlayGpu {
++                format,
++                pipeline,
++                layout,
++                set_layout,
++                pool,
++                set,
++                sampler,
++                font,
++                font_memory,
++                font_view,
++                staging,
++                vertices: (0..in_flight).map(|_| None).collect(),
++            })
++        }
++    }
++
++    unsafe fn pipeline(device: &ash::Device, layout: vk::PipelineLayout, format: vk::Format) -> Result<vk::Pipeline, vk::Result> {
++        unsafe {
++            let vs = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words(VS)), None)?;
++            let fs = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words(FS)), None)?;
++            let stages = [
++                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(vs).name(c"vs"),
++                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(fs).name(c"fs"),
++            ];
++            let bindings = [vk::VertexInputBindingDescription { binding: 0, stride: std::mem::size_of::<Vertex>() as u32, input_rate: vk::VertexInputRate::VERTEX }];
++            let attributes = [
++                vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
++                vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
++                vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 16 },
++            ];
++            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default().vertex_binding_descriptions(&bindings).vertex_attribute_descriptions(&attributes);
++            let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
++            let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
++            let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).cull_mode(vk::CullModeFlags::NONE).line_width(1.0);
++            let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
++            let blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
++                .blend_enable(true)
++                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
++                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
++                .color_blend_op(vk::BlendOp::ADD)
++                .src_alpha_blend_factor(vk::BlendFactor::ONE)
++                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
++                .alpha_blend_op(vk::BlendOp::ADD)
++                .color_write_mask(vk::ColorComponentFlags::RGBA)];
++            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
++            let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
++            let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
++            let formats = [format];
++            let mut rendering = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
++            let info = vk::GraphicsPipelineCreateInfo::default()
++                .stages(&stages)
++                .vertex_input_state(&vertex_input)
++                .input_assembly_state(&assembly)
++                .viewport_state(&viewport)
++                .rasterization_state(&raster)
++                .multisample_state(&multisample)
++                .color_blend_state(&blend)
++                .dynamic_state(&dynamic)
++                .layout(layout)
++                .push_next(&mut rendering);
++            let r = device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map(|p| p[0]).map_err(|(_, e)| e);
++            device.destroy_shader_module(vs, None);
++            device.destroy_shader_module(fs, None);
++            r
++        }
++    }
++
++    pub(super) unsafe fn destroy(self, device: &ash::Device) {
++        unsafe {
++            device.destroy_pipeline(self.pipeline, None);
++            device.destroy_pipeline_layout(self.layout, None);
++            device.destroy_descriptor_pool(self.pool, None);
++            device.destroy_descriptor_set_layout(self.set_layout, None);
++            device.destroy_sampler(self.sampler, None);
++            device.destroy_image_view(self.font_view, None);
++            device.destroy_image(self.font, None);
++            device.free_memory(self.font_memory, None);
++            free(device, self.staging);
++            for b in self.vertices.into_iter().flatten() {
++                free(device, b);
++            }
++        }
++    }
++
++    /// Records the menu into `cmd`: `image` goes from and back to `layout`.
++    #[allow(clippy::too_many_arguments)]
++    pub(super) unsafe fn record(
++        &mut self,
++        device: &ash::Device,
++        props: &vk::PhysicalDeviceMemoryProperties,
++        cmd: vk::CommandBuffer,
++        slot: usize,
++        image: vk::Image,
++        view: vk::ImageView,
++        layout: vk::ImageLayout,
++        extent: vk::Extent2D,
++        verts: &[Vertex],
++    ) -> Result<(), vk::Result> {
++        unsafe {
++            let bytes = std::mem::size_of_val(verts) as u64;
++            if self.vertices[slot].as_ref().is_none_or(|b| b.size < bytes) {
++                if let Some(old) = self.vertices[slot].take() {
++                    free(device, old);
++                }
++                self.vertices[slot] = Some(host_buffer(device, props, bytes.next_power_of_two().max(1 << 16), vk::BufferUsageFlags::VERTEX_BUFFER)?);
++            }
++            let vb = self.vertices[slot].as_ref().unwrap();
++            std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, vb.ptr, bytes as usize);
++            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
++            let to_color = [vk::ImageMemoryBarrier::default()
++                .old_layout(layout)
++                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
++                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++                .image(image)
++                .subresource_range(range)];
++            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::DependencyFlags::empty(), &[], &[], &to_color);
++            let attachments = [vk::RenderingAttachmentInfo::default()
++                .image_view(view)
++                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
++                .load_op(vk::AttachmentLoadOp::LOAD)
++                .store_op(vk::AttachmentStoreOp::STORE)];
++            let area = vk::Rect2D { offset: vk::Offset2D::default(), extent };
++            let info = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&attachments);
++            device.cmd_begin_rendering(cmd, &info);
++            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
++            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[self.set], &[]);
++            device.cmd_bind_vertex_buffers(cmd, 0, &[vb.buffer], &[0]);
++            device.cmd_set_viewport(cmd, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: extent.width as f32, height: extent.height as f32, min_depth: 0.0, max_depth: 1.0 }]);
++            device.cmd_set_scissor(cmd, 0, &[area]);
++            let srgb = matches!(self.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32) as u32;
++            let mut push = [0u8; 16];
++            push[0..4].copy_from_slice(&(extent.width as f32).to_le_bytes());
++            push[4..8].copy_from_slice(&(extent.height as f32).to_le_bytes());
++            push[8..12].copy_from_slice(&srgb.to_le_bytes());
++            device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, &push);
++            device.cmd_draw(cmd, verts.len() as u32, 1, 0, 0);
++            device.cmd_end_rendering(cmd);
++            let back = [vk::ImageMemoryBarrier::default()
++                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
++                .new_layout(layout)
++                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
++                .image(image)
++                .subresource_range(range)];
++            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &back);
++            Ok(())
++        }
++    }
++}
++
++impl Renderer {
++    pub(super) fn draw_overlay(&mut self, image: vk::Image, view: vk::ImageView, format: vk::Format, extent: vk::Extent2D, verts: &[Vertex]) {
++        if self.overlay_failed {
++            return;
++        }
++        if self.overlay.as_ref().is_some_and(|o| o.format != format) {
++            unsafe {
++                let _ = self.device.device_wait_idle();
++                self.overlay.take().unwrap().destroy(&self.device);
++            }
++        }
++        if self.overlay.is_none() {
++            match unsafe { OverlayGpu::new(&self.device, &self.mem_props, self.cmd, format, self.batches.len()) } {
++                Ok(o) => self.overlay = Some(o),
++                Err(e) => {
++                    eprintln!("kirikae: settings menu cannot be drawn ({e:?})");
++                    self.overlay_failed = true;
++                    return;
++                }
++            }
++        }
++        let (device, props, cmd, slot) = (self.device.clone(), self.mem_props, self.cmd, self.current);
++        let o = self.overlay.as_mut().unwrap();
++        if let Err(e) = unsafe { o.record(&device, &props, cmd, slot, image, view, vk::ImageLayout::TRANSFER_DST_OPTIMAL, extent, verts) } {
++            eprintln!("kirikae: settings menu cannot be drawn ({e:?})");
++            self.overlay_failed = true;
++        }
++    }
++
++    pub(super) fn destroy_overlay(&mut self) {
++        if let Some(o) = self.overlay.take() {
++            unsafe { o.destroy(&self.device) };
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use super::super::images::ImageKey;
++
++    /// Renders the open menu over a grey frame with whatever Vulkan device is present and
++    /// writes it to KIRIKAE_OVERLAY_PNG. Run with `--ignored` on a machine with Vulkan.
++    #[test]
++    #[ignore]
++    fn render_menu_offscreen() {
++        let Ok(mut r) = Renderer::new() else { return };
++        let (w, h) = (1280u32, 720u32);
++        let key = ImageKey { cpu: 0x7000_0000, format: vk::Format::R8G8B8A8_UNORM, width: w, height: h };
++        r.create_image(key, 1, 1).unwrap();
++        let grey = vec![0x60u8; (w * h * 4) as usize];
++        r.upload(key, &[(w, h, grey)]);
++        let view = r.view(key, key.format, [vk::ComponentSwizzle::IDENTITY; 4]);
++        crate::overlay::test_open(0);
++        let verts = crate::overlay::build(w, h);
++        assert!(!verts.is_empty());
++        r.begin();
++        r.end_rendering();
++        let image = r.images[&key].image;
++        let mut o = unsafe { OverlayGpu::new(&r.device, &r.mem_props, r.cmd, key.format, r.batches.len()) }.unwrap();
++        let (device, props, cmd, slot) = (r.device.clone(), r.mem_props, r.cmd, r.current);
++        unsafe { o.record(&device, &props, cmd, slot, image, view, vk::ImageLayout::GENERAL, vk::Extent2D { width: w, height: h }, &verts) }.unwrap();
++        r.finish();
++        let bytes = r.read_raw(key, 1).unwrap();
++        unsafe { o.destroy(&r.device) };
++        let px: Vec<u32> = bytes.chunks_exact(4).map(|p| (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32).collect();
++        if let Ok(path) = std::env::var("KIRIKAE_OVERLAY_PNG") {
++            crate::display::write_png(std::path::Path::new(&path), w, h, &px).unwrap();
++        }
++        // the highlight bar of the selected row is blue
++        assert!(px.iter().any(|&p| (p & 0xff) > 0x90 && (p >> 16) < 0x60));
++    }
++}
+diff --git a/crates/rt/src/gpu/vulkan/overlay.wgsl b/crates/rt/src/gpu/vulkan/overlay.wgsl
+new file mode 100644
+index 0000000..70c3647
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/overlay.wgsl
+@@ -0,0 +1,26 @@
++// Settings-menu overlay: solid rectangles (u < 0) and font glyphs (alpha from the R8 atlas).
++struct Push { screen: vec2<f32>, srgb: u32, pad: u32 }
++var<immediate> pc: Push;
++@group(0) @binding(0) var font: texture_2d<f32>;
++@group(0) @binding(1) var font_sampler: sampler;
++
++struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32> }
++
++@vertex
++fn vs(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) c: vec4<f32>) -> VOut {
++    var o: VOut;
++    o.pos = vec4<f32>(p.x / pc.screen.x * 2.0 - 1.0, p.y / pc.screen.y * 2.0 - 1.0, 0.0, 1.0);
++    o.uv = uv;
++    o.color = c;
++    return o;
++}
++
++@fragment
++fn fs(i: VOut) -> @location(0) vec4<f32> {
++    var a = 1.0;
++    if (i.uv.x >= 0.0) { a = textureSample(font, font_sampler, i.uv).r; }
++    var rgb = i.color.rgb;
++    // The menu colours are display (sRGB) values; an sRGB swapchain re-encodes what we write.
++    if (pc.srgb != 0u) { rgb = pow(rgb, vec3<f32>(2.2)); }
++    return vec4<f32>(rgb, i.color.a * a);
++}
+diff --git a/crates/rt/src/gpu/vulkan/overlay_font.r8 b/crates/rt/src/gpu/vulkan/overlay_font.r8
+new file mode 100644
+index 0000000000000000000000000000000000000000..30a3af0b0960125de1307b53a8a915cc342ae7ad
+GIT binary patch
+literal 37632
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/rt/src/gpu/vulkan/overlay_fs.spv b/crates/rt/src/gpu/vulkan/overlay_fs.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb3d0fad1780256cc071360700372f2e2413b6aa
+GIT binary patch
+literal 1760
+zcmZvcX-*YU5QRTpzkYxqgG_>oAkN@(0z?r3Cs0YmnCJ$K8^8tl$JMw8SD@>0NKDLE
+zUDv!AZ_>G4=hUrRb*j3n)>1!JAE$u>nl(;~K46GW?0W~V54uMm-gQ^kZs;*W6^{Ch
+zGC&(R3%oyqDc~e<3OECdQ3clz>{HXpJC<@Un6bnLdi+|64JUT&KWD|t*|8qKa&`gO
+zqvALO=6$}qN)CIp83oQIUhKsld;A|>Ti(0%x9*|Pqp{UszURDpXcvFADf|Sj$ZeV`
+zlr`rW+M%mTTgwz}Y6#9XpIWNDxX&zup|fYar*{>5j#g-F{6Pp`V;D~@#kAe^u_ojB
+z%%_g_aDg@>>8GBXY1=E$%G(c@y_eTkXP5kme7EQF+Un|(pUygrC$Fu})*?Tf@8&D7
+zt?u&0U)_tpdRs?{r)?j^7O6s8wKlfB)z4a&Q~NR>+Mc->nSR_Z_N6BEzx-w3+t=Zp
+z6*{5g6$nh+$9tAjALD6XOIzK$RJp?>EpEkkRdFYM^xw)n?SIMhLDsxZ9rgHax}2*Y
+zw3rBe>bU!A#<G@8>bQR;u`aNcb25|KYpeHMYF&8$A8LI_C+27}=BM$K+ocXo{pOqz
+zwe+mBaX#ll+gZ4fbMTWE*E47LSJZL0KOy7WS24A_34y!5P={8x6SptlsaOpbe$ftY
+z4FXdW-%I@Up7?L5L+_2u)7;)t$86k%!1XVA+=IYf52!+4F>CRD?{e3_nZu?Q=k6r~
+z(eL}w3;WS5>y$U1y^&W>d%vCkF?+6l&cRONpHqk3#ME3J9%fv1kb4AynVav%asD1d
+z+&4^r*iTY(doSlamz?CR(b&duFL9n`oKo{%Pt8TQ{rGP--=gR2=`#rZK4p)e$N#;-
+V4^zJv5b@>A#qU|{H+^i-#~&`5NzMQO
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/rt/src/gpu/vulkan/overlay_vs.spv b/crates/rt/src/gpu/vulkan/overlay_vs.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..573e43a3f728d77d5f66ac9e56bc119ad9f1fa34
+GIT binary patch
+literal 1556
+zcmZ9M+fEcw5JlH?PtS-bhzJPk2;v<bZ-6Lr8GRTZc+mI@{sG2k6Jz2h>w}3|)pbbg
+zNjlxTcHPddbGoiJhtxf;1Mg_p0u?=AmO;FyC!bEnr(Zsgw|AcEF-IMa`pk1azHb0u
+zPvH`<2rL0tfi;NS?`asc>DkP8v6)BPIXJUbX}gfNw#vV;+Dfc-&8Mxzt^-qQE~ZW1
+zZ&&GIN<U&pX&2kS*xX|GA~vtsea&|K-D5XiEld0&Rm3e*hidk;LZ3baHs=z38VJrc
+zO0D$K?z74a!;G=7?kaeVDl|0zO!}I`eCnc2>{}oA;3R!UsgpBWr_Wsasn>pDXJM@T
+zLh55ad9gFFmx9$%tp9R;8!s<b*TS!6AB7jIv%MLAEx$`WvAWBfPk(h6Z&07j%h;RQ
+zw|m?APiwI;w^~7u3vSQHx1)k@r{Lzh3o#2d9aG2qUiSGQxuVln*0yhBA0@VC>E%U7
+zhy9G#zwifn_I7FFym;4Kp0Qt4%!dX|^mQlW?dKrR+2x!~!B_H*itTeHXEC7(tu`QL
+z?OFXz#r>?~`y);C{tzOsYr-J*^*FS5pY3CQ_c?~(erD_wh<NQk(&mpvyL0%Swr3D_
+zXHn`t&$^zQQg^#kS1n839SE+}-GzwPUh2Mtuy^b3LD;SPfnjL$3Zfr5&w`wKIq%mH
+zy1VZ~>cINTJI^=C+nc=D8I<_L<ejs;*qOKw&)8A&YT&$%)8^9Od!kL=b2CX^jpV&2
+V+DiP}<o)-^dvCP;p~oIQ{sIgHH%tHk
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/rt/src/gpu/vulkan/pipeline.rs b/crates/rt/src/gpu/vulkan/pipeline.rs
+index 366744d..dceb28f 100644
+--- a/crates/rt/src/gpu/vulkan/pipeline.rs
++++ b/crates/rt/src/gpu/vulkan/pipeline.rs
+@@ -224,9 +224,18 @@ impl Renderer {
+             let _ = t.join();
+         }
+         self.cache_saved = (self.stats.pipelines, std::time::Instant::now());
+-        let Some(file) = self.cache_file.clone() else { return };
++        let manifest = self.manifest_snapshot();
++        let Some(file) = self.cache_file.clone() else {
++            if let Some((f, m)) = manifest {
++                super::preload::write_manifest(&f, &m);
++            }
++            return;
++        };
+         let (device, cache) = (self.device.clone(), self.pipeline_cache);
+         let save = move || {
++            if let Some((f, m)) = &manifest {
++                super::preload::write_manifest(f, m);
++            }
+             let Ok(data) = (unsafe { device.get_pipeline_cache_data(cache) }) else { return };
+             if data.is_empty() {
+                 return;
+@@ -348,7 +357,7 @@ impl Renderer {
+             let bytes: Vec<u8> = shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{va:010x}_{stage:?}.spv")), bytes);
+         }
+-        let module = unsafe { self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&shader.spirv), None) }.map_err(|e| format!("shader module: {e:?}"))?;
++        let module = self.module_for(&shader.spirv).map_err(|e| format!("shader module: {e:?}"))?;
+         let vertex_index = reads_vertex_index(&shader.spirv);
+         let writes = shader.storage_written != 0 || !shader.images.is_empty();
+         *self.shader_writes.entry(va).or_default() |= writes;
+@@ -370,6 +379,7 @@ impl Renderer {
+         let set = unsafe { self.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&vk_bindings), None).unwrap() };
+         let sets = [set];
+         let layout = unsafe { self.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sets), None).unwrap() };
++        self.preload.layout_keys.insert(layout, key.clone());
+         self.layouts.insert(key, (set, layout));
+         (set, layout)
+     }
+@@ -378,6 +388,11 @@ impl Renderer {
+         if let Some(&p) = self.pipelines.get(key) {
+             return Ok(p);
+         }
++        self.drain_preload();
++        if let Some(&p) = self.pipelines.get(key) {
++            return Ok(p);
++        }
++        self.record_pipeline(key);
+         let Some(c) = self.compiler.as_mut() else {
+             let pipeline = build_pipeline(&self.device, self.pipeline_cache, key).map_err(|e| format!("pipeline: {e:?}"))?;
+             self.pipelines.insert(key.clone(), pipeline);
+diff --git a/crates/rt/src/gpu/vulkan/preload.rs b/crates/rt/src/gpu/vulkan/preload.rs
+new file mode 100644
+index 0000000..0c34d6b
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/preload.rs
+@@ -0,0 +1,434 @@
++//! Pipeline preloading.
++//!
++//! Every graphics pipeline the game asks for is recorded (its SPIR-V and fixed-function state)
++//! in `<exe name>.pipelines` next to the executable. On the next start all recorded pipelines
++//! are built on spare cores while the game boots, and translated shaders whose SPIR-V matches a
++//! preloaded module reuse it, so the game's own pipeline lookups hit them directly instead of
++//! compiling (and skipping draws) the first time a track or car appears.
++
++use std::collections::{HashMap, HashSet};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++
++use ash::vk;
++
++use super::Renderer;
++use super::pipeline::{Built, LayoutKey, PipelineKey, build_pipeline};
++
++const MAGIC: &[u8; 4] = b"KPL1";
++
++#[derive(Clone, PartialEq, Eq, Hash, Debug)]
++pub(super) struct Rec {
++    pub(super) vertex: u64,
++    pub(super) fragment: u64,
++    pub(super) layout: (Vec<(u32, i32)>, u32),
++    pub(super) topology: i32,
++    pub(super) attributes: Vec<(u32, u32, i32, u32)>,
++    pub(super) bindings: Vec<(u32, u32)>,
++    pub(super) colors: Vec<i32>,
++    pub(super) depth: i32,
++    pub(super) blend: Vec<[u32; 8]>,
++    pub(super) depth_clamp: bool,
++    pub(super) alpha_test: [u32; 2],
++}
++
++#[derive(Default)]
++pub(super) struct Manifest {
++    pub(super) spirv: HashMap<u64, Arc<Vec<u32>>>,
++    pub(super) recs: Vec<Rec>,
++}
++
++pub(super) fn spirv_hash(words: &[u32]) -> u64 {
++    let mut h = 0xcbf2_9ce4_8422_2325u64;
++    for w in words {
++        h = (h ^ *w as u64).wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    h ^ (words.len() as u64) << 40
++}
++
++struct Writer(Vec<u8>);
++impl Writer {
++    fn u32(&mut self, v: u32) {
++        self.0.extend_from_slice(&v.to_le_bytes());
++    }
++    fn i32(&mut self, v: i32) {
++        self.u32(v as u32);
++    }
++    fn u64(&mut self, v: u64) {
++        self.0.extend_from_slice(&v.to_le_bytes());
++    }
++}
++
++struct Reader<'a>(&'a [u8]);
++impl Reader<'_> {
++    fn u32(&mut self) -> Option<u32> {
++        let (b, rest) = self.0.split_first_chunk::<4>()?;
++        self.0 = rest;
++        Some(u32::from_le_bytes(*b))
++    }
++    fn i32(&mut self) -> Option<i32> {
++        self.u32().map(|v| v as i32)
++    }
++    fn u64(&mut self) -> Option<u64> {
++        let (b, rest) = self.0.split_first_chunk::<8>()?;
++        self.0 = rest;
++        Some(u64::from_le_bytes(*b))
++    }
++    fn count(&mut self, limit: u32) -> Option<usize> {
++        self.u32().filter(|&n| n <= limit).map(|n| n as usize)
++    }
++}
++
++impl Manifest {
++    pub(super) fn encode(&self) -> Vec<u8> {
++        let mut w = Writer(Vec::new());
++        let mut hashes: Vec<&u64> = self.spirv.keys().collect();
++        hashes.sort();
++        w.u32(hashes.len() as u32);
++        for h in hashes {
++            let words = &self.spirv[h];
++            w.u64(*h);
++            w.u32(words.len() as u32);
++            for x in words.iter() {
++                w.u32(*x);
++            }
++        }
++        w.u32(self.recs.len() as u32);
++        for r in &self.recs {
++            w.u64(r.vertex);
++            w.u64(r.fragment);
++            w.u32(r.layout.0.len() as u32);
++            for &(b, t) in &r.layout.0 {
++                w.u32(b);
++                w.i32(t);
++            }
++            w.u32(r.layout.1);
++            w.i32(r.topology);
++            w.u32(r.attributes.len() as u32);
++            for &(l, b, f, o) in &r.attributes {
++                w.u32(l);
++                w.u32(b);
++                w.i32(f);
++                w.u32(o);
++            }
++            w.u32(r.bindings.len() as u32);
++            for &(b, s) in &r.bindings {
++                w.u32(b);
++                w.u32(s);
++            }
++            w.u32(r.colors.len() as u32);
++            for &c in &r.colors {
++                w.i32(c);
++            }
++            w.i32(r.depth);
++            w.u32(r.blend.len() as u32);
++            for b in &r.blend {
++                for &x in b {
++                    w.u32(x);
++                }
++            }
++            w.u32(r.depth_clamp as u32);
++            w.u32(r.alpha_test[0]);
++            w.u32(r.alpha_test[1]);
++        }
++        let mut out = MAGIC.to_vec();
++        out.extend_from_slice(&(w.0.len() as u32).to_le_bytes());
++        out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 6));
++        out
++    }
++
++    pub(super) fn decode(file: &[u8]) -> Option<Manifest> {
++        if file.get(..4)? != MAGIC {
++            return None;
++        }
++        let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(file.get(8..)?, 1 << 30).ok()?;
++        let mut r = Reader(&raw);
++        let mut m = Manifest::default();
++        for _ in 0..r.count(1 << 20)? {
++            let h = r.u64()?;
++            let n = r.count(1 << 24)?;
++            let words: Option<Vec<u32>> = (0..n).map(|_| r.u32()).collect();
++            m.spirv.insert(h, Arc::new(words?));
++        }
++        for _ in 0..r.count(1 << 22)? {
++            let vertex = r.u64()?;
++            let fragment = r.u64()?;
++            let layout_bindings: Option<Vec<(u32, i32)>> = (0..r.count(256)?).map(|_| Some((r.u32()?, r.i32()?))).collect();
++            let layout = (layout_bindings?, r.u32()?);
++            let topology = r.i32()?;
++            let attributes: Option<Vec<_>> = (0..r.count(64)?).map(|_| Some((r.u32()?, r.u32()?, r.i32()?, r.u32()?))).collect();
++            let bindings: Option<Vec<_>> = (0..r.count(64)?).map(|_| Some((r.u32()?, r.u32()?))).collect();
++            let colors: Option<Vec<_>> = (0..r.count(16)?).map(|_| r.i32()).collect();
++            let depth = r.i32()?;
++            let blend: Option<Vec<[u32; 8]>> = (0..r.count(16)?)
++                .map(|_| {
++                    let mut b = [0u32; 8];
++                    for x in &mut b {
++                        *x = r.u32()?;
++                    }
++                    Some(b)
++                })
++                .collect();
++            let depth_clamp = r.u32()? != 0;
++            let alpha_test = [r.u32()?, r.u32()?];
++            m.recs.push(Rec {
++                vertex,
++                fragment,
++                layout,
++                topology,
++                attributes: attributes?,
++                bindings: bindings?,
++                colors: colors?,
++                depth,
++                blend: blend?,
++                depth_clamp,
++                alpha_test,
++            });
++        }
++        Some(m)
++    }
++}
++
++pub(super) fn manifest_file() -> Option<std::path::PathBuf> {
++    if crate::env_var!("KIRIKAE_NO_PRELOAD").is_some() {
++        return None;
++    }
++    if let Some(p) = crate::env_var!("KIRIKAE_PRELOAD_FILE") {
++        return Some(p.into());
++    }
++    let exe = std::env::current_exe().ok()?;
++    let stem = exe.file_stem()?.to_string_lossy().into_owned();
++    Some(exe.with_file_name(format!("{stem}.pipelines")))
++}
++
++use crate::overlay::{PRELOAD_DONE, PRELOAD_TOTAL};
++
++pub(super) struct Preloader {
++    results: Arc<Mutex<Vec<Built>>>,
++    stop: Arc<AtomicBool>,
++    workers: Vec<std::thread::JoinHandle<()>>,
++}
++
++/// What the renderer keeps for preloading and recording.
++#[derive(Default)]
++pub(super) struct PreloadState {
++    pub(super) file: Option<std::path::PathBuf>,
++    pub(super) module_by_spirv: HashMap<u64, vk::ShaderModule>,
++    pub(super) spirv_by_module: HashMap<vk::ShaderModule, u64>,
++    pub(super) words: HashMap<u64, Arc<Vec<u32>>>,
++    pub(super) layout_keys: HashMap<vk::PipelineLayout, LayoutKey>,
++    pub(super) recorded: HashSet<Rec>,
++    pub(super) order: Vec<Rec>,
++    pub(super) dirty: bool,
++    pub(super) running: Option<Preloader>,
++}
++
++impl Renderer {
++    /// Load the manifest and start building its pipelines in the background.
++    pub(super) fn start_preload(&mut self) {
++        self.preload.file = manifest_file();
++        let Some(file) = self.preload.file.clone() else { return };
++        let Some(m) = std::fs::read(&file).ok().and_then(|d| Manifest::decode(&d)) else { return };
++        let start = std::time::Instant::now();
++        for (h, words) in &m.spirv {
++            let Ok(module) = (unsafe { self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None) }) else { continue };
++            self.preload.module_by_spirv.insert(*h, module);
++            self.preload.spirv_by_module.insert(module, *h);
++            self.preload.words.insert(*h, words.clone());
++        }
++        let mut keys = Vec::new();
++        for r in m.recs {
++            let module = |h: u64| if h == 0 { Some(vk::ShaderModule::null()) } else { self.preload.module_by_spirv.get(&h).copied() };
++            let (Some(vertex), Some(fragment)) = (module(r.vertex), module(r.fragment)) else { continue };
++            let bindings: Vec<(u32, vk::DescriptorType)> = r.layout.0.iter().map(|&(b, t)| (b, vk::DescriptorType::from_raw(t))).collect();
++            let (_, layout) = self.layout(&bindings, vk::ShaderStageFlags::from_raw(r.layout.1));
++            keys.push(PipelineKey {
++                vertex,
++                fragment,
++                layout,
++                topology: vk::PrimitiveTopology::from_raw(r.topology),
++                attributes: r.attributes.iter().map(|&(l, b, f, o)| (l, b, vk::Format::from_raw(f), o)).collect(),
++                bindings: r.bindings.clone(),
++                colors: r.colors.iter().map(|&c| vk::Format::from_raw(c)).collect(),
++                depth: vk::Format::from_raw(r.depth),
++                blend: r.blend.clone(),
++                depth_clamp: r.depth_clamp,
++                alpha_test: r.alpha_test,
++            });
++            if self.preload.recorded.insert(r.clone()) {
++                self.preload.order.push(r);
++            }
++        }
++        let total = keys.len();
++        PRELOAD_TOTAL.store(total, Ordering::Relaxed);
++        PRELOAD_DONE.store(0, Ordering::Relaxed);
++        eprintln!("kirikae: preloading {total} pipelines from {} ({} shaders, {:.0} ms to load)", file.display(), m.spirv.len(), start.elapsed().as_secs_f64() * 1e3);
++        if total == 0 {
++            return;
++        }
++        let keys = Arc::new(keys);
++        let next = Arc::new(AtomicUsize::new(0));
++        let results = Arc::new(Mutex::new(Vec::new()));
++        let stop = Arc::new(AtomicBool::new(false));
++        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 16);
++        let workers = (0..threads)
++            .filter_map(|i| {
++                let (keys, next, results, stop, device, cache) = (keys.clone(), next.clone(), results.clone(), stop.clone(), self.device.clone(), self.pipeline_cache);
++                std::thread::Builder::new()
++                    .name(format!("kirikae-preload-{i}"))
++                    .spawn(move || {
++                        while !stop.load(Ordering::Relaxed) {
++                            let i = next.fetch_add(1, Ordering::Relaxed);
++                            let Some(key) = keys.get(i) else { return };
++                            let r = build_pipeline(&device, cache, key);
++                            results.lock().unwrap().push((key.clone(), r));
++                            let done = PRELOAD_DONE.fetch_add(1, Ordering::Relaxed) + 1;
++                            if done == keys.len() {
++                                eprintln!("kirikae: preloaded {done} pipelines in {:.1} s", start.elapsed().as_secs_f64());
++                            }
++                        }
++                    })
++                    .ok()
++            })
++            .collect();
++        self.preload.running = Some(Preloader { results, stop, workers });
++    }
++
++    /// Move finished preloaded pipelines into the pipeline table.
++    pub(super) fn drain_preload(&mut self) {
++        let Some(p) = &self.preload.running else { return };
++        let built: Vec<Built> = std::mem::take(&mut *p.results.lock().unwrap());
++        let finished = p.workers.iter().all(|w| w.is_finished());
++        for (key, r) in built {
++            match r {
++                Ok(pipe) if self.pipelines.contains_key(&key) => unsafe { self.device.destroy_pipeline(pipe, None) },
++                Ok(pipe) => {
++                    self.pipelines.insert(key, pipe);
++                    self.stats.pipelines += 1;
++                }
++                Err(e) => eprintln!("kirikae: preloaded pipeline failed ({e:?})"),
++            }
++        }
++        if finished && p.results.lock().unwrap().is_empty() {
++            self.preload.running = None;
++        }
++    }
++
++    pub(super) fn stop_preload(&mut self) {
++        if let Some(p) = &mut self.preload.running {
++            p.stop.store(true, Ordering::Relaxed);
++            for w in p.workers.drain(..) {
++                let _ = w.join();
++            }
++        }
++        self.drain_preload();
++        self.preload.running = None;
++    }
++
++    /// The module for this SPIR-V: a preloaded or earlier one with the same code, or a new one.
++    pub(super) fn module_for(&mut self, spirv: &[u32]) -> Result<vk::ShaderModule, vk::Result> {
++        let h = spirv_hash(spirv);
++        if let Some(&m) = self.preload.module_by_spirv.get(&h)
++            && self.preload.words.get(&h).is_some_and(|w| w.as_slice() == spirv)
++        {
++            return Ok(m);
++        }
++        let module = unsafe { self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)? };
++        if self.preload.file.is_none() {
++            return Ok(module);
++        }
++        if !self.preload.module_by_spirv.contains_key(&h) {
++            self.preload.module_by_spirv.insert(h, module);
++            self.preload.words.insert(h, Arc::new(spirv.to_vec()));
++        }
++        // A hash collision with different code is not recorded.
++        if self.preload.words.get(&h).is_some_and(|w| w.as_slice() == spirv) {
++            self.preload.spirv_by_module.insert(module, h);
++        }
++        Ok(module)
++    }
++
++    /// Note a pipeline the game asked for, for the next start's preload.
++    pub(super) fn record_pipeline(&mut self, key: &PipelineKey) {
++        if self.preload.file.is_none() {
++            return;
++        }
++        let hash = |m: vk::ShaderModule| if m == vk::ShaderModule::null() { Some(0) } else { self.preload.spirv_by_module.get(&m).copied() };
++        let (Some(vertex), Some(fragment), Some(layout)) = (hash(key.vertex), hash(key.fragment), self.preload.layout_keys.get(&key.layout)) else { return };
++        if (vertex != 0 && !self.preload.words.contains_key(&vertex)) || (fragment != 0 && !self.preload.words.contains_key(&fragment)) {
++            return;
++        }
++        let rec = Rec {
++            vertex,
++            fragment,
++            layout: (layout.0.iter().map(|&(b, t)| (b, t.as_raw())).collect(), layout.1),
++            topology: key.topology.as_raw(),
++            attributes: key.attributes.iter().map(|&(l, b, f, o)| (l, b, f.as_raw(), o)).collect(),
++            bindings: key.bindings.clone(),
++            colors: key.colors.iter().map(|c| c.as_raw()).collect(),
++            depth: key.depth.as_raw(),
++            blend: key.blend.clone(),
++            depth_clamp: key.depth_clamp,
++            alpha_test: key.alpha_test,
++        };
++        if self.preload.recorded.insert(rec.clone()) {
++            self.preload.order.push(rec);
++            self.preload.dirty = true;
++        }
++    }
++
++    /// Snapshot for writing the manifest off the render thread.
++    pub(super) fn manifest_snapshot(&mut self) -> Option<(std::path::PathBuf, Manifest)> {
++        if !self.preload.dirty {
++            return None;
++        }
++        let file = self.preload.file.clone()?;
++        self.preload.dirty = false;
++        let mut used = HashSet::new();
++        for r in &self.preload.order {
++            used.insert(r.vertex);
++            used.insert(r.fragment);
++        }
++        let spirv = used.iter().filter_map(|h| self.preload.words.get(h).map(|w| (*h, w.clone()))).collect();
++        Some((file, Manifest { spirv, recs: self.preload.order.clone() }))
++    }
++}
++
++pub(super) fn write_manifest(file: &std::path::Path, m: &Manifest) {
++    let tmp = file.with_extension(format!("pipelines.{}.tmp", std::process::id()));
++    if std::fs::write(&tmp, m.encode()).is_err() || std::fs::rename(&tmp, file).is_err() {
++        let _ = std::fs::remove_file(&tmp);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn manifest_round_trip() {
++        let mut m = Manifest::default();
++        m.spirv.insert(5, Arc::new(vec![0x0723_0203, 1, 2, 3]));
++        m.spirv.insert(9, Arc::new(vec![0x0723_0203, 7]));
++        m.recs.push(Rec {
++            vertex: 5,
++            fragment: 9,
++            layout: (vec![(0, 6), (40, 1)], 0x11),
++            topology: 3,
++            attributes: vec![(0, 0, 109, 0), (1, 0, 37, 12)],
++            bindings: vec![(0, 16)],
++            colors: vec![44, 97],
++            depth: 129,
++            blend: vec![[1, 2, 3, 4, 5, 6, 7, 8]],
++            depth_clamp: true,
++            alpha_test: [7, 0x3f00_0000],
++        });
++        m.recs.push(Rec { fragment: 0, colors: vec![], blend: vec![], ..m.recs[0].clone() });
++        let back = Manifest::decode(&m.encode()).unwrap();
++        assert_eq!(back.recs, m.recs);
++        assert_eq!(back.spirv.len(), 2);
++        assert_eq!(*back.spirv[&5], vec![0x0723_0203, 1, 2, 3]);
++        assert!(Manifest::decode(b"nope").is_none());
++        assert!(Manifest::decode(&m.encode()[..20]).is_none());
++    }
++}
+diff --git a/crates/rt/src/gpu/vulkan/present.rs b/crates/rt/src/gpu/vulkan/present.rs
+index 72a3669..b48a3c6 100644
+--- a/crates/rt/src/gpu/vulkan/present.rs
++++ b/crates/rt/src/gpu/vulkan/present.rs
+@@ -14,6 +14,10 @@ pub(super) struct Swapchain {
+     pub(super) stale: bool,
+     pub(super) format: vk::Format,
+     pub(super) readable: bool,
++    pub(super) vsync: bool,
++    /// Views for drawing the settings menu over the frame (empty if the swapchain cannot be
++    /// rendered to).
++    pub(super) views: Vec<vk::ImageView>,
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+@@ -111,6 +115,15 @@ impl Renderer {
+                 d.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &after_clear, &[], &[]);
+             }
+             d.cmd_blit_image(self.cmd, source, vk::ImageLayout::GENERAL, target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &region, scale_filter);
++        }
++        let menu = crate::overlay::build(extent.width, extent.height);
++        let view = self.swapchain.as_ref().and_then(|sc| sc.views.get(index as usize).copied());
++        if let (false, Some(view)) = (menu.is_empty(), view) {
++            let format = self.swapchain.as_ref().unwrap().format;
++            self.draw_overlay(target, view, format, extent, &menu);
++        }
++        unsafe {
++            let d = &self.device;
+             if let Some(buffer) = readback {
+                 let to_src = [vk::ImageMemoryBarrier::default()
+                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+@@ -203,6 +216,8 @@ impl Renderer {
+                     stale: true,
+                     format: vk::Format::UNDEFINED,
+                     readable: false,
++                    vsync: false,
++                    views: Vec::new(),
+                 });
+                 surface
+             }
+@@ -220,7 +235,8 @@ impl Renderer {
+             return None;
+         }
+         let sc = self.swapchain.as_ref()?;
+-        if !sc.stale && sc.extent == extent && sc.srgb == srgb {
++        let vsync = crate::env_var!("KIRIKAE_VSYNC").is_some() || crate::settings::get().vsync;
++        if !sc.stale && sc.extent == extent && sc.srgb == srgb && sc.vsync == vsync {
+             return Some(());
+         }
+         if !caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+@@ -241,12 +257,14 @@ impl Renderer {
+             .copied()?;
+         let modes = unsafe { surface_fn.get_physical_device_surface_present_modes(self.physical, surface) }.unwrap_or_default();
+         let order: &[vk::PresentModeKHR] =
+-            if crate::env_var!("KIRIKAE_VSYNC").is_some() || crate::settings::get().vsync { &[vk::PresentModeKHR::FIFO] } else { &[vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::FIFO] };
++            if vsync { &[vk::PresentModeKHR::FIFO] } else { &[vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::FIFO] };
+         let mode = order.iter().copied().find(|m| modes.contains(m)).unwrap_or(vk::PresentModeKHR::FIFO);
+         let count = if caps.max_image_count > 0 { (caps.min_image_count + 1).min(caps.max_image_count) } else { caps.min_image_count + 1 };
+         let old = self.swapchain.as_ref().map_or(vk::SwapchainKHR::null(), |sc| sc.handle);
+         let readable = crate::env_var!("KIRIKAE_PRESENT_DUMP").is_some() && caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_SRC);
+         let usage = if readable { vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC } else { vk::ImageUsageFlags::TRANSFER_DST };
++        let drawable = caps.supported_usage_flags.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT);
++        let usage = if drawable { usage | vk::ImageUsageFlags::COLOR_ATTACHMENT } else { usage };
+         let info = vk::SwapchainCreateInfoKHR::default()
+             .surface(surface)
+             .min_image_count(count)
+@@ -274,8 +292,21 @@ impl Renderer {
+         self.drop_swapchain(false);
+         let images = unsafe { swapchain_fn.get_swapchain_images(handle) }.ok()?;
+         let done = images.iter().map(|_| unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap() }).collect();
++        let views = if drawable {
++            images
++                .iter()
++                .filter_map(|&image| {
++                    let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
++                    let info = vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(format.format).subresource_range(range);
++                    unsafe { self.device.create_image_view(&info, None) }.ok()
++                })
++                .collect::<Vec<_>>()
++        } else {
++            Vec::new()
++        };
++        let views = if views.len() == images.len() { views } else { Vec::new() };
+         let sc = self.swapchain.as_mut()?;
+-        *sc = Swapchain { surface, handle, images, extent, srgb, done, stale: false, format: format.format, readable };
++        *sc = Swapchain { surface, handle, images, extent, srgb, done, stale: false, format: format.format, readable, vsync, views };
+         if crate::gpu::trace() || self.stats.presents == 0 {
+             eprintln!("kirikae: presenting to the window through a swapchain ({}x{}, {:?}, {mode:?})", extent.width, extent.height, format.format);
+         }
+@@ -289,6 +320,9 @@ impl Renderer {
+             for s in sc.done.drain(..) {
+                 self.device.destroy_semaphore(s, None);
+             }
++            for v in sc.views.drain(..) {
++                self.device.destroy_image_view(v, None);
++            }
+             if sc.handle != vk::SwapchainKHR::null()
+                 && let Some(f) = &self.swapchain_fn
+             {
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index 339a7c2..a8b5f77 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -517,7 +517,7 @@ impl Renderer {
+         let filter = |l: bool| if l { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+         // Forced anisotropy only for filtered, mipmapped, non-shadow lookups; full-screen
+         // passes sample without mips and keep the game's setting.
+-        let forced = if s.min_linear && s.mip >= 2 && s.compare.is_none() { crate::settings::get().anisotropy } else { 1 };
++        let forced = if s.min_linear && s.mip >= 2 && s.compare.is_none() { crate::settings::boot().anisotropy } else { 1 };
+         let aniso = s.max_anisotropy.max(forced).min(16);
+         let info = vk::SamplerCreateInfo::default()
+             .mag_filter(filter(s.mag_linear))
+diff --git a/crates/rt/src/input.rs b/crates/rt/src/input.rs
+index 267cfae..3671a1f 100644
+--- a/crates/rt/src/input.rs
++++ b/crates/rt/src/input.rs
+@@ -33,44 +33,6 @@ pub struct PadState {
+     pub right: (i32, i32),
+ }
+ 
+-enum Control {
+-    Button(u64),
+-    Left(i32, i32),
+-    Right(i32, i32),
+-}
+-
+-fn control(code: KeyCode) -> Option<Control> {
+-    use Control::*;
+-    use KeyCode as K;
+-    Some(match code {
+-        K::KeyW | K::ArrowUp => Left(0, 1),
+-        K::KeyS | K::ArrowDown => Left(0, -1),
+-        K::KeyA | K::ArrowLeft => Left(-1, 0),
+-        K::KeyD | K::ArrowRight => Left(1, 0),
+-        K::KeyI => Right(0, 1),
+-        K::KeyK => Right(0, -1),
+-        K::KeyJ => Right(-1, 0),
+-        K::KeyL => Right(1, 0),
+-        K::KeyZ | K::Space => Button(button::A),
+-        K::KeyX => Button(button::B),
+-        K::KeyC => Button(button::X),
+-        K::KeyV => Button(button::Y),
+-        K::KeyE => Button(button::L),
+-        K::KeyU => Button(button::R),
+-        K::KeyQ => Button(button::ZL),
+-        K::KeyO => Button(button::ZR),
+-        K::Enter | K::Equal | K::NumpadAdd => Button(button::PLUS),
+-        K::Backspace | K::Minus | K::NumpadSubtract => Button(button::MINUS),
+-        K::KeyT => Button(button::UP),
+-        K::KeyF => Button(button::LEFT),
+-        K::KeyG => Button(button::DOWN),
+-        K::KeyH => Button(button::RIGHT),
+-        K::ShiftLeft => Button(button::STICK_L),
+-        K::KeyM => Button(button::STICK_R),
+-        _ => return None,
+-    })
+-}
+-
+ static KEYS: Mutex<Option<HashSet<KeyCode>>> = Mutex::new(None);
+ 
+ pub fn key(code: KeyCode, pressed: bool) {
+@@ -89,23 +51,11 @@ pub fn release_all() {
+     }
+ }
+ 
+-fn key_stick(x: i32, y: i32) -> (i32, i32) {
+-    let (x, y) = (x.signum(), y.signum());
+-    let scale = if x != 0 && y != 0 { (STICK_MAX as f32 * std::f32::consts::FRAC_1_SQRT_2) as i32 } else { STICK_MAX };
+-    (x * scale, y * scale)
+-}
+-
+ fn keyboard() -> PadState {
+     let keys = KEYS.lock().unwrap();
+-    let (mut buttons, mut l, mut r) = (0, (0, 0), (0, 0));
+-    for c in keys.iter().flatten().filter_map(|&k| control(k)) {
+-        match c {
+-            Control::Button(b) => buttons |= b,
+-            Control::Left(x, y) => l = (l.0 + x, l.1 + y),
+-            Control::Right(x, y) => r = (r.0 + x, r.1 + y),
+-        }
+-    }
+-    PadState { buttons, left: key_stick(l.0, l.1), right: key_stick(r.0, r.1) }
++    let empty = HashSet::new();
++    let keys = keys.as_ref().unwrap_or(&empty);
++    crate::bindings::keyboard(&|k| keys.contains(&k))
+ }
+ 
+ fn stick_bits(s: (i32, i32), first: u64) -> u64 {
+@@ -208,8 +158,21 @@ fn scripted() -> Option<PadState> {
+ }
+ 
+ pub fn state() -> PadState {
++    let raw = gamepad::poll();
++    if let Some(raw) = raw {
++        crate::overlay::pad_input(&raw);
++    }
++    if crate::overlay::owns_input() {
++        return PadState::default();
++    }
+     let mut s = keyboard();
+-    for g in [gamepad::poll(), scripted()].into_iter().flatten() {
++    let pad = raw.map(|mut r| {
++        if crate::settings::get().swap_ab_xy {
++            crate::bindings::swap_face(&mut r);
++        }
++        crate::bindings::pad(&r)
++    });
++    for g in [pad, scripted()].into_iter().flatten() {
+         s.buttons |= g.buttons;
+         let pick = |a: i32, b: i32| if b.abs() > a.abs() { b } else { a };
+         s.left = (pick(s.left.0, g.left.0), pick(s.left.1, g.left.1));
+@@ -219,13 +182,20 @@ pub fn state() -> PadState {
+     s
+ }
+ 
++/// Rumble on the active controller: low- and high-frequency motor strength, 0 to 1.
++pub fn rumble(low: f32, high: f32) {
++    let s = crate::settings::get();
++    let k = if s.vibration && !crate::overlay::owns_input() { s.vibration_strength as f32 / 100.0 } else { 0.0 };
++    gamepad::rumble((low * k).clamp(0.0, 1.0), (high * k).clamp(0.0, 1.0));
++}
++
+ #[cfg(windows)]
+ mod gamepad {
+     use std::ffi::{c_char, c_void};
+     use std::sync::Mutex;
+     use std::time::{Duration, Instant};
+ 
+-    use super::{button, PadState, STICK_MAX};
++    use crate::bindings::RawPad;
+ 
+     #[repr(C)]
+     #[derive(Default)]
+@@ -241,6 +211,7 @@ mod gamepad {
+     }
+ 
+     type GetState = unsafe extern "system" fn(u32, *mut XInputState) -> u32;
++    type SetState = unsafe extern "system" fn(u32, *mut [u16; 2]) -> u32;
+ 
+     unsafe extern "system" {
+         fn LoadLibraryA(name: *const c_char) -> *mut c_void;
+@@ -249,13 +220,16 @@ mod gamepad {
+ 
+     struct Pads {
+         get_state: Option<GetState>,
++        set_state: Option<SetState>,
+         connected: [bool; 4],
++        active: Option<u32>,
++        motors: [u16; 2],
+         last_scan: Option<Instant>,
+     }
+ 
+     static PADS: Mutex<Option<Pads>> = Mutex::new(None);
+ 
+-    fn load() -> Option<GetState> {
++    fn load() -> (Option<GetState>, Option<SetState>) {
+         for dll in [c"xinput1_4.dll", c"xinput1_3.dll", c"xinput9_1_0.dll"] {
+             // SAFETY: NUL-terminated names; XInputGetState has this signature
+             // in every XInput version.
+@@ -265,49 +239,39 @@ mod gamepad {
+                     continue;
+                 }
+                 let f = GetProcAddress(module, c"XInputGetState".as_ptr());
++                let g = GetProcAddress(module, c"XInputSetState".as_ptr());
+                 if !f.is_null() {
+-                    return Some(std::mem::transmute::<*mut c_void, GetState>(f));
++                    let set = (!g.is_null()).then(|| std::mem::transmute::<*mut c_void, SetState>(g));
++                    return (Some(std::mem::transmute::<*mut c_void, GetState>(f)), set);
+                 }
+             }
+         }
+-        None
++        (None, None)
+     }
+ 
+-    fn axis(v: i16, dead: i32) -> i32 {
+-        let v = (v as i32).clamp(-STICK_MAX, STICK_MAX);
+-        if v.abs() < dead { 0 } else { v }
++    fn convert(s: &XInputState) -> RawPad {
++        RawPad { buttons: s.buttons, lt: s.left_trigger, rt: s.right_trigger, lx: s.lx, ly: s.ly, rx: s.rx, ry: s.ry }
+     }
+ 
+-    fn convert(s: &XInputState) -> PadState {
+-        const MAP: [(u16, u64); 14] = [
+-            (0x0001, button::UP),
+-            (0x0002, button::DOWN),
+-            (0x0004, button::LEFT),
+-            (0x0008, button::RIGHT),
+-            (0x0010, button::PLUS),
+-            (0x0020, button::MINUS),
+-            (0x0040, button::STICK_L),
+-            (0x0080, button::STICK_R),
+-            (0x0100, button::L),
+-            (0x0200, button::R),
+-            (0x1000, button::B),
+-            (0x2000, button::A),
+-            (0x4000, button::Y),
+-            (0x8000, button::X),
+-        ];
+-        let mut buttons = MAP.iter().filter(|(x, _)| s.buttons & x != 0).fold(0, |b, (_, n)| b | n);
+-        if s.left_trigger > 30 {
+-            buttons |= button::ZL;
+-        }
+-        if s.right_trigger > 30 {
+-            buttons |= button::ZR;
++    pub fn rumble(low: f32, high: f32) {
++        let mut pads = PADS.lock().unwrap();
++        let Some(pads) = pads.as_mut() else { return };
++        let (Some(set), Some(i)) = (pads.set_state, pads.active) else { return };
++        let motors = [(low * 65535.0) as u16, (high * 65535.0) as u16];
++        if motors != pads.motors {
++            pads.motors = motors;
++            let mut v = motors;
++            // SAFETY: XINPUT_VIBRATION is two u16 motor speeds.
++            unsafe { set(i, &mut v) };
+         }
+-        PadState { buttons, left: (axis(s.lx, 7849), axis(s.ly, 7849)), right: (axis(s.rx, 8689), axis(s.ry, 8689)) }
+     }
+ 
+-    pub fn poll() -> Option<PadState> {
++    pub fn poll() -> Option<RawPad> {
+         let mut pads = PADS.lock().unwrap();
+-        let pads = pads.get_or_insert_with(|| Pads { get_state: load(), connected: [false; 4], last_scan: None });
++        let pads = pads.get_or_insert_with(|| {
++            let (get_state, set_state) = load();
++            Pads { get_state, set_state, connected: [false; 4], active: None, motors: [0; 2], last_scan: None }
++        });
+         let get_state = pads.get_state?;
+         let scan = pads.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+         if scan {
+@@ -323,6 +287,7 @@ mod gamepad {
+             pads.connected[i] = unsafe { get_state(i as u32, &mut st) } == 0;
+             if pads.connected[i] && found.is_none() {
+                 found = Some(convert(&st));
++                pads.active = Some(i as u32);
+             }
+         }
+         found
+@@ -336,39 +301,44 @@ mod gamepad {
+ 
+     use gilrs::{Axis, Button, Gilrs};
+ 
+-    use super::{button, PadState, STICK_MAX};
+-
+-    static STATE: Mutex<Option<PadState>> = Mutex::new(None);
+-
+-    fn axis(v: f32, dead: f32) -> i32 {
+-        if v.abs() < dead { 0 } else { (v.clamp(-1.0, 1.0) * STICK_MAX as f32) as i32 }
+-    }
+-
+-    fn read(gilrs: &Gilrs) -> Option<PadState> {
+-        const MAP: [(Button, u64); 16] = [
+-            (Button::DPadUp, button::UP),
+-            (Button::DPadDown, button::DOWN),
+-            (Button::DPadLeft, button::LEFT),
+-            (Button::DPadRight, button::RIGHT),
+-            (Button::Start, button::PLUS),
+-            (Button::Select, button::MINUS),
+-            (Button::LeftThumb, button::STICK_L),
+-            (Button::RightThumb, button::STICK_R),
+-            (Button::LeftTrigger, button::L),
+-            (Button::RightTrigger, button::R),
+-            (Button::LeftTrigger2, button::ZL),
+-            (Button::RightTrigger2, button::ZR),
+-            (Button::South, button::B),
+-            (Button::East, button::A),
+-            (Button::West, button::Y),
+-            (Button::North, button::X),
++    use crate::bindings::{RawPad, xb};
++
++    static STATE: Mutex<Option<RawPad>> = Mutex::new(None);
++
++    fn read(gilrs: &Gilrs) -> Option<RawPad> {
++        const MAP: [(Button, u16); 14] = [
++            (Button::DPadUp, xb::DPUP),
++            (Button::DPadDown, xb::DPDOWN),
++            (Button::DPadLeft, xb::DPLEFT),
++            (Button::DPadRight, xb::DPRIGHT),
++            (Button::Start, xb::START),
++            (Button::Select, xb::BACK),
++            (Button::LeftThumb, xb::LSTICK),
++            (Button::RightThumb, xb::RSTICK),
++            (Button::LeftTrigger, xb::LB),
++            (Button::RightTrigger, xb::RB),
++            (Button::South, xb::A),
++            (Button::East, xb::B),
++            (Button::West, xb::X),
++            (Button::North, xb::Y),
+         ];
+         let (_, pad) = gilrs.gamepads().find(|(_, g)| g.is_connected())?;
+         let buttons = MAP.iter().filter(|(b, _)| pad.is_pressed(*b)).fold(0, |acc, (_, n)| acc | n);
+-        let stick = |x: Axis, y: Axis| (axis(pad.value(x), 0.24), axis(pad.value(y), 0.24));
+-        Some(PadState { buttons, left: stick(Axis::LeftStickX, Axis::LeftStickY), right: stick(Axis::RightStickX, Axis::RightStickY) })
++        let ax = |a: Axis| (pad.value(a).clamp(-1.0, 1.0) * 32767.0) as i16;
++        let trig = |b: Button| (pad.button_data(b).map_or(if pad.is_pressed(b) { 1.0 } else { 0.0 }, |d| d.value()) * 255.0) as u8;
++        Some(RawPad {
++            buttons,
++            lt: trig(Button::LeftTrigger2),
++            rt: trig(Button::RightTrigger2),
++            lx: ax(Axis::LeftStickX),
++            ly: ax(Axis::LeftStickY),
++            rx: ax(Axis::RightStickX),
++            ry: ax(Axis::RightStickY),
++        })
+     }
+ 
++    pub fn rumble(_low: f32, _high: f32) {}
++
+     fn run() {
+         let mut gilrs = match Gilrs::new() {
+             Ok(g) => g,
+@@ -384,7 +354,7 @@ mod gamepad {
+         }
+     }
+ 
+-    pub fn poll() -> Option<PadState> {
++    pub fn poll() -> Option<RawPad> {
+         static STARTED: OnceLock<()> = OnceLock::new();
+         STARTED.get_or_init(|| {
+             let _ = std::thread::Builder::new().name("kirikae-gamepad".into()).spawn(run);
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index 1a80b10..98f084c 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -26,6 +26,8 @@ pub mod nvn;
+ pub mod process;
+ pub mod prof;
+ pub mod sched;
++pub mod bindings;
++pub mod overlay;
+ pub mod services;
+ pub mod settings;
+ pub mod simd;
+diff --git a/crates/rt/src/overlay.rs b/crates/rt/src/overlay.rs
+new file mode 100644
+index 0000000..7ebf60a
+--- /dev/null
++++ b/crates/rt/src/overlay.rs
+@@ -0,0 +1,512 @@
++//! In-game settings menu, frame-rate counter and shader-preload progress.
++//! Open/close: F1 or Esc on the keyboard, Start+Back together on a controller.
++//! The game is paused while the menu is open.
++//!
++//! Same menu as the other native ports: the layout, colours and font (DejaVu Sans Mono Bold)
++//! match them. UI state changes on the window thread (keyboard) and the input thread
++//! (controller); the vertices are built on the render thread when a frame is presented.
++
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use crate::bindings::{self, CONTROLS, RawPad, xb};
++use crate::settings::{self, Filter};
++
++pub const FONT_CW: f32 = 14.0;
++pub const FONT_CH: f32 = 28.0;
++pub const FONT_W: u32 = 224;
++pub const FONT_H: u32 = 168;
++
++/// Startup pipeline preload progress (set by the renderer).
++pub static PRELOAD_TOTAL: AtomicUsize = AtomicUsize::new(0);
++pub static PRELOAD_DONE: AtomicUsize = AtomicUsize::new(0);
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Nav {
++    Up,
++    Down,
++    Left,
++    Right,
++    Ok,
++    Back,
++}
++
++#[derive(Default)]
++struct Ui {
++    open: bool,
++    sel: usize,
++    quit_armed: bool,
++    /// 0 main menu, 1 keyboard keys, 2 controller buttons
++    keys_page: u8,
++    key_sel: usize,
++    capturing: Option<usize>,
++    /// The controller input that was just bound must not also act on the menu.
++    skip_pad: bool,
++}
++
++static UI: Mutex<Ui> = Mutex::new(Ui { open: false, sel: 0, quit_armed: false, keys_page: 0, key_sel: 0, capturing: None, skip_pad: false });
++static OPEN: AtomicBool = AtomicBool::new(false);
++
++struct Item {
++    label: &'static str,
++    opts: &'static [&'static str],
++    note: Option<&'static str>,
++}
++
++const RESOLUTIONS: [(u32, u32); 4] = [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
++const ANISOTROPY: [u32; 5] = [1, 2, 4, 8, 16];
++const FRAME_RATES: [u32; 3] = [60, 120, 144];
++
++static ITEMS: &[Item] = &[
++    Item { label: "Resolution", opts: &["1280x720 (handheld)", "1920x1080 (docked)", "2560x1440", "3840x2160"], note: Some("Applies after a restart. Above 1080p is experimental.") },
++    Item { label: "Aspect ratio", opts: &["16:9 (black bars)", "Stretch"], note: Some("How the picture fits a window that is not 16:9.") },
++    Item { label: "VSync", opts: &["Off", "On"], note: None },
++    Item { label: "Fullscreen", opts: &["Off", "On"], note: Some("Also F11 or Alt+Enter.") },
++    Item { label: "Scaling", opts: &["Sharp", "Smooth"], note: Some("How the picture is scaled to the window.") },
++    Item { label: "Texture filtering", opts: &["Off (original)", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic"], note: Some("Sharper road and ground in the distance. Applies after a restart.") },
++    Item { label: "Frame rate", opts: &["60 (original)", "120", "144"], note: Some("Applies after a restart. Above 60 is experimental.") },
++    Item { label: "Vibration", opts: &["Off", "On"], note: Some("Controller rumble, when the game uses it.") },
++    Item { label: "Vibration strength", opts: &["25%", "50%", "75%", "100%"], note: None },
++    Item { label: "Swap A/B and X/Y", opts: &["Off", "On"], note: Some("Gamepad: use the face buttons by position (Nintendo style).") },
++    Item { label: "Frame rate display", opts: &["Off", "On"], note: None },
++    Item { label: "Keyboard keys", opts: &[], note: Some("Change which key presses each Switch button.") },
++    Item { label: "Controller buttons", opts: &[], note: Some("Change which controller button presses each Switch button.") },
++    Item { label: "Close menu", opts: &[], note: None },
++    Item { label: "Quit game", opts: &[], note: None },
++];
++
++fn get_value(i: usize) -> usize {
++    let s = settings::get();
++    let pos = |v: usize| v;
++    match i {
++        0 => RESOLUTIONS.iter().position(|&r| r == (s.render_width, s.render_height)).unwrap_or(1),
++        1 => pos(!s.keep_aspect as usize),
++        2 => s.vsync as usize,
++        3 => s.fullscreen as usize,
++        4 => (s.scale_filter == Filter::Linear) as usize,
++        5 => ANISOTROPY.iter().position(|&a| a >= s.anisotropy).unwrap_or(4),
++        6 => FRAME_RATES.iter().position(|&f| f == s.frame_rate).unwrap_or(0),
++        7 => s.vibration as usize,
++        8 => ((s.vibration_strength as usize + 12) / 25).clamp(1, 4) - 1,
++        9 => s.swap_ab_xy as usize,
++        10 => s.show_fps as usize,
++        _ => 0,
++    }
++}
++
++fn set_value(i: usize, v: usize) {
++    settings::update(|f| {
++        let s = &mut f.settings;
++        match i {
++            0 => (s.render_width, s.render_height) = RESOLUTIONS[v],
++            1 => s.keep_aspect = v == 0,
++            2 => s.vsync = v == 1,
++            3 => s.fullscreen = v == 1,
++            4 => s.scale_filter = if v == 1 { Filter::Linear } else { Filter::Nearest },
++            5 => s.anisotropy = ANISOTROPY[v],
++            6 => s.frame_rate = FRAME_RATES[v],
++            7 => s.vibration = v == 1,
++            8 => s.vibration_strength = (v as u32 + 1) * 25,
++            9 => s.swap_ab_xy = v == 1,
++            10 => s.show_fps = v == 1,
++            _ => {}
++        }
++    });
++    if i == 3 {
++        crate::display::apply_fullscreen(v == 1);
++    }
++}
++
++pub fn is_open() -> bool {
++    OPEN.load(Ordering::Relaxed)
++}
++
++/// The menu owns the controls while open; the game sees nothing pressed.
++pub fn owns_input() -> bool {
++    is_open()
++}
++
++/// The game is held (its last frame shown again) while the menu is open.
++pub fn pausing() -> bool {
++    is_open()
++}
++
++/// 1 when the keyboard page waits for a key, 2 when the controller page waits for an input.
++pub fn capturing() -> u8 {
++    let ui = UI.lock().unwrap();
++    if ui.open && ui.capturing.is_some() { ui.keys_page } else { 0 }
++}
++
++pub fn toggle() {
++    let mut ui = UI.lock().unwrap();
++    ui.open = !ui.open;
++    ui.quit_armed = false;
++    ui.keys_page = 0;
++    ui.capturing = None;
++    OPEN.store(ui.open, Ordering::Relaxed);
++    drop(ui);
++    crate::input::release_all();
++    crate::input::rumble(0.0, 0.0);
++}
++
++/// A key name for the keyboard page, or None to cancel.
++pub fn key_captured(name: Option<&str>) {
++    let mut ui = UI.lock().unwrap();
++    let Some(i) = ui.capturing.take() else { return };
++    if let Some(n) = name.filter(|n| !n.is_empty()) {
++        if ui.keys_page == 2 {
++            bindings::set_pad(i, n);
++        } else {
++            bindings::set_key(i, n);
++        }
++    }
++}
++
++/// Delete on a binding row clears it (no key / no button).
++pub fn clear_binding() {
++    let ui = UI.lock().unwrap();
++    if !ui.open || ui.keys_page == 0 || ui.capturing.is_some() || ui.key_sel >= CONTROLS.len() {
++        return;
++    }
++    if ui.keys_page == 2 {
++        bindings::set_pad(ui.key_sel, "");
++    } else {
++        bindings::set_key(ui.key_sel, "");
++    }
++}
++
++fn keys_rows() -> usize {
++    CONTROLS.len() + 2
++}
++
++fn keys_input(ui: &mut Ui, nav: Nav) {
++    let n = keys_rows();
++    match nav {
++        Nav::Up => ui.key_sel = (ui.key_sel + n - 1) % n,
++        Nav::Down => ui.key_sel = (ui.key_sel + 1) % n,
++        Nav::Back | Nav::Left => ui.keys_page = 0,
++        Nav::Ok | Nav::Right => {
++            if ui.key_sel < CONTROLS.len() {
++                ui.capturing = Some(ui.key_sel);
++            } else if ui.key_sel == CONTROLS.len() {
++                if ui.keys_page == 2 {
++                    bindings::reset_pad();
++                } else {
++                    bindings::reset_keys();
++                }
++            } else {
++                ui.keys_page = 0;
++            }
++        }
++    }
++}
++
++pub fn input(nav: Nav) {
++    let mut ui = UI.lock().unwrap();
++    if !ui.open {
++        return;
++    }
++    if ui.keys_page != 0 {
++        if ui.capturing.is_none() {
++            keys_input(&mut ui, nav);
++        }
++        return;
++    }
++    let n = ITEMS.len();
++    match nav {
++        Nav::Up => {
++            ui.sel = (ui.sel + n - 1) % n;
++            ui.quit_armed = false;
++        }
++        Nav::Down => {
++            ui.sel = (ui.sel + 1) % n;
++            ui.quit_armed = false;
++        }
++        Nav::Back => {
++            drop(ui);
++            toggle();
++        }
++        Nav::Left | Nav::Right | Nav::Ok => {
++            let sel = ui.sel;
++            let item = &ITEMS[sel];
++            if item.opts.is_empty() {
++                if nav != Nav::Ok {
++                    return;
++                }
++                match sel {
++                    _ if sel == n - 4 => {
++                        ui.keys_page = 1;
++                        ui.key_sel = 0;
++                    }
++                    _ if sel == n - 3 => {
++                        ui.keys_page = 2;
++                        ui.key_sel = 0;
++                    }
++                    _ if sel == n - 2 => {
++                        drop(ui);
++                        toggle();
++                    }
++                    _ => {
++                        if ui.quit_armed {
++                            drop(ui);
++                            crate::display::quit();
++                        } else {
++                            ui.quit_armed = true;
++                        }
++                    }
++                }
++                return;
++            }
++            drop(ui);
++            let cnt = item.opts.len();
++            let v = get_value(sel);
++            let v = if nav == Nav::Left { (v + cnt - 1) % cnt } else { (v + 1) % cnt };
++            set_value(sel, v);
++        }
++    }
++}
++
++/// Controller: Start+Back toggles the menu, the d-pad / left stick and A (bottom) / B (right)
++/// drive it, and the controller page binds the next input pressed.
++pub fn pad_input(raw: &RawPad) {
++    static PREV: Mutex<RawPad> = Mutex::new(RawPad { buttons: 0, lt: 0, rt: 0, lx: 0, ly: 0, rx: 0, ry: 0 });
++    let mut prev = PREV.lock().unwrap();
++    let nav_bits = |r: &RawPad| {
++        let mut b = r.buttons;
++        if r.lx > 16000 {
++            b |= xb::DPRIGHT;
++        }
++        if r.lx < -16000 {
++            b |= xb::DPLEFT;
++        }
++        if r.ly > 16000 {
++            b |= xb::DPUP;
++        }
++        if r.ly < -16000 {
++            b |= xb::DPDOWN;
++        }
++        b
++    };
++    let (now_bits, was_bits) = (nav_bits(raw), nav_bits(&prev));
++    let mut down = now_bits & !was_bits;
++    let captured = if capturing() == 2 { bindings::newly_pressed(&prev, raw) } else { None };
++    *prev = *raw;
++    drop(prev);
++    if let Some(name) = captured {
++        key_captured(Some(name));
++        UI.lock().unwrap().skip_pad = true;
++        return;
++    }
++    {
++        let mut ui = UI.lock().unwrap();
++        if ui.skip_pad {
++            ui.skip_pad = false;
++            down = 0;
++        }
++        if ui.capturing.is_some() {
++            return;
++        }
++    }
++    if down & (xb::START | xb::BACK) != 0 && now_bits & xb::START != 0 && now_bits & xb::BACK != 0 {
++        toggle();
++        return;
++    }
++    if !is_open() {
++        return;
++    }
++    let nav = [(xb::DPUP, Nav::Up), (xb::DPDOWN, Nav::Down), (xb::DPLEFT, Nav::Left), (xb::DPRIGHT, Nav::Right), (xb::A, Nav::Ok), (xb::B, Nav::Back)];
++    if let Some(&(_, n)) = nav.iter().find(|(bit, _)| down & bit != 0) {
++        input(n);
++    }
++}
++
++// ---------------------------------------------------------------- drawing
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct Vertex {
++    pub x: f32,
++    pub y: f32,
++    pub u: f32,
++    pub v: f32,
++    pub color: [f32; 4],
++}
++
++struct Builder {
++    verts: Vec<Vertex>,
++}
++
++impl Builder {
++    fn quad(&mut self, x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], c: [f32; 4]) {
++        let [u0, v0, u1, v1] = uv;
++        let v = |x, y, u, v| Vertex { x, y, u, v, color: c };
++        let (a, b, d, e) = (v(x, y, u0, v0), v(x + w, y, u1, v0), v(x, y + h, u0, v1), v(x + w, y + h, u1, v1));
++        self.verts.extend_from_slice(&[a, b, d, b, e, d]);
++    }
++
++    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) {
++        self.quad(x, y, w, h, [-1.0, 0.0, -1.0, 0.0], c);
++    }
++
++    fn text(&mut self, mut x: f32, y: f32, s: f32, text: &str, c: [f32; 4]) -> f32 {
++        for ch in text.chars() {
++            let ch = if (' '..='\u{7f}').contains(&ch) { ch as u32 } else { '?' as u32 };
++            let i = ch - 32;
++            let u0 = (i % 16) as f32 * FONT_CW / FONT_W as f32;
++            let v0 = (i / 16) as f32 * FONT_CH / FONT_H as f32;
++            self.quad(x, y, FONT_CW * s, FONT_CH * s, [u0, v0, u0 + FONT_CW / FONT_W as f32, v0 + FONT_CH / FONT_H as f32], c);
++            x += FONT_CW * s;
++        }
++        x
++    }
++}
++
++const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
++const GREY: [f32; 4] = [0.7, 0.7, 0.75, 1.0];
++const GOLD: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
++const PANEL: [f32; 4] = [0.05, 0.07, 0.15, 0.88];
++const HIGHLIGHT: [f32; 4] = [0.25, 0.35, 0.7, 0.9];
++const SHADE: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
++
++fn fps_text() -> Option<String> {
++    static LAST: Mutex<Option<(std::time::Instant, u64, String)>> = Mutex::new(None);
++    if !settings::get().show_fps {
++        return None;
++    }
++    let frames = crate::display::FRAMES.load(Ordering::Relaxed);
++    let mut last = LAST.lock().unwrap();
++    let now = std::time::Instant::now();
++    match last.as_mut() {
++        None => *last = Some((now, frames, String::new())),
++        Some((t, f, text)) => {
++            let secs = now.duration_since(*t).as_secs_f64();
++            if secs >= 1.0 {
++                *text = format!("{:.0} FPS", (frames - *f) as f64 / secs);
++                *t = now;
++                *f = frames;
++            }
++        }
++    }
++    last.as_ref().map(|l| l.2.clone()).filter(|t| !t.is_empty())
++}
++
++/// Vertices for this frame in window pixels (top-left origin), or nothing to draw.
++pub fn build(ww: u32, wh: u32) -> Vec<Vertex> {
++    let (open, sel, armed, keys_page, key_sel, capturing) = {
++        let ui = UI.lock().unwrap();
++        (ui.open, ui.sel, ui.quit_armed, ui.keys_page, ui.key_sel, ui.capturing)
++    };
++    let fps = fps_text();
++    let (done, total) = (PRELOAD_DONE.load(Ordering::Relaxed), PRELOAD_TOTAL.load(Ordering::Relaxed));
++    let preloading = total > 0 && done < total;
++    if !open && fps.is_none() && !preloading {
++        return Vec::new();
++    }
++    let (ww, wh) = (ww as f32, wh as f32);
++    let mut b = Builder { verts: Vec::new() };
++    let mut s = (wh / 900.0).max(0.6);
++    if let Some(t) = &fps {
++        let tw = t.len() as f32 * FONT_CW * s * 0.8;
++        b.rect(ww - tw - 16.0 * s, 8.0 * s, tw + 12.0 * s, FONT_CH * s * 0.8 + 6.0 * s, SHADE);
++        b.text(ww - tw - 10.0 * s, 11.0 * s, s * 0.8, t, WHITE);
++    }
++    if preloading {
++        let t = format!("Preloading shaders  {done} / {total}");
++        let tw = t.len() as f32 * FONT_CW * s * 0.8;
++        let y = wh - FONT_CH * s * 0.8 - 14.0 * s;
++        b.rect(8.0 * s, y - 3.0 * s, tw + 12.0 * s, FONT_CH * s * 0.8 + 6.0 * s, SHADE);
++        b.text(14.0 * s, y, s * 0.8, &t, GOLD);
++    }
++    if open && keys_page != 0 {
++        let n = keys_rows();
++        s = s.min(wh * 0.92 / ((n as f32 + 4.5) * FONT_CH * 1.25));
++        let lh = FONT_CH * s * 1.25;
++        let (pw, ph) = (46.0 * FONT_CW * s, (n as f32 + 4.5) * lh);
++        let (px, py) = ((ww - pw) / 2.0, (wh - ph) / 2.0);
++        b.rect(0.0, 0.0, ww, wh, SHADE);
++        b.rect(px, py, pw, ph, PANEL);
++        b.text(px + 20.0 * s, py + 14.0 * s, s, if keys_page == 2 { "CONTROLLER BUTTONS" } else { "KEYBOARD KEYS" }, GOLD);
++        let mut y = py + 14.0 * s + lh * 1.4;
++        for i in 0..n {
++            if i == key_sel {
++                b.rect(px + 8.0 * s, y - 4.0 * s, pw - 16.0 * s, lh, HIGHLIGHT);
++            }
++            let col = if i == key_sel { WHITE } else { GREY };
++            if i < CONTROLS.len() {
++                b.text(px + 20.0 * s, y, s, CONTROLS[i].label, col);
++                let k = if capturing == Some(i) {
++                    (if keys_page == 2 { "press a button..." } else { "press a key..." }).to_string()
++                } else if keys_page == 2 {
++                    bindings::pad_binding(i)
++                } else {
++                    bindings::key_binding(i)
++                };
++                let k = if k.is_empty() { "-".to_string() } else { k };
++                b.text(px + 20.0 * s + 22.0 * FONT_CW * s, y, s, &k, if capturing == Some(i) { GOLD } else { WHITE });
++            } else {
++                b.text(px + 20.0 * s, y, s, if i == CONTROLS.len() { "Reset to defaults" } else { "Back" }, col);
++            }
++            y += lh;
++        }
++        let hint = match (capturing.is_some(), keys_page) {
++            (true, 2) => "Press the controller button, trigger or stick direction. Esc cancels.",
++            (true, _) => "Press the new key. Esc cancels.",
++            _ => "Enter: change   Delete: clear   Left / Backspace: back",
++        };
++        b.text(px + 20.0 * s, y + lh * 0.4, s * 0.75, hint, if capturing.is_some() { GOLD } else { GREY });
++        b.text(px + 20.0 * s, y + lh * 1.3, s * 0.75, "Menu keys (arrows, Enter, Esc, F1) always work in this menu.", GREY);
++    } else if open {
++        let lh = FONT_CH * s * 1.35;
++        let (pw, ph) = (46.0 * FONT_CW * s, (ITEMS.len() as f32 + 4.5) * lh);
++        let (px, py) = ((ww - pw) / 2.0, (wh - ph) / 2.0);
++        b.rect(0.0, 0.0, ww, wh, SHADE);
++        b.rect(px, py, pw, ph, PANEL);
++        b.text(px + 20.0 * s, py + 14.0 * s, s, "SETTINGS", GOLD);
++        let mut y = py + 14.0 * s + lh * 1.4;
++        for (i, item) in ITEMS.iter().enumerate() {
++            if i == sel {
++                b.rect(px + 8.0 * s, y - 4.0 * s, pw - 16.0 * s, lh, HIGHLIGHT);
++            }
++            b.text(px + 20.0 * s, y, s, item.label, if i == sel { WHITE } else { GREY });
++            if !item.opts.is_empty() {
++                b.text(px + 20.0 * s + 20.0 * FONT_CW * s, y, s, &format!("< {} >", item.opts[get_value(i)]), WHITE);
++            } else if i == sel && armed {
++                b.text(px + 20.0 * s + 20.0 * FONT_CW * s, y, s, "press again to quit", GOLD);
++            }
++            y += lh;
++        }
++        let note = ITEMS[sel].note.unwrap_or("Up/Down select, Left/Right change. Saved to the .ini file.");
++        b.text(px + 20.0 * s, y + lh * 0.4, s * 0.75, note, GREY);
++        b.text(px + 20.0 * s, y + lh * 1.3, s * 0.75, "F1 / Esc / Start+Back: close", GREY);
++    }
++    b.verts
++}
++
++#[cfg(test)]
++pub(crate) fn test_open(sel: usize) {
++    let mut ui = UI.lock().unwrap();
++    ui.open = true;
++    ui.sel = sel;
++    OPEN.store(true, Ordering::Relaxed);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn closed_menu_draws_nothing() {
++        if !is_open() && !settings::get().show_fps && PRELOAD_TOTAL.load(Ordering::Relaxed) == 0 {
++            assert!(build(1920, 1080).is_empty());
++        }
++    }
++
++    #[test]
++    fn every_option_value_is_in_range() {
++        for (i, item) in ITEMS.iter().enumerate() {
++            if !item.opts.is_empty() {
++                assert!(get_value(i) < item.opts.len(), "{}", item.label);
++            }
++        }
++    }
++}
+diff --git a/crates/rt/src/services/am/applet.rs b/crates/rt/src/services/am/applet.rs
+index 8ecd573..59b25ce 100644
+--- a/crates/rt/src/services/am/applet.rs
++++ b/crates/rt/src/services/am/applet.rs
+@@ -90,7 +90,7 @@ impl Service for CommonStateGetter {
+             8 => Reply::ok().u8(0),
+             9 => Reply::ok().u8(1),
+             60 => {
+-                let s = crate::settings::get();
++                let s = crate::settings::boot();
+                 Reply::ok().u32(s.render_width).u32(s.render_height)
+             }
+             61 => Reply::ok().copy_handle(c.process().create_event(false)),
+diff --git a/crates/rt/src/services/hid.rs b/crates/rt/src/services/hid.rs
+index 6feabb0..6ac192f 100644
+--- a/crates/rt/src/services/hid.rs
++++ b/crates/rt/src/services/hid.rs
+@@ -372,7 +372,7 @@ impl Service for Hid {
+         match req.cmd {
+             0 => Reply::ok().object(Arc::new(AppletResource)),
+             1 | 11 | 21 | 31 | 40 | 66 | 67 | 68 | 69 | 82 | 103 | 104 | 109 | 122 | 123 | 124 | 125 | 128 | 129 | 130 | 131
+-            | 132 | 133 | 201 | 206 | 1000 => crate::services::stub::plain_ok(),
++            | 132 | 133 | 1000 => crate::services::stub::plain_ok(),
+             100 => {
+                 SUPPORTED_STYLES.store(req.u32(0), Relaxed);
+                 npads(c).tick(c.process());
+@@ -410,7 +410,26 @@ impl Service for Hid {
+                 let device = (req.u32(0) >> 16) & 0xff;
+                 Reply::ok().u32(1).u32(device.min(1) + 1)
+             }
++            201 => {
++                // SendVibrationValue: handle, then amp_low, freq_low, amp_high, freq_high
++                let f = |o: usize| f32::from_bits(req.u32(o));
++                crate::input::rumble(f(4), f(12));
++                Reply::ok()
++            }
+             203 => Reply::ok().object(Arc::new(ActiveVibrationDeviceList)),
++            206 => {
++                // SendVibrationValues: a buffer of handles and a buffer of 16-byte values
++                let p = c.process();
++                let values = req.in_buf(1).and_then(|b| p.memory.read(b.addr, b.size.min(0x100))).unwrap_or_default();
++                let (mut low, mut high) = (0f32, 0f32);
++                for v in values.chunks_exact(16) {
++                    let f = |o: usize| f32::from_le_bytes(v[o..o + 4].try_into().unwrap());
++                    low = low.max(f(0));
++                    high = high.max(f(8));
++                }
++                crate::input::rumble(low, high);
++                Reply::ok()
++            }
+             _ => unimplemented("hid", c, req),
+         }
+     }
+diff --git a/crates/rt/src/services/vi.rs b/crates/rt/src/services/vi.rs
+index 306f2dc..1dba84d 100644
+--- a/crates/rt/src/services/vi.rs
++++ b/crates/rt/src/services/vi.rs
+@@ -71,7 +71,7 @@ fn start_vsync(p: &'static Process, st: &State) {
+     }
+     let event = st.vsync_event;
+     let _ = std::thread::Builder::new().name("kirikae-vsync".into()).spawn(move || {
+-        let period = std::time::Duration::from_nanos(1_000_000_000 / crate::settings::get().frame_rate as u64);
++        let period = std::time::Duration::from_nanos(1_000_000_000 / crate::settings::boot().frame_rate as u64);
+         let epoch = *VSYNC_EPOCH.get_or_init(std::time::Instant::now);
+         let past = (epoch.elapsed().as_nanos() / period.as_nanos()) as u32;
+         let mut next = epoch + period * past;
+@@ -240,6 +240,12 @@ fn transact(c: &Cpu, id: i32, code: u32, input: &[u8]) -> Vec<u8> {
+                     drop(prof);
+                     let _prof = crate::prof::enter(crate::prof::Cat::Sleep);
+                     pace(crate::games::pace_interval(p, interval));
++                    // settings menu open: hold the game here and keep showing its last frame
++                    while crate::overlay::pausing() && !p.sched.exiting.load(Ordering::Relaxed) {
++                        present(p, &s, transform);
++                        let _ = crate::input::state(); // the controller drives the menu
++                        std::thread::sleep(std::time::Duration::from_millis(16));
++                    }
+                     crate::games::presented(p);
+                     crate::gpu::frame_presented();
+                 }),
+@@ -403,7 +409,7 @@ fn pace(interval: u32) {
+         return;
+     }
+     let epoch = *VSYNC_EPOCH.get_or_init(std::time::Instant::now);
+-    let hz = crate::settings::get().frame_rate as u128;
++    let hz = crate::settings::boot().frame_rate as u128;
+     let blank = |n: u64| epoch + std::time::Duration::from_nanos((n as u128 * 1_000_000_000 / hz) as u64);
+     let mut last = LAST.lock().unwrap();
+     let now = std::time::Instant::now();
+diff --git a/crates/rt/src/settings.rs b/crates/rt/src/settings.rs
+index c268061..83227e5 100644
+--- a/crates/rt/src/settings.rs
++++ b/crates/rt/src/settings.rs
+@@ -1,10 +1,12 @@
+-//! Player settings, read from `<exe name>.ini` next to the executable.
++//! Player settings, read from `<exe name>.ini` next to the executable and changed from the
++//! in-game settings menu (F1). Every change is saved straight back to the file.
+ //!
+-//! A commented default file is written the first time the game starts, so players can
+-//! find and edit every option. Unknown keys and bad values are reported and ignored.
++//! Some settings can only take effect when the game starts (the render resolution is read
++//! by the game once); `boot()` returns the values the game started with.
+ 
++use std::collections::BTreeMap;
+ use std::path::PathBuf;
+-use std::sync::OnceLock;
++use std::sync::{Mutex, OnceLock, RwLock};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Filter {
+@@ -12,18 +14,13 @@ pub enum Filter {
+     Nearest,
+ }
+ 
+-#[derive(Clone, Debug)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct Settings {
+-    /// Window client size in physical pixels.
+     pub window_width: u32,
+     pub window_height: u32,
+-    /// Start in borderless fullscreen. F11 or Alt+Enter toggles it at runtime.
+     pub fullscreen: bool,
+-    /// Wait for the monitor refresh when presenting (no tearing, a little more latency).
+     pub vsync: bool,
+-    /// Keep the game's aspect ratio and add black bars instead of stretching.
+     pub keep_aspect: bool,
+-    /// Filter used to scale the game's frame to the window.
+     pub scale_filter: Filter,
+     /// Anisotropic filtering forced on mipmapped textures (1 = off, up to 16).
+     pub anisotropy: u32,
+@@ -32,6 +29,12 @@ pub struct Settings {
+     pub render_height: u32,
+     /// Frame rate the game is paced to (the Switch runs it at 60).
+     pub frame_rate: u32,
++    pub vibration: bool,
++    /// Percent.
++    pub vibration_strength: u32,
++    /// Controller face buttons by position (Nintendo layout) instead of by label.
++    pub swap_ab_xy: bool,
++    pub show_fps: bool,
+ }
+ 
+ impl Default for Settings {
+@@ -47,82 +50,206 @@ impl Default for Settings {
+             render_width: 1920,
+             render_height: 1080,
+             frame_rate: 60,
++            vibration: true,
++            vibration_strength: 100,
++            swap_ab_xy: false,
++            show_fps: false,
++        }
++    }
++}
++
++/// Settings plus the key and controller bindings (control id -> input names).
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct File {
++    pub settings: Settings,
++    pub keys: BTreeMap<String, String>,
++    pub pad: BTreeMap<String, String>,
++}
++
++pub fn path() -> Option<PathBuf> {
++    if let Some(p) = crate::env_var!("KIRIKAE_SETTINGS") {
++        return Some(p.into());
++    }
++    let exe = std::env::current_exe().ok()?;
++    let stem = exe.file_stem()?.to_string_lossy().into_owned();
++    Some(exe.with_file_name(format!("{stem}.ini")))
++}
++
++static CURRENT: RwLock<Option<File>> = RwLock::new(None);
++static BOOT: OnceLock<Settings> = OnceLock::new();
++static SAVE: Mutex<()> = Mutex::new(());
++
++fn load() -> File {
++    let Some(path) = path() else { return File::default() };
++    let (file, exists) = match std::fs::read_to_string(&path) {
++        Ok(text) => {
++            let (f, problems) = parse(&text);
++            for p in problems {
++                eprintln!("kirikae: settings: {}: {p}", path.display());
++            }
++            (f, true)
+         }
++        Err(_) => (File::default(), false),
++    };
++    if !exists {
++        write(&file);
++        eprintln!("kirikae: settings: wrote defaults to {}", path.display());
+     }
++    eprintln!("kirikae: settings: {:?}", file.settings);
++    file
+ }
+ 
+-const DEFAULT_FILE: &str = "\
+-; Settings for the native PC build. Delete this file to get the defaults back.
++fn with<R>(f: impl FnOnce(&File) -> R) -> R {
++    if let Some(file) = CURRENT.read().unwrap().as_ref() {
++        return f(file);
++    }
++    let mut w = CURRENT.write().unwrap();
++    let file = w.get_or_insert_with(load);
++    BOOT.get_or_init(|| file.settings);
++    f(file)
++}
++
++/// The current settings.
++pub fn get() -> Settings {
++    with(|f| f.settings)
++}
++
++/// The settings the game started with (for options that apply after a restart).
++pub fn boot() -> Settings {
++    with(|f| f.settings);
++    *BOOT.get().unwrap()
++}
++
++pub fn keys() -> BTreeMap<String, String> {
++    with(|f| f.keys.clone())
++}
++
++pub fn pad() -> BTreeMap<String, String> {
++    with(|f| f.pad.clone())
++}
++
++/// Change the settings or bindings and save the file.
++pub fn update(change: impl FnOnce(&mut File)) {
++    with(|_| ());
++    let snapshot = {
++        let mut w = CURRENT.write().unwrap();
++        let file = w.as_mut().unwrap();
++        change(file);
++        file.clone()
++    };
++    let _g = SAVE.lock().unwrap();
++    write(&snapshot);
++}
++
++fn write(file: &File) {
++    let Some(path) = path() else { return };
++    let text = render(file);
++    let text = if cfg!(windows) { text.replace('\n', "\r\n") } else { text };
++    let tmp = path.with_extension("ini.tmp");
++    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
++        let _ = std::fs::remove_file(&tmp);
++        eprintln!("kirikae: settings: cannot write {}", path.display());
++    }
++}
++
++fn on_off(b: bool) -> &'static str {
++    if b { "true" } else { "false" }
++}
++
++pub fn render(f: &File) -> String {
++    let s = &f.settings;
++    let mut out = format!(
++        "\
++; Settings for the native PC build. Change them in the game with F1 (or Start+Back on a
++; controller), or edit this file while the game is closed. Delete it to get the defaults back.
+ 
+ [display]
+ ; Window size in pixels.
+-window_width = 1920
+-window_height = 1080
+-; Start in borderless fullscreen. F11 or Alt+Enter switches at any time.
+-fullscreen = false
++window_width = {}
++window_height = {}
++; Borderless fullscreen. F11 or Alt+Enter switches at any time.
++fullscreen = {}
+ ; true = wait for the monitor refresh (no tearing), false = lowest latency.
+-vsync = false
++vsync = {}
+ ; true = black bars keep the picture 16:9, false = stretch to the window.
+-keep_aspect = true
+-; How the game's frame is scaled to the window: linear or nearest.
+-scale_filter = linear
++keep_aspect = {}
++; How the game's frame is scaled to the window: linear (smooth) or nearest (sharp).
++scale_filter = {}
+ 
+ [graphics]
+ ; Anisotropic texture filtering: 1 (off, like the Switch), 2, 4, 8 or 16.
+-anisotropy = 16
++anisotropy = {}
+ ; Resolution the game renders at. The Switch renders 1920x1080 when docked.
+-; Higher values are experimental: the game sizes its own render targets from this,
+-; and the Switch memory budget was not planned for them.
+-render_width = 1920
+-render_height = 1080
++; Higher values are experimental: the game sizes its own render targets from this.
++render_width = {}
++render_height = {}
+ 
+ [performance]
+-; Frame rate the game is paced to. The Switch runs it at 60.
+-; Higher values are experimental (game timing was tuned for 60).
+-frame_rate = 60
+-";
++; Frame rate the game is paced to. The Switch runs it at 60. Higher is experimental.
++frame_rate = {}
++; Frame rate counter in the corner.
++show_fps = {}
+ 
+-pub fn path() -> Option<PathBuf> {
+-    let exe = std::env::current_exe().ok()?;
+-    let stem = exe.file_stem()?.to_string_lossy().into_owned();
+-    Some(exe.with_file_name(format!("{stem}.ini")))
+-}
+-
+-pub fn get() -> &'static Settings {
+-    static SETTINGS: OnceLock<Settings> = OnceLock::new();
+-    SETTINGS.get_or_init(|| {
+-        let Some(path) = path() else { return Settings::default() };
+-        let text = match std::fs::read_to_string(&path) {
+-            Ok(t) => t,
+-            Err(_) => {
+-                if std::fs::write(&path, DEFAULT_FILE.replace('\n', if cfg!(windows) { "\r\n" } else { "\n" })).is_ok() {
+-                    eprintln!("kirikae: settings: wrote defaults to {}", path.display());
+-                }
+-                DEFAULT_FILE.to_string()
+-            }
+-        };
+-        let (s, problems) = parse(&text);
+-        for p in problems {
+-            eprintln!("kirikae: settings: {}: {p}", path.display());
+-        }
+-        eprintln!("kirikae: settings: {s:?}");
+-        s
+-    })
++[controls]
++vibration = {}
++vibration_strength = {}
++; Controller face buttons by position (Nintendo layout) instead of by label.
++swap_ab_xy = {}
++",
++        s.window_width,
++        s.window_height,
++        on_off(s.fullscreen),
++        on_off(s.vsync),
++        on_off(s.keep_aspect),
++        if s.scale_filter == Filter::Linear { "linear" } else { "nearest" },
++        s.anisotropy,
++        s.render_width,
++        s.render_height,
++        s.frame_rate,
++        on_off(s.show_fps),
++        on_off(s.vibration),
++        s.vibration_strength,
++        on_off(s.swap_ab_xy),
++    );
++    out += "\n[keyboard]\n; Switch control = key names separated by spaces (\"none\" = unbound). Missing lines use the defaults.\n";
++    for (k, v) in &f.keys {
++        out += &format!("{k} = {v}\n");
++    }
++    out += "\n[controller]\n; Switch control = controller input (Xbox-style names). Missing lines use the defaults.\n";
++    for (k, v) in &f.pad {
++        out += &format!("{k} = {v}\n");
++    }
++    out
+ }
+ 
+-pub fn parse(text: &str) -> (Settings, Vec<String>) {
+-    let mut s = Settings::default();
++pub fn parse(text: &str) -> (File, Vec<String>) {
++    let mut f = File::default();
++    let s = &mut f.settings;
+     let mut problems = Vec::new();
++    let mut section = String::new();
+     for (n, raw) in text.lines().enumerate() {
+-        let line = raw.split([';', '#']).next().unwrap_or("").trim();
+-        if line.is_empty() || line.starts_with('[') {
++        let line = raw.split(';').next().unwrap_or("").trim();
++        if line.is_empty() {
++            continue;
++        }
++        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
++            section = name.trim().to_ascii_lowercase();
+             continue;
+         }
+         let Some((key, value)) = line.split_once('=') else {
+             problems.push(format!("line {}: expected key = value", n + 1));
+             continue;
+         };
+-        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim().to_ascii_lowercase());
++        let (key, raw_value) = (key.trim().to_ascii_lowercase(), value.trim());
++        if section == "keyboard" {
++            f.keys.insert(key, raw_value.to_string());
++            continue;
++        }
++        if section == "controller" {
++            f.pad.insert(key, raw_value.to_ascii_lowercase());
++            continue;
++        }
++        let value = raw_value.to_ascii_lowercase();
+         let num = |lo: u32, hi: u32| value.parse::<u32>().ok().filter(|v| (lo..=hi).contains(v));
+         let flag = || match value.as_str() {
+             "true" | "yes" | "on" | "1" => Some(true),
+@@ -136,14 +263,18 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
+             "vsync" => flag().map(|v| s.vsync = v),
+             "keep_aspect" => flag().map(|v| s.keep_aspect = v),
+             "scale_filter" => match value.as_str() {
+-                "linear" => Some(s.scale_filter = Filter::Linear),
+-                "nearest" => Some(s.scale_filter = Filter::Nearest),
++                "linear" | "smooth" => Some(s.scale_filter = Filter::Linear),
++                "nearest" | "sharp" => Some(s.scale_filter = Filter::Nearest),
+                 _ => None,
+             },
+             "anisotropy" => num(0, 16).map(|v| s.anisotropy = v.max(1)),
+             "render_width" => num(640, 7680).map(|v| s.render_width = v),
+             "render_height" => num(360, 4320).map(|v| s.render_height = v),
+             "frame_rate" => num(30, 360).map(|v| s.frame_rate = v),
++            "show_fps" => flag().map(|v| s.show_fps = v),
++            "vibration" => flag().map(|v| s.vibration = v),
++            "vibration_strength" => num(0, 100).map(|v| s.vibration_strength = v),
++            "swap_ab_xy" => flag().map(|v| s.swap_ab_xy = v),
+             _ => {
+                 problems.push(format!("line {}: unknown setting {key}", n + 1));
+                 continue;
+@@ -153,7 +284,7 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
+             problems.push(format!("line {}: bad value {value:?} for {key}, keeping the default", n + 1));
+         }
+     }
+-    (s, problems)
++    (f, problems)
+ }
+ 
+ #[cfg(test)]
+@@ -161,21 +292,29 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn default_file_matches_defaults() {
+-        let (s, problems) = parse(DEFAULT_FILE);
++    fn rendered_file_reads_back() {
++        let mut f = File::default();
++        f.settings.vsync = true;
++        f.settings.anisotropy = 4;
++        f.settings.scale_filter = Filter::Nearest;
++        f.settings.swap_ab_xy = true;
++        f.keys.insert("a".into(), "Z Space".into());
++        f.pad.insert("zr".into(), "righttrigger".into());
++        let (back, problems) = parse(&render(&f));
+         assert!(problems.is_empty(), "{problems:?}");
+-        let d = Settings::default();
+-        assert_eq!((s.window_width, s.window_height, s.fullscreen, s.vsync, s.keep_aspect), (d.window_width, d.window_height, d.fullscreen, d.vsync, d.keep_aspect));
+-        assert_eq!((s.scale_filter, s.anisotropy, s.render_width, s.render_height, s.frame_rate), (d.scale_filter, d.anisotropy, d.render_width, d.render_height, d.frame_rate));
++        assert_eq!(back, f);
++        let (d, problems) = parse(&render(&File::default()));
++        assert!(problems.is_empty());
++        assert_eq!(d, File::default());
+     }
+ 
+     #[test]
+     fn values_and_problems() {
+-        let (s, problems) = parse("fullscreen = yes ; comment\nanisotropy=8\nframe_rate = 5\nscale_filter = Nearest\nbogus = 1\nnope");
+-        assert!(s.fullscreen);
+-        assert_eq!(s.anisotropy, 8);
+-        assert_eq!(s.frame_rate, 60);
+-        assert_eq!(s.scale_filter, Filter::Nearest);
++        let (f, problems) = parse("fullscreen = yes ; comment\nanisotropy=8\nframe_rate = 5\nscale_filter = Nearest\nbogus = 1\nnope");
++        assert!(f.settings.fullscreen);
++        assert_eq!(f.settings.anisotropy, 8);
++        assert_eq!(f.settings.frame_rate, 60);
++        assert_eq!(f.settings.scale_filter, Filter::Nearest);
+         assert_eq!(problems.len(), 3);
+     }
+ }

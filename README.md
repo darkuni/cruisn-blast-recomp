@@ -78,16 +78,20 @@ backtraces and stats on, logging to `run.log`.
 - Playable on Windows (i9-13900K / RTX 4070 Ti) at 60 fps: boot, menus, car select with the
   3D car and the rendered car icons in the selector, races with the full 3D scene,
   post-processing and HUD; FMOD audio works
-- Kirikae patches 0001-0012 (see `patches/kirikae/README.md`): function discovery, bindless
+- Kirikae patches 0001-0013 (see `patches/kirikae/README.md`): function discovery, bindless
   textures (NVN texture|sampler handles), TLD/TXQ, compressed-texture aliasing, layout-aware
   inline uploads, MSAA resolve blits, render-target write-back for copy-engine reads, plus
   diagnostics
-- Settings in `build\cruisn-blast.ini` (written on first start, patch 0012): window size,
-  borderless fullscreen (F11 / Alt+Enter), vsync, aspect-correct scaling, forced 16x
-  anisotropic filtering, render resolution and frame rate (both experimental above stock)
+- In-game settings menu (F1 / Esc / Start+Back), same as the other native ports: resolution,
+  aspect ratio, VSync, fullscreen, scaling, anisotropic filtering, frame rate, vibration,
+  A/B swap, frame-rate display, keyboard and controller rebinding. Saved to
+  `build\cruisn-blast.ini`
+- Shader preloading: pipelines are recorded to `build\cruisn-blast.pipelines` and built at
+  startup on spare cores, so tracks and cars seen before never stutter on first appearance.
+  Ship that file with a build and testers get it from their first run
 - Open issues:
-  - Hitches the first time new materials appear (driver pipeline compiles); a second pass
-    over the same content is much smoother thanks to the driver pipeline cache
+  - Content never seen by any run still compiles on first sight (until it is in the
+    `.pipelines` file)
   - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
     unpatched Kirikae
 

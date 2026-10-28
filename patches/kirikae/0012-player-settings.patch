@@ -234,3 +234,190 @@ index bbd6a31..306f2dc 100644
      match last.map(|l| l + interval as u64) {
          Some(target) if blank(target) > now => {
              let wait = blank(target) - now;
+diff --git a/crates/rt/src/settings.rs b/crates/rt/src/settings.rs
+new file mode 100644
+index 0000000..c268061
+--- /dev/null
++++ b/crates/rt/src/settings.rs
+@@ -0,0 +1,181 @@
++//! Player settings, read from `<exe name>.ini` next to the executable.
++//!
++//! A commented default file is written the first time the game starts, so players can
++//! find and edit every option. Unknown keys and bad values are reported and ignored.
++
++use std::path::PathBuf;
++use std::sync::OnceLock;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Filter {
++    Linear,
++    Nearest,
++}
++
++#[derive(Clone, Debug)]
++pub struct Settings {
++    /// Window client size in physical pixels.
++    pub window_width: u32,
++    pub window_height: u32,
++    /// Start in borderless fullscreen. F11 or Alt+Enter toggles it at runtime.
++    pub fullscreen: bool,
++    /// Wait for the monitor refresh when presenting (no tearing, a little more latency).
++    pub vsync: bool,
++    /// Keep the game's aspect ratio and add black bars instead of stretching.
++    pub keep_aspect: bool,
++    /// Filter used to scale the game's frame to the window.
++    pub scale_filter: Filter,
++    /// Anisotropic filtering forced on mipmapped textures (1 = off, up to 16).
++    pub anisotropy: u32,
++    /// Resolution reported to the game as the docked display resolution.
++    pub render_width: u32,
++    pub render_height: u32,
++    /// Frame rate the game is paced to (the Switch runs it at 60).
++    pub frame_rate: u32,
++}
++
++impl Default for Settings {
++    fn default() -> Self {
++        Settings {
++            window_width: 1920,
++            window_height: 1080,
++            fullscreen: false,
++            vsync: false,
++            keep_aspect: true,
++            scale_filter: Filter::Linear,
++            anisotropy: 16,
++            render_width: 1920,
++            render_height: 1080,
++            frame_rate: 60,
++        }
++    }
++}
++
++const DEFAULT_FILE: &str = "\
++; Settings for the native PC build. Delete this file to get the defaults back.
++
++[display]
++; Window size in pixels.
++window_width = 1920
++window_height = 1080
++; Start in borderless fullscreen. F11 or Alt+Enter switches at any time.
++fullscreen = false
++; true = wait for the monitor refresh (no tearing), false = lowest latency.
++vsync = false
++; true = black bars keep the picture 16:9, false = stretch to the window.
++keep_aspect = true
++; How the game's frame is scaled to the window: linear or nearest.
++scale_filter = linear
++
++[graphics]
++; Anisotropic texture filtering: 1 (off, like the Switch), 2, 4, 8 or 16.
++anisotropy = 16
++; Resolution the game renders at. The Switch renders 1920x1080 when docked.
++; Higher values are experimental: the game sizes its own render targets from this,
++; and the Switch memory budget was not planned for them.
++render_width = 1920
++render_height = 1080
++
++[performance]
++; Frame rate the game is paced to. The Switch runs it at 60.
++; Higher values are experimental (game timing was tuned for 60).
++frame_rate = 60
++";
++
++pub fn path() -> Option<PathBuf> {
++    let exe = std::env::current_exe().ok()?;
++    let stem = exe.file_stem()?.to_string_lossy().into_owned();
++    Some(exe.with_file_name(format!("{stem}.ini")))
++}
++
++pub fn get() -> &'static Settings {
++    static SETTINGS: OnceLock<Settings> = OnceLock::new();
++    SETTINGS.get_or_init(|| {
++        let Some(path) = path() else { return Settings::default() };
++        let text = match std::fs::read_to_string(&path) {
++            Ok(t) => t,
++            Err(_) => {
++                if std::fs::write(&path, DEFAULT_FILE.replace('\n', if cfg!(windows) { "\r\n" } else { "\n" })).is_ok() {
++                    eprintln!("kirikae: settings: wrote defaults to {}", path.display());
++                }
++                DEFAULT_FILE.to_string()
++            }
++        };
++        let (s, problems) = parse(&text);
++        for p in problems {
++            eprintln!("kirikae: settings: {}: {p}", path.display());
++        }
++        eprintln!("kirikae: settings: {s:?}");
++        s
++    })
++}
++
++pub fn parse(text: &str) -> (Settings, Vec<String>) {
++    let mut s = Settings::default();
++    let mut problems = Vec::new();
++    for (n, raw) in text.lines().enumerate() {
++        let line = raw.split([';', '#']).next().unwrap_or("").trim();
++        if line.is_empty() || line.starts_with('[') {
++            continue;
++        }
++        let Some((key, value)) = line.split_once('=') else {
++            problems.push(format!("line {}: expected key = value", n + 1));
++            continue;
++        };
++        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim().to_ascii_lowercase());
++        let num = |lo: u32, hi: u32| value.parse::<u32>().ok().filter(|v| (lo..=hi).contains(v));
++        let flag = || match value.as_str() {
++            "true" | "yes" | "on" | "1" => Some(true),
++            "false" | "no" | "off" | "0" => Some(false),
++            _ => None,
++        };
++        let ok = match key.as_str() {
++            "window_width" => num(320, 16384).map(|v| s.window_width = v),
++            "window_height" => num(180, 16384).map(|v| s.window_height = v),
++            "fullscreen" => flag().map(|v| s.fullscreen = v),
++            "vsync" => flag().map(|v| s.vsync = v),
++            "keep_aspect" => flag().map(|v| s.keep_aspect = v),
++            "scale_filter" => match value.as_str() {
++                "linear" => Some(s.scale_filter = Filter::Linear),
++                "nearest" => Some(s.scale_filter = Filter::Nearest),
++                _ => None,
++            },
++            "anisotropy" => num(0, 16).map(|v| s.anisotropy = v.max(1)),
++            "render_width" => num(640, 7680).map(|v| s.render_width = v),
++            "render_height" => num(360, 4320).map(|v| s.render_height = v),
++            "frame_rate" => num(30, 360).map(|v| s.frame_rate = v),
++            _ => {
++                problems.push(format!("line {}: unknown setting {key}", n + 1));
++                continue;
++            }
++        };
++        if ok.is_none() {
++            problems.push(format!("line {}: bad value {value:?} for {key}, keeping the default", n + 1));
++        }
++    }
++    (s, problems)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn default_file_matches_defaults() {
++        let (s, problems) = parse(DEFAULT_FILE);
++        assert!(problems.is_empty(), "{problems:?}");
++        let d = Settings::default();
++        assert_eq!((s.window_width, s.window_height, s.fullscreen, s.vsync, s.keep_aspect), (d.window_width, d.window_height, d.fullscreen, d.vsync, d.keep_aspect));
++        assert_eq!((s.scale_filter, s.anisotropy, s.render_width, s.render_height, s.frame_rate), (d.scale_filter, d.anisotropy, d.render_width, d.render_height, d.frame_rate));
++    }
++
++    #[test]
++    fn values_and_problems() {
++        let (s, problems) = parse("fullscreen = yes ; comment\nanisotropy=8\nframe_rate = 5\nscale_filter = Nearest\nbogus = 1\nnope");
++        assert!(s.fullscreen);
++        assert_eq!(s.anisotropy, 8);
++        assert_eq!(s.frame_rate, 60);
++        assert_eq!(s.scale_filter, Filter::Nearest);
++        assert_eq!(problems.len(), 3);
++    }
++}

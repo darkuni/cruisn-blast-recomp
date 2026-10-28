@@ -10,3 +10,5 @@ global-metadata.dat
 il2cpp_dump/
 __pycache__/
 *.profile
+# recorded game shaders (derived from the game)
+*.pipelines

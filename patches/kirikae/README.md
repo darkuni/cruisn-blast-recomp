@@ -161,3 +161,37 @@ default file on first start. Options:
 | performance | `frame_rate` | 60 | Rate for the vsync event and frame pacing. Experimental above 60 |
 
 Runtime tests: 201 pass (settings parsing, default file, letterbox math).
+
+## 0013 - settings menu, controls, rumble and shader preloading
+
+**Settings menu.** The same in-game menu as the other native ports (layout, colours and the
+DejaVu Sans Mono Bold font atlas taken from the Einhander port): F1 or Esc, or Start+Back on a
+controller. The game is held while it is open (the vi present path keeps re-showing its last
+frame and polling the controller). Options: resolution (reported docked resolution, restart),
+aspect ratio, VSync (swapchain is remade on change), fullscreen, scaling filter, anisotropic
+filtering (restart), frame rate (restart), vibration and strength, swap A/B and X/Y, frame
+rate display, keyboard and controller rebinding pages, close, quit (press twice). Everything is
+saved to `<exe>.ini` immediately; `settings::boot()` keeps the values the game started with.
+
+Drawn with a small Vulkan pipeline after the frame is blitted to the swapchain (swapchain
+images get COLOR_ATTACHMENT usage and views when the surface allows it). Shaders are
+`overlay.wgsl` compiled to SPIR-V with naga 30 and embedded (`overlay_vs.spv`, `overlay_fs.spv`).
+
+**Bindings.** `bindings.rs`: one table of Switch controls with keyboard defaults equal to the old
+fixed map, and controller defaults by label (Xbox A = Switch A); "Swap A/B and X/Y" gives the
+old positional mapping. Stick directions stay analog when bound to stick directions. XInput
+and gilrs both feed a raw XInput-layout pad.
+
+**Rumble.** hid SendVibrationValue (201) and SendVibrationValues (206) drive the XInput motors
+(low band -> left motor, high band -> right), scaled by the strength setting.
+
+**Shader preloading.** Every graphics pipeline the game asks for is recorded (SPIR-V + state)
+into `<exe>.pipelines` (deflate-compressed, rewritten with the pipeline cache every 30 s and on
+exit). On start all recorded pipelines are built on spare cores while the game boots, with a
+"Preloading shaders n / total" line in the corner. Translated shaders with identical SPIR-V
+reuse the preloaded module, so the game's own lookups hit the preloaded pipelines directly:
+no driver compile and no skipped draws the first time a track appears.
+`KIRIKAE_NO_PRELOAD` turns it off; `KIRIKAE_PRELOAD_FILE` points somewhere else.
+
+Runtime tests: 207 pass, plus an ignored offscreen render test of the menu
+(`render_menu_offscreen`, writes `KIRIKAE_OVERLAY_PNG`).
