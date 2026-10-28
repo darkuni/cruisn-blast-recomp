@@ -72,16 +72,19 @@ backtraces and stats on, logging to `run.log`.
 
 ## Status
 
-- Recompiles: 247,518 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links
-- Playable on Windows (i9-13900K / RTX 4070 Ti): boots, menus, car select with the 3D car,
-  races with full 3D scene, post-processing and HUD at 60 fps; FMOD audio works
+- Recompiles: 247,852 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links.
+  Seeded with IL2CPP method entries plus addresses earlier runs interpreted; at runtime the
+  interpreter is effectively unused (hundreds of instructions per session)
+- Playable on Windows (i9-13900K / RTX 4070 Ti) at 60 fps: boot, menus, car select with the
+  3D car and the rendered car icons in the selector, races with the full 3D scene,
+  post-processing and HUD; FMOD audio works
+- Kirikae patches 0001-0011 (see `patches/kirikae/README.md`): function discovery, bindless
+  textures (NVN texture|sampler handles), TLD/TXQ, compressed-texture aliasing, layout-aware
+  inline uploads, MSAA resolve blits, render-target write-back for copy-engine reads, plus
+  diagnostics
 - Open issues:
-  - Hitches when new materials appear: driver pipeline compiles (151 -> 214 pipelines in a
-    race, spikes up to 1.9 s). Kirikae keeps a driver pipeline cache between runs
-  - Car-selector thumbnails blank: 4,939 draws skipped during loading with no color or
-    depth target (patch 0006 reports why)
-  - About 1.8 ms/frame on the main thread still runs in the interpreter; the run writes
-    `build/cruisn-blast.profile`, and a full rebuild compiles those addresses natively
+  - Hitches the first time new materials appear (driver pipeline compiles); a second pass
+    over the same content is much smoother thanks to the driver pipeline cache
   - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
     unpatched Kirikae
 
