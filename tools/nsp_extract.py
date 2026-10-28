@@ -272,6 +272,8 @@ def main():
     ap.add_argument('--info', action='store_true', help='print layout only')
     ap.add_argument('--no-exefs', action='store_true')
     ap.add_argument('--no-romfs', action='store_true')
+    ap.add_argument('--resume', action='store_true',
+                    help='skip RomFS files already extracted at full size')
     ap.add_argument('--romfs-filter', action='append', default=[],
                     help='only extract RomFS paths containing this text (repeatable)')
     a = ap.parse_args()
@@ -328,6 +330,9 @@ def main():
         print(f'romfs: {len(files)} files, {sum(z for _, _, z in files) / 1e9:.2f} GB')
         for path, off, size in files:
             if a.romfs_filter and not any(t in path for t in a.romfs_filter):
+                continue
+            dst = os.path.join(a.out, 'romfs', path.lstrip('/'))
+            if a.resume and os.path.exists(dst) and os.path.getsize(dst) == size:
                 continue
             sec.copy_out(off, size, os.path.join(a.out, 'romfs', path.lstrip('/')))
             print(f'romfs{path} {size:,}')
