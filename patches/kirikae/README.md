@@ -60,3 +60,19 @@ it cannot leak into a later texture. TMML.B uses the same resolution.
 
 Tests: the exact Cruis'n Blast pattern and a leak check. With `KIRIKAE_SHADER_DIR` pointed
 at the five dumped shaders, `dumped_shaders` reports 5/5 translating completely.
+
+## 0005 - maxwell: TLD and bindless TXQ
+
+With 0004 the menus and HUD rendered but the 3D scene never reached the screen: Unity's
+URP post-process filter (3x3 texel fetches) and MSAA resolve both use TLD.B, and Kirikae had
+no TLD translation at all, plus the resolve sizes its target with TXQ.B.
+
+- TLD, bound (0xdc38) and bindless (0xdd38), per envytools gm107 fields: A registers
+  [layer], coords; B registers [handle], [lod], [offset], [sample]. Host render targets are
+  single-sample, so the sample index is consumed and ignored.
+- TXQ.B: handle from Ra (through the same NVN texture|sampler resolution), LOD from Ra+1.
+
+All 1,332 shaders dumped from a Cruis'n Blast session: 753 translate completely on
+unpatched Kirikae, 1,324 with 0003-0005; nothing is reported missing. The other 8 fail naga
+validation with BreakOutsideOfLoopOrSwitch identically with and without these patches
+(pre-existing control-flow structuring issue).

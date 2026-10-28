@@ -1,0 +1,196 @@
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index 32fb7cf..cf486a7 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -1568,7 +1568,8 @@ impl<'a> Translator<'a> {
+                 let v = self.b.i_add(u, None, shifted, b)?;
+                 self.set(i.rd(), v)
+             }
+-            "txq" => self.txq(i),
++            "txq" => self.txq(pc, i),
++            "tld" => self.tld(pc, i),
+             "tmml" => self.tmml(pc, i),
+             "ipa" => self.ipa(i),
+             "texs" => self.texs(i),
+@@ -3161,20 +3162,28 @@ impl<'a> Translator<'a> {
+         Ok(())
+     }
+ 
+-    fn txq(&mut self, i: &Insn) -> R {
+-        if i.op.value != 0xdf48000000000000 {
+-            self.unsupported.push("txq (bindless)");
+-            return Ok(());
+-        }
+-        let handle = i.bits(36, 13) as u32;
++    fn txq(&mut self, pc: u32, i: &Insn) -> R {
++        // TXQ.B takes the handle from Ra and the LOD from Ra+1.
++        let bindless = i.op.value == 0xdf50000000000000;
+         let query = i.bits(22, 6);
+         if query != 1 {
+             self.unsupported.push("txq (query type)");
+             return Ok(());
+         }
+-        let (image_var, _, image_ty, _) = self.texture(None, handle, TexDim::D2, false, false);
++        let (slot, handle, lod_reg) = if bindless {
++            match self.bindless_handle(pc, i.ra()) {
++                Some((slot, word)) => (Some(slot), word, if i.ra() == RZ { RZ } else { i.ra() + 1 }),
++                None => {
++                    self.unsupported.push("txq (bindless)");
++                    return Ok(());
++                }
++            }
++        } else {
++            (None, i.bits(36, 13) as u32, i.ra())
++        };
++        let (image_var, _, image_ty, _) = self.texture(slot, handle, TexDim::D2, false, false);
+         let img = self.b.load(image_ty, None, image_var, None, [])?;
+-        let lod = self.r(i.ra())?;
++        let lod = self.r(lod_reg)?;
+         let lod_i = self.cast_i(lod)?;
+         let v2i = self.b.type_vector(self.t.i32, 2);
+         let size = self.b.image_query_size_lod(v2i, None, img, lod_i)?;
+@@ -3718,6 +3727,75 @@ impl<'a> Translator<'a> {
+         self.texs_results(i, result)
+     }
+ 
++    /// TLD (texel fetch), bound (0xdc38) or bindless (0xdd38). Fields per envytools gm107:
++    /// dim 29-30, array 28, mask 31-34, LOD mode bit 55 (0 lz, 1 ll), AOFFI 35, MS 50, CL 54.
++    /// A registers: [layer], coords. B registers: [handle], [lod], [offset], [sample].
++    /// Render targets are single-sample on the host, so the sample index is read and ignored:
++    /// a resolve averaging N identical fetches gives the right color.
++    fn tld(&mut self, pc: u32, i: &Insn) -> R {
++        let bindless = i.op.value == 0xdd38000000000000;
++        if i.bit(54) {
++            self.unsupported.push("tld (lod clamp)");
++            return Ok(());
++        }
++        let (slot, handle) = if bindless {
++            match self.bindless_handle(pc, i.rb()) {
++                Some((slot, word)) => (Some(slot), word),
++                None => {
++                    self.unsupported.push("tld (bindless)");
++                    return Ok(());
++                }
++            }
++        } else {
++            (None, i.bits(36, 13) as u32)
++        };
++        let dim = match i.bits(29, 2) {
++            0 => TexDim::D1,
++            1 => TexDim::D2,
++            2 => TexDim::D3,
++            _ => {
++                self.unsupported.push("tld (cube)");
++                return Ok(());
++            }
++        };
++        let array = i.bit(28);
++        let mut reg_a = i.ra();
++        let mut take_a = |t: &mut Self| -> R<Word> {
++            let r = reg_a;
++            if reg_a != RZ {
++                reg_a += 1;
++            }
++            t.r(r)
++        };
++        let layer = if array { Some(take_a(self)?) } else { None };
++        let mut coords = Vec::new();
++        for _ in 0..Self::coord_count(dim) {
++            coords.push(take_a(self)?);
++        }
++        let mut reg_b = if bindless && i.rb() != RZ { i.rb() + 1 } else { i.rb() };
++        let mut take_b = |t: &mut Self| -> R<Word> {
++            let r = reg_b;
++            if reg_b != RZ {
++                reg_b += 1;
++            }
++            t.r(r)
++        };
++        let lod = if i.bit(55) { Some(take_b(self)?) } else { None };
++        let offset = if i.bit(35) { Some(take_b(self)?) } else { None };
++        if i.bit(50) {
++            let _sample = take_b(self)?;
++        }
++        let result = self.fetch(slot, handle, dim, array, coords, layer, lod, offset)?;
++        let mut reg = i.rd();
++        for (c, &value) in result.iter().enumerate() {
++            if i.bit(31 + c as u32) && reg != RZ {
++                self.set(reg, value)?;
++                reg += 1;
++            }
++        }
++        Ok(())
++    }
++
+     fn tlds(&mut self, i: &Insn) -> R {
+         let handle = i.bits(36, 13) as u32;
+         let (ra, rb) = (i.ra(), i.rb());
+@@ -3762,14 +3840,14 @@ impl<'a> Translator<'a> {
+                 return Ok(());
+             }
+         };
+-        let result = self.fetch(handle, dim, array, coords, layer, lod, offset)?;
++        let result = self.fetch(None, handle, dim, array, coords, layer, lod, offset)?;
+         self.texs_results(i, result)
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    fn fetch(&mut self, handle: u32, dim: TexDim, array: bool, coords: Vec<Word>, layer: Option<Word>, lod: Option<Word>, offset: Option<Word>) -> R<[Word; 4]> {
++    fn fetch(&mut self, slot: Option<u32>, handle: u32, dim: TexDim, array: bool, coords: Vec<Word>, layer: Option<Word>, lod: Option<Word>, offset: Option<Word>) -> R<[Word; 4]> {
+         let i32t = self.t.i32;
+-        let (image_var, _, image_ty, _) = self.texture(None, handle, dim, array, false);
++        let (image_var, _, image_ty, _) = self.texture(slot, handle, dim, array, false);
+         let img = self.b.load(image_ty, None, image_var, None, [])?;
+         let mut comps = Vec::new();
+         for (k, c) in coords.into_iter().enumerate() {
+diff --git a/crates/maxwell/tests/translate.rs b/crates/maxwell/tests/translate.rs
+index d1e28f3..c4b55ef 100644
+--- a/crates/maxwell/tests/translate.rs
++++ b/crates/maxwell/tests/translate.rs
+@@ -406,3 +406,46 @@ fn bindless_or_word_does_not_leak_into_a_later_bound_texture() {
+     assert_eq!((bound.handle, bound.or), (3, None));
+     validate(&shader.spirv);
+ }
++
++fn tld_b_2d(rd: u64, ra: u64, rb: u64, mask: u64, ms: bool) -> u64 {
++    0xdd38_0000_0000_0000 | (ms as u64) << 50 | mask << 31 | 1 << 29 | rb << 20 | PT | ra << 8 | rd
++}
++fn txq_b_dimension(rd: u64, ra: u64) -> u64 {
++    0xdf50_0000_0000_0000 | 0x3 << 31 | 1 << 22 | PT | ra << 8 | rd
++}
++
++#[test]
++fn bindless_texel_fetch_and_size_query_for_an_msaa_resolve() {
++    // The resolve shader pattern: handle = c2[0x168] | c2[0x568]; size via TXQ.B; then
++    // TLD.B .ms with the sample index in the register after the handle.
++    let code = program(
++        fragment_header(1),
++        &[
++            mov_cbuf(14, 2, 0x168),
++            mov32i(15, 0),
++            lop_or_cbuf(14, 14, 2, 0x568),
++            txq_b_dimension(0, 14),
++            mov32i(20, 3),
++            mov32i(21, 5),
++            mov_reg(6, 14),
++            mov32i(7, 1),
++            tld_b_2d(4, 20, 6, 0xf, true),
++            EXIT,
++        ],
++    );
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    assert_eq!(shader.textures.len(), 1, "query and fetch share one binding");
++    let t = shader.textures[0];
++    assert_eq!((t.slot, t.handle, t.or), (Some(2), 0x168 / 4, Some((2, 0x568 / 4))));
++    validate(&shader.spirv);
++}
++
++#[test]
++fn bound_texel_fetch() {
++    let code = program(fragment_header(1), &[mov32i(0, 1), mov32i(1, 2), 0xdc38_0000_0000_0000 | 5 << 36 | 0xf << 31 | 1 << 29 | 0xff << 20 | PT | 4, EXIT]);
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    assert_eq!((shader.textures[0].slot, shader.textures[0].handle), (None, 5));
++    validate(&shader.spirv);
++}
