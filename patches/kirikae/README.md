@@ -41,3 +41,22 @@ a bound texture at that slot and word, which the runtime already supports.
   bit 36 (TEX: 54); the remaining B operands start at Rb+1.
 - Tests: handle from LDC, from the high word of LDC.64 with explicit LOD, through a register
   copy, and a computed handle that stays unsupported. All translator tests pass.
+
+## 0004 - NVN texture | sampler handles
+
+0003 alone resolved none of Cruis'n Blast's bindless samples. Disassembling the five
+skipped shaders (148 TEX.B in all) showed every handle built the same way:
+
+```
+mov    Ra, c2[A]          ; texture handle
+lop.or Rd, Ra, c2[B]      ; | sampler handle
+(mov   Rx, Rd)            ; optional copy
+```
+
+The translator now resolves LOP.OR of two constant-buffer words (cbuf or register second
+operand, no inversions) and records the second word in `TextureUse::or`; the runtime ORs
+both words before splitting TIC/TSC indices. The stashed word is cleared per instruction so
+it cannot leak into a later texture. TMML.B uses the same resolution.
+
+Tests: the exact Cruis'n Blast pattern and a leak check. With `KIRIKAE_SHADER_DIR` pointed
+at the five dumped shaders, `dumped_shaders` reports 5/5 translating completely.

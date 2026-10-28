@@ -1,0 +1,213 @@
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index fe3a571..32fb7cf 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -104,6 +104,9 @@ pub enum TexDim {
+ pub struct TextureUse {
+     pub slot: Option<u32>,
+     pub handle: u32,
++    /// A second constant-buffer word (slot, word index) ORed into the handle. NVN shaders
++    /// build bindless handles as `c[s][texture] | c[s][sampler]`.
++    pub or: Option<(u32, u32)>,
+     pub dim: TexDim,
+     pub array: bool,
+     pub shadow: bool,
+@@ -211,6 +214,7 @@ struct Translator<'a> {
+     interface: Vec<Word>,
+     cbufs: BTreeMap<u32, Word>,
+     textures: Vec<(TextureUse, Word)>,
++    handle_or: Option<(u32, u32)>,
+     images: Vec<(ImageUse, Word)>,
+     local: Option<Word>,
+     shared: Option<(Word, Word)>,
+@@ -315,6 +319,7 @@ impl<'a> Translator<'a> {
+             interface: Vec::new(),
+             cbufs: BTreeMap::new(),
+             textures: Vec::new(),
++            handle_or: None,
+             images: Vec::new(),
+             storage_images: false,
+             local: None,
+@@ -992,6 +997,8 @@ impl<'a> Translator<'a> {
+     fn op(&mut self, pc: u32, i: &Insn) -> R {
+         let t = self.t.f32;
+         let u = self.t.u32;
++        // A handle's ORed word only applies to the instruction that resolved it.
++        self.handle_or = None;
+         match i.name() {
+             "mov" if i.op.value == 0xf0c8000000000000 => {
+                 let v = match i.bits(20, 8) {
+@@ -2695,6 +2702,50 @@ impl<'a> Translator<'a> {
+         self.cbuf_source_depth(pc, reg, 4)
+     }
+ 
++    /// A bindless handle's source: one constant-buffer word, or two combined by LOP.OR
++    /// (`mov Ra, c[s][a]; lop.or Rd, Ra, c[s][b]`), through register copies.
++    fn handle_source(&self, pc: u32, reg: u8, depth: u32) -> Option<((u32, u32), Option<(u32, u32)>)> {
++        if let Some(src) = self.cbuf_source_depth(pc, reg, 0) {
++            return Some((src, None));
++        }
++        let (def_pc, def) = self.def_of(pc, reg)?;
++        if def.rd() != reg {
++            return None;
++        }
++        if def.name() == "mov" && def.form() == Form::Reg && depth > 0 {
++            return self.handle_source(def_pc, def.rb(), depth - 1);
++        }
++        if def.name() == "lop" && def.bits(41, 2) == 1 && !def.bit(39) && !def.bit(40) {
++            let a = self.cbuf_source_depth(def_pc, def.ra(), 4)?;
++            let b = match def.form() {
++                Form::Cbuf => def.cbuf(),
++                Form::Reg => self.cbuf_source_depth(def_pc, def.rb(), 4)?,
++                _ => return None,
++            };
++            return Some((a, Some(b)));
++        }
++        None
++    }
++
++    fn def_of(&self, pc: u32, reg: u8) -> Option<(u32, &Insn)> {
++        const NO_RD: &[&str] = &["st", "stg", "sts", "stl", "sust", "red", "exit", "bra", "brx", "sync", "ssy", "pbk", "brk", "kil", "depbar", "bar", "membar", "nop", "isetp", "fsetp", "psetp", "hsetp2", "csetp", "dsetp"];
++        if reg == RZ {
++            return None;
++        }
++        self.insns.range(..pc).rev().take(512).find(|(_, i)| !NO_RD.contains(&i.name()) && i.rd() == reg).map(|(&p, i)| (p, i))
++    }
++
++    /// Resolve a bindless handle register to (slot, word) and stash any ORed second word
++    /// for the next `texture()` call.
++    fn bindless_handle(&mut self, pc: u32, reg: u8) -> Option<(u32, u32)> {
++        let ((slot, off), or) = self.handle_source(pc, reg, 4)?;
++        if off % 4 != 0 || or.is_some_and(|(_, o)| o % 4 != 0) {
++            return None;
++        }
++        self.handle_or = or.map(|(s, o)| (s, o / 4));
++        Some((slot, off / 4))
++    }
++
+     /// Where a register's value was loaded from a constant buffer: `MOV Rd, c[s][o]`,
+     /// `LDC Rd, c[s][imm]` with no index register (also the later words of a 64/128-bit
+     /// LDC), or a register copy of either. Bindless texture handles reach TEX.B this way.
+@@ -3146,8 +3197,8 @@ impl<'a> Translator<'a> {
+         let (slot, handle) = if i.op.value == 0xdf58000000000000 {
+             (None, i.bits(36, 13) as u32)
+         } else {
+-            match self.cbuf_source(pc, i.rb()) {
+-                Some((slot, offset)) => (Some(slot), offset / 4),
++            match self.bindless_handle(pc, i.rb()) {
++                Some((slot, word)) => (Some(slot), word),
+                 None => {
+                     self.unsupported.push("tmml (bindless)");
+                     return Ok(());
+@@ -3211,10 +3262,11 @@ impl<'a> Translator<'a> {
+     }
+ 
+     fn texture(&mut self, slot: Option<u32>, handle: u32, dim: TexDim, array: bool, shadow: bool) -> (Word, Word, Word, Word) {
+-        let key = TextureUse { slot, handle, dim, array, shadow, binding: 0 };
++        let or = self.handle_or.take();
++        let key = TextureUse { slot, handle, or, dim, array, shadow, binding: 0 };
+         let image_ty = self.image_type(dim, array, shadow);
+         let sampled_ty = self.b.type_sampled_image(image_ty);
+-        if let Some(&(_, var)) = self.textures.iter().find(|(u, _)| u.slot == slot && u.handle == handle && u.dim == dim && u.array == array && u.shadow == shadow) {
++        if let Some(&(_, var)) = self.textures.iter().find(|(u, _)| u.slot == slot && u.handle == handle && u.or == or && u.dim == dim && u.array == array && u.shadow == shadow) {
+             return (var, var + 1, image_ty, sampled_ty);
+         }
+         let binding = self.opts.texture_binding + 2 * self.textures.len() as u32;
+@@ -3804,8 +3856,8 @@ impl<'a> Translator<'a> {
+             return Ok(());
+         }
+         let (slot, handle) = if bindless {
+-            match self.cbuf_source(pc, i.rb()) {
+-                Some((slot, offset)) => (Some(slot), offset / 4),
++            match self.bindless_handle(pc, i.rb()) {
++                Some((slot, word)) => (Some(slot), word),
+                 None => {
+                     self.unsupported.push("tex (bindless)");
+                     return Ok(());
+diff --git a/crates/maxwell/tests/translate.rs b/crates/maxwell/tests/translate.rs
+index eaf407f..d1e28f3 100644
+--- a/crates/maxwell/tests/translate.rs
++++ b/crates/maxwell/tests/translate.rs
+@@ -372,3 +372,37 @@ fn bindless_tex_with_a_computed_handle_stays_unsupported() {
+     assert!(shader.unsupported.contains(&"tex (bindless)"), "{:?}", shader.unsupported);
+     assert!(shader.textures.is_empty());
+ }
++
++fn mov_cbuf(rd: u64, slot: u64, offset: u64) -> u64 {
++    0x4c98_0000_0000_0000 | 0xf << 39 | slot << 34 | (offset / 4) << 20 | PT | rd
++}
++fn lop_or_cbuf(rd: u64, ra: u64, slot: u64, offset: u64) -> u64 {
++    0x4c40_0000_0000_0000 | 1 << 41 | slot << 34 | (offset / 4) << 20 | PT << 32 | PT | ra << 8 | rd
++}
++
++#[test]
++fn bindless_tex_from_nvn_texture_or_sampler_handle() {
++    // The pattern Cruis'n Blast's shaders use: mov R13, c2[0x168]; lop.or R13, R13, c2[0x568]
++    let code = program(
++        fragment_header(1),
++        &[mov_cbuf(13, 2, 0x168), ipa(0, 0x80, 0xff), lop_or_cbuf(13, 13, 2, 0x568), ipa(1, 0x84, 0xff), tex_b_2d(4, 0, 13, 0), EXIT],
++    );
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    let t = shader.textures[0];
++    assert_eq!((t.slot, t.handle, t.or), (Some(2), 0x168 / 4, Some((2, 0x568 / 4))));
++    validate(&shader.spirv);
++}
++
++#[test]
++fn bindless_or_word_does_not_leak_into_a_later_bound_texture() {
++    let code = program(
++        fragment_header(1),
++        &[mov_cbuf(13, 2, 0x10), lop_or_cbuf(13, 13, 2, 0x20), ipa(0, 0x80, 0xff), ipa(1, 0x84, 0xff), tex_b_2d(4, 0, 13, 0), texs_2d(8, 0, 1, 3), EXIT],
++    );
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    let bound = shader.textures.iter().find(|t| t.slot.is_none()).unwrap();
++    assert_eq!((bound.handle, bound.or), (3, None));
++    validate(&shader.spirv);
++}
+diff --git a/crates/rt/src/gpu/vulkan/descriptors.rs b/crates/rt/src/gpu/vulkan/descriptors.rs
+index 86bd89f..28b06f6 100644
+--- a/crates/rt/src/gpu/vulkan/descriptors.rs
++++ b/crates/rt/src/gpu/vulkan/descriptors.rs
+@@ -127,7 +127,7 @@ impl Renderer {
+         }
+         self.lap(10, &mut lap);
+         for &t in &s.shader.textures {
+-            let (view, sampler) = match self.texture(gpu, mem, regs, cbufs, t.slot, t.handle, t.dim, t.array, t.shadow) {
++            let (view, sampler) = match self.texture(gpu, mem, regs, cbufs, t.slot, t.handle, t.or, t.dim, t.array, t.shadow) {
+                 Ok(v) => v,
+                 Err(why) => {
+                     self.note_placeholder(&why);
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index 15512b1..ee0bb34 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -66,15 +66,21 @@ impl Renderer {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    pub(super) fn texture(&mut self, gpu: &Gpu, mem: &GuestMemory, regs: &[u32], cbufs: [Option<(u64, u32)>; CB_SLOTS], slot: Option<u32>, handle: u32, dim: TexDim, array: bool, shadow: bool) -> Result<(vk::ImageView, vk::Sampler), String> {
++    pub(super) fn texture(&mut self, gpu: &Gpu, mem: &GuestMemory, regs: &[u32], cbufs: [Option<(u64, u32)>; CB_SLOTS], slot: Option<u32>, handle: u32, or: Option<(u32, u32)>, dim: TexDim, array: bool, shadow: bool) -> Result<(vk::ImageView, vk::Sampler), String> {
+         let mut lap = self.clock_start();
++        let read_word = |slot: u32, index: u32| -> Result<u32, String> {
++            let (cb, cb_size) = cbufs[slot as usize].ok_or_else(|| format!("texture constant buffer {slot} not bound"))?;
++            if index * 4 + 4 > cb_size {
++                return Err("texture handle outside its constant buffer".into());
++            }
++            let word = gpu.bytes(mem, cb + index as u64 * 4, 4).ok_or("texture handle unreadable")?;
++            Ok(u32::from_le_bytes(word.try_into().unwrap()))
++        };
+         let slot = slot.unwrap_or(regs[reg::BINDLESS_TEXTURE] & 0x1f);
+-        let (cb, cb_size) = cbufs[slot as usize].ok_or_else(|| format!("texture constant buffer {slot} not bound"))?;
+-        if handle * 4 + 4 > cb_size {
+-            return Err("texture handle outside its constant buffer".into());
++        let mut word = read_word(slot, handle)?;
++        if let Some((s, i)) = or {
++            word |= read_word(s, i)?;
+         }
+-        let word = gpu.bytes(mem, cb + handle as u64 * 4, 4).ok_or("texture handle unreadable")?;
+-        let word = u32::from_le_bytes(word.try_into().unwrap());
+         let (tic_index, tsc_index) = (word & 0xfffff, word >> 20);
+         let tic_pool = address(regs, reg::TEX_HEADER_POOL);
+         let tsc_pool = address(regs, reg::TEX_SAMPLER_POOL);
