@@ -78,10 +78,13 @@ backtraces and stats on, logging to `run.log`.
 - Playable on Windows (i9-13900K / RTX 4070 Ti) at 60 fps: boot, menus, car select with the
   3D car and the rendered car icons in the selector, races with the full 3D scene,
   post-processing and HUD; FMOD audio works
-- Kirikae patches 0001-0011 (see `patches/kirikae/README.md`): function discovery, bindless
+- Kirikae patches 0001-0012 (see `patches/kirikae/README.md`): function discovery, bindless
   textures (NVN texture|sampler handles), TLD/TXQ, compressed-texture aliasing, layout-aware
   inline uploads, MSAA resolve blits, render-target write-back for copy-engine reads, plus
   diagnostics
+- Settings in `build\cruisn-blast.ini` (written on first start, patch 0012): window size,
+  borderless fullscreen (F11 / Alt+Enter), vsync, aspect-correct scaling, forced 16x
+  anisotropic filtering, render resolution and frame rate (both experimental above stock)
 - Open issues:
   - Hitches the first time new materials appear (driver pipeline compiles); a second pass
     over the same content is much smoother thanks to the driver pipeline cache

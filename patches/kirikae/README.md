@@ -143,3 +143,21 @@ When a copy-engine transfer reads block-linear memory that starts at a GPU-writt
 single-level color image, the image is now read back from the GPU and written into guest
 memory with the transfer's own block-linear geometry before the copy. With
 KIRIKAE_TRACE_UPLOADS set, each write-back is logged. Runtime tests: 198 pass.
+
+## 0012 - player settings (`cruisn-blast.ini`)
+
+New `settings` module: reads `<exe name>.ini` next to the executable and writes a commented
+default file on first start. Options:
+
+| Section | Key | Default | Effect |
+|---|---|---|---|
+| display | `window_width`, `window_height` | 1920 x 1080 | Window size in physical pixels (was a fixed 1280x720 logical window, so the game's 1080p frames were shown downscaled) |
+| display | `fullscreen` | false | Start in borderless fullscreen. F11 or Alt+Enter toggles at runtime (Alt+Enter is not passed to the game as +) |
+| display | `vsync` | false | FIFO present mode (same as `KIRIKAE_VSYNC`) |
+| display | `keep_aspect` | true | Letterbox / pillarbox instead of stretching |
+| display | `scale_filter` | linear | `linear` or `nearest` scaling of the frame to the window |
+| graphics | `anisotropy` | 16 | Forced on linear, mipmapped, non-depth-compare samplers; never lower than the game asks |
+| graphics | `render_width`, `render_height` | 1920 x 1080 | Docked display resolution reported to the game (am ICommonStateGetter 60). Experimental above 1080p |
+| performance | `frame_rate` | 60 | Rate for the vsync event and frame pacing. Experimental above 60 |
+
+Runtime tests: 201 pass (settings parsing, default file, letterbox math).
