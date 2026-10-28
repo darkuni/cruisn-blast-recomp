@@ -195,3 +195,42 @@ no driver compile and no skipped draws the first time a track appears.
 
 Runtime tests: 207 pass, plus an ignored offscreen render test of the menu
 (`render_menu_offscreen`, writes `KIRIKAE_OVERLAY_PNG`).
+
+## 0014 - compile every game shader at startup (pipeline libraries)
+
+The game's own shader programs (all 32,501 Switch/Maxwell programs in its Unity data, pulled
+out at build time by `tools/extract_shaders.py` into `build\cruisn-blast.shaders`) are
+translated and compiled on spare cores when the game starts. On the first launch the game
+waits on its first frame behind a "Preparing shaders" progress screen until they are done;
+later launches hit the driver's caches.
+
+How it can compile ahead without knowing draw state: with VK_EXT_graphics_pipeline_library
+each pipeline is linked from four parts (vertex input, vertex shader, fragment shader,
+fragment output). The two shader parts are the expensive ones, and they are made independent
+of everything else:
+
+- vertex resources are in descriptor set 0 and fragment resources in set 1, with
+  INDEPENDENT_SETS layouts and per-stage set visibility (translator option `descriptor_set`)
+- the viewport depth transform is a push constant instead of constants baked into the vertex
+  shader (translator option `depth_push`)
+- depth clamp is dynamic state (VK_EXT_extended_dynamic_state3) when available
+
+A draw then only links the parts (measured 0.03-0.1 ms per pipeline on lavapipe). Shader
+parts the preload did not cover (3 programs with indirect-branch tables that read constant
+buffers, Unity's 2 built-in engine shaders, rare draw-state variants) compile when first
+drawn, and are counted.
+
+Without pipeline library support (or `KIRIKAE_NO_GPL`) everything works as before, including
+the recorded `.pipelines` preload from 0013. `KIRIKAE_NO_SHADER_WAIT` skips the first-launch
+wait; `KIRIKAE_SHADERS` points at another shader file.
+
+Also fixed: the translator decorated the shared constant-buffer array type with ArrayStride
+once per buffer, which is invalid SPIR-V (spirv-val rejected 294 of the first 300 game
+programs; NVIDIA tolerated it).
+
+New stats line (KIRIKAE_STATS): frames over 33 ms and over 100 ms, shader parts compiled ahead
+vs while playing, pipelines linked.
+
+Verified offline: every program translates; library compiles and links of the game programs
+pass the Khronos validation layer on lavapipe; tests `game_shaders` (maxwell) and
+`compile_and_link_game_shaders` (rt), both ignored by default and driven by KIRIKAE_SHADERS.

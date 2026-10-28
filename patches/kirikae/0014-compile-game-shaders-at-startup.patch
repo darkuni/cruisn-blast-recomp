@@ -1,0 +1,1381 @@
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index cf486a7..b049311 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -66,6 +66,12 @@ pub struct Options {
+     pub depth_unorm16: bool,
+     pub alpha_test: bool,
+     pub exact_texel_rounding: bool,
++    /// Descriptor set every resource is decorated with.
++    pub descriptor_set: u32,
++    /// Vertex: apply the viewport depth transform from a push constant block
++    /// `{ f32 scale, f32 offset }` at offset 0 instead of baking `depth_transform` in, so the
++    /// SPIR-V does not depend on draw state.
++    pub depth_push: bool,
+ }
+ 
+ impl Options {
+@@ -88,6 +94,8 @@ impl Options {
+             depth_unorm16: false,
+             alpha_test: false,
+             exact_texel_rounding: false,
++            descriptor_set: 0,
++            depth_push: false,
+         }
+     }
+ }
+@@ -466,13 +474,17 @@ impl<'a> Translator<'a> {
+         }
+         let len = self.u(CBUF_VEC4S);
+         let arr = self.b.type_array(self.t.v4u, len);
+-        self.b.decorate(arr, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
+         let st = self.b.type_struct([arr]);
+-        self.b.decorate(st, Decoration::Block, []);
+-        self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
++        // the builder shares one array and block type between all constant buffers:
++        // decorate them once (repeated ArrayStride is invalid SPIR-V)
++        if self.cbufs.is_empty() {
++            self.b.decorate(arr, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
++            self.b.decorate(st, Decoration::Block, []);
++            self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
++        }
+         let ptr = self.b.type_pointer(None, StorageClass::Uniform, st);
+         let var = self.global(ptr, StorageClass::Uniform);
+-        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
++        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(self.opts.descriptor_set)]);
+         self.b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(self.opts.cbuf_binding + slot)]);
+         self.cbufs.insert(slot, var);
+         var
+@@ -579,7 +591,7 @@ impl<'a> Translator<'a> {
+         if self.opts.stage == Stage::Fragment {
+             self.fragment_outputs()?;
+         }
+-        if self.opts.stage == Stage::Vertex && (self.opts.depth_transform.is_some() || self.opts.depth_unorm16) {
++        if self.opts.stage == Stage::Vertex && (self.opts.depth_transform.is_some() || self.opts.depth_unorm16 || self.opts.depth_push) {
+             let v4f = self.t.v4f;
+             let position = self.builtin(BuiltIn::Position, v4f, true);
+             let f32_ = self.t.f32;
+@@ -589,7 +601,23 @@ impl<'a> Translator<'a> {
+             let wp = self.b.access_chain(ptr_ty, None, position, [three])?;
+             let mut z = self.b.load(f32_, None, zp, None, [])?;
+             let w = self.b.load(f32_, None, wp, None, [])?;
+-            if let Some((scale, offset)) = self.opts.depth_transform {
++            if self.opts.depth_push {
++                let st = self.b.type_struct([f32_, f32_]);
++                self.b.decorate(st, Decoration::Block, []);
++                self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
++                self.b.member_decorate(st, 1, Decoration::Offset, [Operand::LiteralBit32(4)]);
++                let st_ptr = self.b.type_pointer(None, StorageClass::PushConstant, st);
++                let block = self.global(st_ptr, StorageClass::PushConstant);
++                let member_ptr = self.b.type_pointer(None, StorageClass::PushConstant, f32_);
++                let (zero, one) = (self.u(0), self.u(1));
++                let sp = self.b.access_chain(member_ptr, None, block, [zero])?;
++                let op = self.b.access_chain(member_ptr, None, block, [one])?;
++                let scale = self.b.load(f32_, None, sp, None, [])?;
++                let offset = self.b.load(f32_, None, op, None, [])?;
++                let wo = self.b.f_mul(f32_, None, w, offset)?;
++                self.exact(wo);
++                z = self.ext(f32_, glsl::FMA, &[z, scale, wo])?;
++            } else if let Some((scale, offset)) = self.opts.depth_transform {
+                 let (scale, offset) = (self.f(scale), self.f(offset));
+                 let wo = self.b.f_mul(f32_, None, w, offset)?;
+                 self.exact(wo);
+@@ -2829,13 +2857,15 @@ impl<'a> Translator<'a> {
+             return v;
+         }
+         let arr = self.b.type_runtime_array(self.t.u32);
+-        self.b.decorate(arr, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+         let st = self.b.type_struct([arr]);
+-        self.b.decorate(st, Decoration::Block, []);
+-        self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
++        if self.storage.is_empty() {
++            self.b.decorate(arr, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
++            self.b.decorate(st, Decoration::Block, []);
++            self.b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
++        }
+         let ptr = self.b.type_pointer(None, StorageClass::StorageBuffer, st);
+         let var = self.global(ptr, StorageClass::StorageBuffer);
+-        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
++        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(self.opts.descriptor_set)]);
+         self.b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(self.opts.storage_binding + slot)]);
+         self.interface_storage(var);
+         self.storage.insert(slot, var);
+@@ -3286,7 +3316,7 @@ impl<'a> Translator<'a> {
+         let sampler = self.global(sampler_ptr, StorageClass::UniformConstant);
+         debug_assert_eq!(sampler, image + 1);
+         for (var, b) in [(image, binding), (sampler, binding + 1)] {
+-            self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
++            self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(self.opts.descriptor_set)]);
+             self.b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(b)]);
+         }
+         self.textures.push((TextureUse { binding, ..key }, image));
+@@ -3314,7 +3344,7 @@ impl<'a> Translator<'a> {
+         let binding = self.opts.image_binding + self.images.len() as u32;
+         let ptr = self.b.type_pointer(None, StorageClass::UniformConstant, image_ty);
+         let var = self.global(ptr, StorageClass::UniformConstant);
+-        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
++        self.b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(self.opts.descriptor_set)]);
+         self.b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(binding)]);
+         self.b.decorate(var, Decoration::NonReadable, []);
+         self.images.push((ImageUse { slot, handle, dim, array, binding }, var));
+diff --git a/crates/maxwell/tests/game_shaders.rs b/crates/maxwell/tests/game_shaders.rs
+new file mode 100644
+index 0000000..0cdc81f
+--- /dev/null
++++ b/crates/maxwell/tests/game_shaders.rs
+@@ -0,0 +1,88 @@
++//! Translates every program in a `.shaders` file (tools/extract_shaders.py) with default draw
++//! state and validates the SPIR-V. Run with:
++//!   KIRIKAE_SHADERS=path/to/game.shaders cargo test --release -p kirikae-maxwell --test game_shaders -- --ignored --nocapture
++
++use std::collections::BTreeMap;
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use kirikae_maxwell::{NoEnv, Options, Stage, sph, translate};
++
++fn programs(file: &[u8]) -> Vec<&[u8]> {
++    assert_eq!(&file[..4], b"KSH1");
++    let n = u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize;
++    let mut p = 8;
++    (0..n)
++        .map(|_| {
++            let len = u32::from_le_bytes(file[p..p + 4].try_into().unwrap()) as usize;
++            p += 4;
++            let code = &file[p..p + len];
++            p += len;
++            code
++        })
++        .collect()
++}
++
++#[test]
++#[ignore]
++fn translate_all_game_shaders() {
++    let Ok(path) = std::env::var("KIRIKAE_SHADERS") else { return };
++    let file = std::fs::read(path).unwrap();
++    let progs = programs(&file);
++    let next = AtomicUsize::new(0);
++    let results: Mutex<BTreeMap<String, (usize, usize)>> = Mutex::new(BTreeMap::new());
++    let unsupported: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
++    let start = std::time::Instant::now();
++    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
++    std::thread::scope(|s| {
++        for _ in 0..threads {
++            s.spawn(|| {
++                loop {
++                    let i = next.fetch_add(1, Ordering::Relaxed);
++                    let Some(code) = progs.get(i) else { return };
++                    let Some(h) = sph::Header::parse(code) else {
++                        results.lock().unwrap().entry("no header".into()).or_default().0 += 1;
++                        continue;
++                    };
++                    let stage = match h.shader_type() {
++                        1 => Stage::Vertex,
++                        5 => Stage::Fragment,
++                        t => {
++                            results.lock().unwrap().entry(format!("shader type {t}")).or_default().0 += 1;
++                            continue;
++                        }
++                    };
++                    let base = if stage == Stage::Fragment { 0x80 } else { 0 };
++                    let opts = Options::new(stage, base);
++                    let r = std::panic::catch_unwind(|| translate(code, &opts, &NoEnv));
++                    let outcome = match r {
++                        Err(_) => "panic".to_string(),
++                        Ok(Err(e)) => format!("error {e:?}").chars().take(60).collect(),
++                        Ok(Ok(shader)) => {
++                            for u in &shader.unsupported {
++                                *unsupported.lock().unwrap().entry(u).or_default() += 1;
++                            }
++                            let bytes: Vec<u8> = shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
++                            match naga::front::spv::parse_u8_slice(&bytes, &naga::front::spv::Options::default()) {
++                                Err(naga::front::spv::Error::UnsupportedCapability(_) | naga::front::spv::Error::UnsupportedInstruction(..)) => "ok (naga cannot parse, not checked)".into(),
++                                Err(e) => format!("naga parse {e:?}").chars().take(60).collect(),
++                                Ok(m) => match naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&m) {
++                                    Ok(_) => "ok".into(),
++                                    Err(e) => format!("invalid {:?}", e.as_inner()).chars().take(60).collect(),
++                                },
++                            }
++                        }
++                    };
++                    let mut r = results.lock().unwrap();
++                    let e = r.entry(format!("{stage:?}: {outcome}")).or_default();
++                    e.0 += 1;
++                }
++            });
++        }
++    });
++    eprintln!("{} programs in {:.1} s on {threads} threads", progs.len(), start.elapsed().as_secs_f64());
++    for (k, (n, _)) in results.lock().unwrap().iter() {
++        eprintln!("{n:7}  {k}");
++    }
++    eprintln!("unsupported instructions: {:?}", unsupported.lock().unwrap());
++}
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index e373329..ecce9e1 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -26,12 +26,21 @@ pub fn uncapped_fps(frames: u64, secs: f64, paced: u64) -> f64 {
+     if busy > 0.0 { frames as f64 / busy } else { 0.0 }
+ }
+ static LONGEST: AtomicU64 = AtomicU64::new(0);
++/// Frames that took longer than two refreshes (33 ms) and longer than 100 ms.
++pub static HITCHES: AtomicU64 = AtomicU64::new(0);
++pub static BIG_HITCHES: AtomicU64 = AtomicU64::new(0);
+ static LAST_FRAME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+ 
+ fn note_frame() {
+     let now = std::time::Instant::now();
+     if let Some(last) = LAST_FRAME.lock().unwrap().replace(now) {
+         LONGEST.fetch_max((now - last).as_nanos() as u64, Ordering::Relaxed);
++        if now - last > std::time::Duration::from_millis(33) {
++            HITCHES.fetch_add(1, Ordering::Relaxed);
++        }
++        if now - last > std::time::Duration::from_millis(100) {
++            BIG_HITCHES.fetch_add(1, Ordering::Relaxed);
++        }
+         if now - last > std::time::Duration::from_millis(100) && std::env::var("KIRIKAE_STATS").is_ok_and(|v| v == "2") {
+             let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+             eprintln!("kirikae: hitch: frame {} took {:.0} ms, ending at {:.3}", FRAMES.load(Ordering::Relaxed), (now - last).as_secs_f64() * 1e3, unix.as_secs_f64());
+diff --git a/crates/rt/src/gpu/vulkan/descriptors.rs b/crates/rt/src/gpu/vulkan/descriptors.rs
+index 28b06f6..05e3ea9 100644
+--- a/crates/rt/src/gpu/vulkan/descriptors.rs
++++ b/crates/rt/src/gpu/vulkan/descriptors.rs
+@@ -250,6 +250,66 @@ impl Renderer {
+     }
+ }
+ 
++impl Renderer {
++    /// Library mode: vertex resources in set 0, fragment resources in set 1.
++    pub(super) fn bind_descriptor_sets(&mut self, layout: vk::PipelineLayout, set_layouts: [vk::DescriptorSetLayout; 2], descriptors: &[Descriptor], scratch: &mut DrawScratch) {
++        if self.bound.descriptors.as_ref().is_some_and(|(l, d)| *l == layout && d.as_slice() == descriptors) {
++            self.stats.pushes_reused += 1;
++            return;
++        }
++        let last = self.bound.descriptors.get_or_insert_with(|| (layout, Vec::new()));
++        last.0 = layout;
++        last.1.clear();
++        last.1.extend_from_slice(descriptors);
++        let sets = match unsafe { self.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.descriptor_pool).set_layouts(&set_layouts)) } {
++            Ok(s) => [s[0], s[1]],
++            Err(e) => {
++                eprintln!("kirikae: descriptor sets: {e:?}");
++                self.bound.descriptors = None;
++                return;
++            }
++        };
++        let (buffer_infos, image_infos, writes) = (&mut scratch.buffer_infos, &mut scratch.image_infos, &mut scratch.writes);
++        buffer_infos.clear();
++        image_infos.clear();
++        writes.clear();
++        for d in descriptors {
++            buffer_infos.push(match *d {
++                Descriptor::Buffer(_, _, buffer, offset, range) => vk::DescriptorBufferInfo { buffer, offset, range },
++                _ => vk::DescriptorBufferInfo::default(),
++            });
++            image_infos.push(match *d {
++                Descriptor::Image(_, view) | Descriptor::StorageImage(_, view) => vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL },
++                Descriptor::Sampler(_, s) => vk::DescriptorImageInfo { sampler: s, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED },
++                _ => vk::DescriptorImageInfo::default(),
++            });
++        }
++        for (k, d) in descriptors.iter().enumerate() {
++            let (binding, ty) = match *d {
++                Descriptor::Buffer(b, ty, ..) => (b, ty),
++                Descriptor::Image(b, _) => (b, vk::DescriptorType::SAMPLED_IMAGE),
++                Descriptor::Sampler(b, _) => (b, vk::DescriptorType::SAMPLER),
++                Descriptor::StorageImage(b, _) => (b, vk::DescriptorType::STORAGE_IMAGE),
++            };
++            let buffer = matches!(d, Descriptor::Buffer(..));
++            writes.push(vk::WriteDescriptorSet {
++                dst_set: sets[(binding >= FRAGMENT_BASE) as usize],
++                dst_binding: binding,
++                descriptor_count: 1,
++                descriptor_type: ty,
++                p_buffer_info: if buffer { &buffer_infos[k] } else { std::ptr::null() },
++                p_image_info: if buffer { std::ptr::null() } else { &image_infos[k] },
++                ..Default::default()
++            });
++        }
++        unsafe {
++            self.device.update_descriptor_sets(writes, &[]);
++            self.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &sets, &[]);
++        }
++        writes.clear();
++    }
++}
++
+ #[derive(Clone, Copy, PartialEq)]
+ pub(super) enum Descriptor {
+     Buffer(u32, vk::DescriptorType, vk::Buffer, u64, u64),
+diff --git a/crates/rt/src/gpu/vulkan/draw.rs b/crates/rt/src/gpu/vulkan/draw.rs
+index 6ee6989..1417bf7 100644
+--- a/crates/rt/src/gpu/vulkan/draw.rs
++++ b/crates/rt/src/gpu/vulkan/draw.rs
+@@ -48,6 +48,8 @@ pub(super) struct Bound {
+     pub(super) vertex: [Option<(vk::Buffer, u64)>; 32],
+     pub(super) index: Option<(vk::Buffer, u64, vk::IndexType)>,
+     pub(super) descriptors: Option<(vk::PipelineLayout, Vec<Descriptor>)>,
++    pub(super) depth_push: Option<(vk::PipelineLayout, [u32; 2])>,
++    pub(super) clamp: Option<bool>,
+ }
+ 
+ fn depth_state(test: bool, write: bool, func: u32, exports_depth: bool) -> (bool, bool, vk::CompareOp) {
+@@ -286,7 +288,19 @@ impl Renderer {
+ 
+         let exports_depth = fs.as_ref().is_some_and(|f| f.shader.writes_depth);
+         let pair = (vs.module, fs.as_ref().map_or(vk::ShaderModule::null(), |f| f.module));
++        let mut gpl_sets = None;
+         let (set_layout, layout) = match self.pair_layouts.get(&pair) {
++            _ if self.gpl.is_some() => {
++                let mut vb = Vec::new();
++                Self::shader_bindings(&vs, VERTEX_BASE, &mut vb);
++                let mut fb = Vec::new();
++                if let Some(fs) = &fs {
++                    Self::shader_bindings(fs, FRAGMENT_BASE, &mut fb);
++                }
++                let (layout, sets) = self.gpl.as_mut().unwrap().link_layout(super::gpl::set_key(vb, Stage::Vertex), super::gpl::set_key(fb, Stage::Fragment));
++                gpl_sets = Some(sets);
++                (sets[0], layout)
++            }
+             Some(&l) => l,
+             None => {
+                 let mut bindings: Vec<(u32, vk::DescriptorType)> = Vec::new();
+@@ -350,7 +364,9 @@ impl Renderer {
+         key.colors.clear();
+         key.colors.extend(targets.iter().map(|t| t.map_or(vk::Format::UNDEFINED, |(_, f)| f.vk)));
+         key.depth = depth.map_or(vk::Format::UNDEFINED, |k| k.format);
+-        key.depth_clamp = self.depth_clamp && regs[reg::VIEW_VOLUME_CLIP_CTRL] & 1 << 11 == 0;
++        let clamp = self.depth_clamp && regs[reg::VIEW_VOLUME_CLIP_CTRL] & 1 << 11 == 0;
++        let dynamic_clamp = self.gpl.as_ref().is_some_and(|g| g.eds3.is_some());
++        key.depth_clamp = clamp && !dynamic_clamp;
+         key.alpha_test = match alpha_test_func(regs) {
+             7 => [7, 0],
+             f => [f, regs[reg::ALPHA_TEST_REF]],
+@@ -358,7 +374,18 @@ impl Renderer {
+         let frame = crate::display::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+         let recurring = self.pair_drawn.get(&pair).is_some_and(|&f| frame.saturating_sub(f) <= 2);
+         let lasting = !recurring || targets.iter().flatten().map(|&(k, _)| k).chain(depth).any(|k| !self.images[&k].transient(frame));
+-        let pipeline = self.pipeline(&key, lasting)?;
++        let pipeline = if self.gpl.is_some() {
++            self.library_pipeline(&key, &vs.shader.spirv, fs.as_ref().map(|f| f.shader.spirv.as_slice()))
++        } else {
++            self.pipeline(&key, lasting)
++        };
++        let pipeline = match pipeline {
++            Ok(p) => p,
++            Err(e) => {
++                self.scratch_key = key;
++                return Err(e);
++            }
++        };
+         self.lap(4, &mut lap);
+         if crate::gpu::trace() {
+             let f = |r: usize| f32::from_bits(regs[r]);
+@@ -485,6 +512,21 @@ impl Renderer {
+             if changed(&mut b.pipeline, pipeline) {
+                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+             }
++            if let Some(g) = &self.gpl {
++                // viewport depth transform for library-mode vertex shaders
++                let (s, o) = super::pipeline::depth_transform(regs).unwrap_or((1.0, 0.0));
++                if changed(&mut b.depth_push, (layout, [s.to_bits(), o.to_bits()])) {
++                    let mut bytes = [0u8; 8];
++                    bytes[..4].copy_from_slice(&s.to_le_bytes());
++                    bytes[4..].copy_from_slice(&o.to_le_bytes());
++                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::VERTEX, 0, &bytes);
++                }
++                if let Some(e) = &g.eds3
++                    && changed(&mut b.clamp, clamp)
++                {
++                    e.cmd_set_depth_clamp_enable(cmd, clamp);
++                }
++            }
+             let sx = f32::from_bits(regs[reg::VIEWPORT_SCALE]);
+             let sy = f32::from_bits(regs[reg::VIEWPORT_SCALE + 1]);
+             let ox = f32::from_bits(regs[reg::VIEWPORT_SCALE + 3]);
+@@ -581,7 +623,10 @@ impl Renderer {
+                 }
+             }
+         }
+-        self.bind_descriptors(vk::PipelineBindPoint::GRAPHICS, set_layout, layout, &descriptors, &mut scratch);
++        match gpl_sets {
++            Some(sets) => self.bind_descriptor_sets(layout, sets, &descriptors, &mut scratch),
++            None => self.bind_descriptors(vk::PipelineBindPoint::GRAPHICS, set_layout, layout, &descriptors, &mut scratch),
++        }
+         unsafe {
+             let d = &self.device;
+             match index {
+diff --git a/crates/rt/src/gpu/vulkan/gpl.rs b/crates/rt/src/gpu/vulkan/gpl.rs
+new file mode 100644
+index 0000000..df1ee09
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/gpl.rs
+@@ -0,0 +1,645 @@
++//! Graphics pipeline libraries (VK_EXT_graphics_pipeline_library).
++//!
++//! Every pipeline is linked from four parts: vertex input, pre-rasterization (the vertex
++//! shader), fragment shader and fragment output. The two shader parts are the expensive ones
++//! and depend only on their own shader: vertex resources live in descriptor set 0 and fragment
++//! resources in set 1 (independent sets), and the viewport depth transform comes from a push
++//! constant instead of being baked into the vertex shader. So they can all be compiled up
++//! front from the game's shader programs (`<exe>.shaders`, written by the build), and a draw
++//! only has to link the parts, which is fast.
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++
++use ash::vk;
++use kirikae_maxwell::{NoEnv, Options, Shader, Stage};
++
++use super::Renderer;
++use super::descriptors::{FRAGMENT_BASE, IMAGE_OFFSET, STORAGE_OFFSET, TEXTURE_OFFSET, VERTEX_BASE};
++use super::pipeline::{LayoutKey, PipelineKey};
++use super::preload::spirv_hash;
++use crate::gpu::threed::CB_SLOTS;
++use crate::overlay::{PRELOAD_DONE, PRELOAD_TOTAL};
++
++/// Shader parts compiled ahead of time, compiled while the game ran, and pipelines linked.
++pub static PARTS_PRELOADED: AtomicUsize = AtomicUsize::new(0);
++pub static PARTS_ON_DEMAND: AtomicUsize = AtomicUsize::new(0);
++pub static LINKED: AtomicUsize = AtomicUsize::new(0);
++
++/// `{ f32 depth scale, f32 depth offset }` for the vertex stage.
++pub(super) const PUSH_SIZE: u32 = 8;
++
++type PreKey = (vk::ShaderModule, LayoutKey, bool);
++type FragKey = (vk::ShaderModule, LayoutKey, [u32; 2]);
++
++/// Resource bindings of one translated shader (same numbering as the draw path).
++pub(super) fn bindings_of(s: &Shader, base: u32) -> Vec<(u32, vk::DescriptorType)> {
++    let mut out = Vec::new();
++    for slot in 0..CB_SLOTS as u32 {
++        if s.cbufs >> slot & 1 == 1 {
++            out.push((base + slot, vk::DescriptorType::UNIFORM_BUFFER));
++        }
++    }
++    for slot in 0..16 {
++        if s.storage >> slot & 1 == 1 {
++            out.push((base + STORAGE_OFFSET + slot, vk::DescriptorType::STORAGE_BUFFER));
++        }
++    }
++    for t in &s.textures {
++        out.push((t.binding, vk::DescriptorType::SAMPLED_IMAGE));
++        out.push((t.binding + 1, vk::DescriptorType::SAMPLER));
++    }
++    for i in &s.images {
++        out.push((i.binding, vk::DescriptorType::STORAGE_IMAGE));
++    }
++    out
++}
++
++/// The set layout key for a stage's bindings (visible to that stage only, so the vertex and
++/// fragment sets never overlap).
++pub(super) fn set_key(mut bindings: Vec<(u32, vk::DescriptorType)>, stage: Stage) -> LayoutKey {
++    bindings.sort_unstable_by_key(|b| b.0);
++    bindings.dedup();
++    let flags = if stage == Stage::Fragment { vk::ShaderStageFlags::FRAGMENT } else { vk::ShaderStageFlags::VERTEX };
++    (bindings, flags.as_raw())
++}
++
++/// Translation options in library mode; the draw path and the preload must agree exactly so
++/// the same program gives the same SPIR-V.
++pub(super) fn options(stage: Stage) -> Options {
++    let base = if stage == Stage::Fragment { FRAGMENT_BASE } else { VERTEX_BASE };
++    Options {
++        texture_binding: base + TEXTURE_OFFSET,
++        storage_binding: base + STORAGE_OFFSET,
++        image_binding: base + IMAGE_OFFSET,
++        exact_texel_rounding: crate::env_var!("KIRIKAE_NO_TEXEL_ROUNDING").is_some(),
++        descriptor_set: (stage == Stage::Fragment) as u32,
++        depth_push: stage == Stage::Vertex,
++        ..Options::new(stage, base)
++    }
++}
++
++pub(super) fn dynamic_states(clamp: bool) -> Vec<vk::DynamicState> {
++    let mut d = vec![
++        vk::DynamicState::VIEWPORT,
++        vk::DynamicState::SCISSOR,
++        vk::DynamicState::CULL_MODE,
++        vk::DynamicState::FRONT_FACE,
++        vk::DynamicState::BLEND_CONSTANTS,
++        vk::DynamicState::DEPTH_TEST_ENABLE,
++        vk::DynamicState::DEPTH_WRITE_ENABLE,
++        vk::DynamicState::DEPTH_COMPARE_OP,
++        vk::DynamicState::STENCIL_TEST_ENABLE,
++        vk::DynamicState::STENCIL_OP,
++        vk::DynamicState::STENCIL_COMPARE_MASK,
++        vk::DynamicState::STENCIL_WRITE_MASK,
++        vk::DynamicState::STENCIL_REFERENCE,
++        vk::DynamicState::DEPTH_BIAS_ENABLE,
++        vk::DynamicState::DEPTH_BIAS,
++    ];
++    if clamp {
++        d.push(vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT);
++    }
++    d
++}
++
++/// Parts shared with the preload threads.
++pub(super) struct Shared {
++    device: ash::Device,
++    cache: vk::PipelineCache,
++    /// Depth clamp is dynamic state (VK_EXT_extended_dynamic_state3).
++    pub(super) clamp_dynamic: bool,
++    set_layouts: Mutex<HashMap<LayoutKey, vk::DescriptorSetLayout>>,
++    lib_layouts: Mutex<HashMap<(Option<LayoutKey>, Option<LayoutKey>), vk::PipelineLayout>>,
++    pre: Mutex<HashMap<PreKey, vk::Pipeline>>,
++    frag: Mutex<HashMap<FragKey, vk::Pipeline>>,
++    /// Shader parts compiled while the game was running (not preloaded).
++    pub(super) on_demand: AtomicUsize,
++    pub(super) preloaded: AtomicUsize,
++}
++
++impl Shared {
++    /// Identity of a shader part: its SPIR-V hash, carried in a ShaderModule handle. The
++    /// real VkShaderModule only exists while its library compiles.
++    pub(super) fn id(&self, spirv: &[u32]) -> vk::ShaderModule {
++        use ash::vk::Handle;
++        vk::ShaderModule::from_raw(spirv_hash(spirv) | 1)
++    }
++
++    fn temp_module(&self, spirv: &[u32]) -> Result<vk::ShaderModule, vk::Result> {
++        unsafe { self.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }
++    }
++
++    pub(super) fn set_layout(&self, key: &LayoutKey) -> vk::DescriptorSetLayout {
++        let mut m = self.set_layouts.lock().unwrap();
++        if let Some(&l) = m.get(key) {
++            return l;
++        }
++        let stages = vk::ShaderStageFlags::from_raw(key.1);
++        let bindings: Vec<vk::DescriptorSetLayoutBinding> = key.0.iter().map(|&(b, ty)| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(ty).descriptor_count(1).stage_flags(stages)).collect();
++        let l = unsafe { self.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).unwrap() };
++        m.insert(key.clone(), l);
++        l
++    }
++
++    /// Pipeline layout with independent sets: set 0 vertex, set 1 fragment.
++    pub(super) fn layout(&self, vertex: Option<&LayoutKey>, fragment: Option<&LayoutKey>) -> vk::PipelineLayout {
++        let key = (vertex.cloned(), fragment.cloned());
++        if let Some(&l) = self.lib_layouts.lock().unwrap().get(&key) {
++            return l;
++        }
++        let sets = [vertex.map_or(vk::DescriptorSetLayout::null(), |k| self.set_layout(k)), fragment.map_or(vk::DescriptorSetLayout::null(), |k| self.set_layout(k))];
++        let push = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::VERTEX, offset: 0, size: PUSH_SIZE }];
++        let info = vk::PipelineLayoutCreateInfo::default().flags(vk::PipelineLayoutCreateFlags::INDEPENDENT_SETS_EXT).set_layouts(&sets).push_constant_ranges(&push);
++        let l = unsafe { self.device.create_pipeline_layout(&info, None).unwrap() };
++        *self.lib_layouts.lock().unwrap().entry(key).or_insert(l)
++    }
++
++    fn library(&self, info: vk::GraphicsPipelineCreateInfo, parts: vk::GraphicsPipelineLibraryFlagsEXT) -> Result<vk::Pipeline, vk::Result> {
++        let mut lib = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(parts);
++        let info = info.flags(vk::PipelineCreateFlags::LIBRARY_KHR).push_next(&mut lib);
++        unsafe { self.device.create_graphics_pipelines(self.cache, &[info], None) }.map(|p| p[0]).map_err(|(_, e)| e)
++    }
++
++    /// The vertex shader part; `clamp` is ignored when depth clamp is dynamic.
++    pub(super) fn pre(&self, id: vk::ShaderModule, spirv: &[u32], set: &LayoutKey, clamp: bool, on_demand: bool) -> Result<vk::Pipeline, vk::Result> {
++        let clamp = clamp && !self.clamp_dynamic;
++        let key = (id, set.clone(), clamp);
++        if let Some(&p) = self.pre.lock().unwrap().get(&key) {
++            return Ok(p);
++        }
++        let module = self.temp_module(spirv)?;
++        let layout = self.layout(Some(set), None);
++        let stages = [vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(module).name(c"main")];
++        let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
++        let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).line_width(1.0).depth_clamp_enable(clamp);
++        let dynamic = dynamic_states(self.clamp_dynamic);
++        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
++        let mut rendering = vk::PipelineRenderingCreateInfo::default();
++        let info = vk::GraphicsPipelineCreateInfo::default()
++            .stages(&stages)
++            .viewport_state(&viewport)
++            .rasterization_state(&raster)
++            .dynamic_state(&dynamic)
++            .layout(layout)
++            .push_next(&mut rendering);
++        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS);
++        unsafe { self.device.destroy_shader_module(module, None) };
++        let p = p?;
++        self.count(on_demand);
++        Ok(*self.pre.lock().unwrap().entry(key).or_insert(p))
++    }
++
++    /// The fragment shader part (`module` null for depth-only draws).
++    pub(super) fn frag(&self, id: vk::ShaderModule, spirv: Option<&[u32]>, set: &LayoutKey, alpha_test: [u32; 2], on_demand: bool) -> Result<vk::Pipeline, vk::Result> {
++        let key = (id, set.clone(), alpha_test);
++        if let Some(&p) = self.frag.lock().unwrap().get(&key) {
++            return Ok(p);
++        }
++        let module = match spirv {
++            Some(code) => self.temp_module(code)?,
++            None => vk::ShaderModule::null(),
++        };
++        let layout = self.layout(None, Some(set));
++        let entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }, vk::SpecializationMapEntry { constant_id: 1, offset: 4, size: 4 }];
++        let data: Vec<u8> = alpha_test.iter().flat_map(|w| w.to_ne_bytes()).collect();
++        let spec = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
++        let stages: Vec<vk::PipelineShaderStageCreateInfo> = if module == vk::ShaderModule::null() {
++            Vec::new()
++        } else {
++            vec![vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(module).name(c"main").specialization_info(&spec)]
++        };
++        let depth = vk::PipelineDepthStencilStateCreateInfo::default().depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
++        let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
++        let dynamic = dynamic_states(self.clamp_dynamic);
++        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
++        let mut rendering = vk::PipelineRenderingCreateInfo::default();
++        let info = vk::GraphicsPipelineCreateInfo::default()
++            .stages(&stages)
++            .depth_stencil_state(&depth)
++            .multisample_state(&multisample)
++            .dynamic_state(&dynamic)
++            .layout(layout)
++            .push_next(&mut rendering);
++        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
++        if module != vk::ShaderModule::null() {
++            unsafe { self.device.destroy_shader_module(module, None) };
++        }
++        let p = p?;
++        self.count(on_demand);
++        Ok(*self.frag.lock().unwrap().entry(key).or_insert(p))
++    }
++
++    fn count(&self, on_demand: bool) {
++        if on_demand {
++            self.on_demand.fetch_add(1, Ordering::Relaxed);
++            PARTS_ON_DEMAND.fetch_add(1, Ordering::Relaxed);
++        } else {
++            self.preloaded.fetch_add(1, Ordering::Relaxed);
++            PARTS_PRELOADED.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    pub(super) fn vertex_input(&self, key: &PipelineKey) -> Result<vk::Pipeline, vk::Result> {
++        let bindings: Vec<vk::VertexInputBindingDescription> = key.bindings.iter().map(|&(b, stride)| vk::VertexInputBindingDescription { binding: b, stride, input_rate: vk::VertexInputRate::VERTEX }).collect();
++        let attributes: Vec<vk::VertexInputAttributeDescription> = key.attributes.iter().map(|&(location, binding, format, offset)| vk::VertexInputAttributeDescription { location, binding, format, offset }).collect();
++        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default().vertex_binding_descriptions(&bindings).vertex_attribute_descriptions(&attributes);
++        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology);
++        let dynamic = dynamic_states(self.clamp_dynamic);
++        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
++        let info = vk::GraphicsPipelineCreateInfo::default().vertex_input_state(&vertex_input).input_assembly_state(&assembly).dynamic_state(&dynamic);
++        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE)
++    }
++
++    pub(super) fn fragment_output(&self, key: &PipelineKey) -> Result<vk::Pipeline, vk::Result> {
++        let attachments: Vec<vk::PipelineColorBlendAttachmentState> = key.blend.iter().map(|b| super::pipeline::blend_attachment(b)).collect();
++        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
++        let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
++        let dynamic = dynamic_states(self.clamp_dynamic);
++        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
++        let mut rendering = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&key.colors).depth_attachment_format(key.depth);
++        if super::images::aspect_of(key.depth).contains(vk::ImageAspectFlags::STENCIL) {
++            rendering = rendering.stencil_attachment_format(key.depth);
++        }
++        let info = vk::GraphicsPipelineCreateInfo::default().color_blend_state(&blend).multisample_state(&multisample).dynamic_state(&dynamic).push_next(&mut rendering);
++        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE)
++    }
++
++    pub(super) fn link(&self, parts: &[vk::Pipeline; 4], layout: vk::PipelineLayout) -> Result<vk::Pipeline, vk::Result> {
++        let mut libs = vk::PipelineLibraryCreateInfoKHR::default().libraries(parts);
++        let info = vk::GraphicsPipelineCreateInfo::default().layout(layout).push_next(&mut libs);
++        unsafe { self.device.create_graphics_pipelines(self.cache, &[info], None) }.map(|p| p[0]).map_err(|(_, e)| e)
++    }
++
++    /// Everything this owns.
++    unsafe fn destroy(&self) {
++        unsafe {
++            let d = &self.device;
++            for p in self.pre.lock().unwrap().drain().map(|(_, p)| p).chain(self.frag.lock().unwrap().drain().map(|(_, p)| p)) {
++                d.destroy_pipeline(p, None);
++            }
++            for (_, l) in self.lib_layouts.lock().unwrap().drain() {
++                d.destroy_pipeline_layout(l, None);
++            }
++            for (_, l) in self.set_layouts.lock().unwrap().drain() {
++                d.destroy_descriptor_set_layout(l, None);
++            }
++        }
++    }
++}
++
++pub(super) struct Gpl {
++    pub(super) shared: Arc<Shared>,
++    pub(super) eds3: Option<ash::ext::extended_dynamic_state3::Device>,
++    vertex_inputs: HashMap<(Vec<(u32, u32, vk::Format, u32)>, Vec<(u32, u32)>, vk::PrimitiveTopology), vk::Pipeline>,
++    outputs: HashMap<(Vec<vk::Format>, vk::Format, Vec<[u32; 8]>), vk::Pipeline>,
++    /// link layout -> (vertex set key, fragment set key, set layouts)
++    pub(super) layouts: HashMap<vk::PipelineLayout, (LayoutKey, LayoutKey, [vk::DescriptorSetLayout; 2])>,
++    pub(super) links: usize,
++    stop: Arc<AtomicBool>,
++    workers: Vec<std::thread::JoinHandle<()>>,
++}
++
++impl Gpl {
++    pub(super) fn new(device: &ash::Device, cache: vk::PipelineCache, eds3: Option<ash::ext::extended_dynamic_state3::Device>) -> Gpl {
++        Gpl {
++            shared: Arc::new(Shared {
++                device: device.clone(),
++                cache,
++                clamp_dynamic: eds3.is_some(),
++                set_layouts: Default::default(),
++                lib_layouts: Default::default(),
++                pre: Default::default(),
++                frag: Default::default(),
++                on_demand: AtomicUsize::new(0),
++                preloaded: AtomicUsize::new(0),
++            }),
++            eds3,
++            vertex_inputs: HashMap::new(),
++            outputs: HashMap::new(),
++            layouts: HashMap::new(),
++            links: 0,
++            stop: Arc::new(AtomicBool::new(false)),
++            workers: Vec::new(),
++        }
++    }
++
++    /// The link layout for a vertex/fragment pair, and its two set layouts.
++    pub(super) fn link_layout(&mut self, vertex: LayoutKey, fragment: LayoutKey) -> (vk::PipelineLayout, [vk::DescriptorSetLayout; 2]) {
++        let layout = self.shared.layout(Some(&vertex), Some(&fragment));
++        if let Some(e) = self.layouts.get(&layout) {
++            return (layout, e.2);
++        }
++        let sets = [self.shared.set_layout(&vertex), self.shared.set_layout(&fragment)];
++        self.layouts.insert(layout, (vertex, fragment, sets));
++        (layout, sets)
++    }
++
++    pub(super) fn pipeline(&mut self, key: &PipelineKey, vs: &[u32], fs: Option<&[u32]>) -> Result<vk::Pipeline, String> {
++        let (vset, fset, _) = self.layouts.get(&key.layout).cloned().ok_or("pipeline layout not from the library path")?;
++        let pre = self.shared.pre(key.vertex, vs, &vset, key.depth_clamp, true).map_err(|e| format!("vertex library: {e:?}"))?;
++        let frag = self.shared.frag(key.fragment, fs, &fset, key.alpha_test, true).map_err(|e| format!("fragment library: {e:?}"))?;
++        let vi_key = (key.attributes.clone(), key.bindings.clone(), key.topology);
++        let vi = match self.vertex_inputs.get(&vi_key) {
++            Some(&p) => p,
++            None => {
++                let p = self.shared.vertex_input(key).map_err(|e| format!("vertex input library: {e:?}"))?;
++                *self.vertex_inputs.entry(vi_key).or_insert(p)
++            }
++        };
++        let fo_key = (key.colors.clone(), key.depth, key.blend.clone());
++        let fo = match self.outputs.get(&fo_key) {
++            Some(&p) => p,
++            None => {
++                let p = self.shared.fragment_output(key).map_err(|e| format!("fragment output library: {e:?}"))?;
++                *self.outputs.entry(fo_key).or_insert(p)
++            }
++        };
++        self.links += 1;
++        LINKED.fetch_add(1, Ordering::Relaxed);
++        self.shared.link(&[vi, pre, frag, fo], key.layout).map_err(|e| format!("pipeline link: {e:?}"))
++    }
++
++    /// Translate and compile every program in `file` on spare cores.
++    pub(super) fn start_preload(&mut self, file: &std::path::Path) {
++        let Ok(data) = std::fs::read(file) else { return };
++        let Some(programs) = parse_programs(&data) else {
++            eprintln!("kirikae: {} is not a shader file", file.display());
++            return;
++        };
++        let total = programs.1.len();
++        PRELOAD_TOTAL.store(total, Ordering::Relaxed);
++        PRELOAD_DONE.store(0, Ordering::Relaxed);
++        eprintln!("kirikae: compiling {total} shader programs from {} in the background", file.display());
++        let programs = Arc::new(programs);
++        let next = Arc::new(AtomicUsize::new(0));
++        let failed = Arc::new(AtomicUsize::new(0));
++        let start = std::time::Instant::now();
++        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 32);
++        for i in 0..threads {
++            let (programs, next, failed, stop, shared) = (programs.clone(), next.clone(), failed.clone(), self.stop.clone(), self.shared.clone());
++            let w = std::thread::Builder::new().name(format!("kirikae-shaders-{i}")).stack_size(64 << 20).spawn(move || {
++                while !stop.load(Ordering::Relaxed) {
++                    let k = next.fetch_add(1, Ordering::Relaxed);
++                    let Some(&(start_at, len)) = programs.1.get(k) else { return };
++                    let code = &programs.0[start_at..start_at + len];
++                    if compile_program(&shared, code).is_err() {
++                        failed.fetch_add(1, Ordering::Relaxed);
++                    }
++                    let done = PRELOAD_DONE.fetch_add(1, Ordering::Relaxed) + 1;
++                    if done == programs.1.len() {
++                        eprintln!(
++                            "kirikae: compiled {done} shader programs in {:.1} s ({} unique parts, {} not compiled), process memory {} MB",
++                            start.elapsed().as_secs_f64(),
++                            shared.preloaded.load(Ordering::Relaxed),
++                            failed.load(Ordering::Relaxed),
++                            process_memory_mb()
++                        );
++                    }
++                }
++            });
++            if let Ok(w) = w {
++                self.workers.push(w);
++            }
++        }
++    }
++
++    pub(super) fn stop(&mut self) {
++        self.stop.store(true, Ordering::Relaxed);
++        for w in self.workers.drain(..) {
++            let _ = w.join();
++        }
++    }
++
++    pub(super) unsafe fn destroy(&mut self, device: &ash::Device) {
++        self.stop();
++        unsafe {
++            for p in self.vertex_inputs.drain().map(|(_, p)| p).chain(self.outputs.drain().map(|(_, p)| p)) {
++                device.destroy_pipeline(p, None);
++            }
++            self.shared.destroy();
++        }
++    }
++}
++
++/// Memory the process uses, in MB (working set on Windows, resident set elsewhere).
++pub fn process_memory_mb() -> u64 {
++    #[cfg(windows)]
++    {
++        #[repr(C)]
++        #[derive(Default)]
++        struct Counters {
++            cb: u32,
++            page_faults: u32,
++            peak_working_set: usize,
++            working_set: usize,
++            quota_peak_paged: usize,
++            quota_paged: usize,
++            quota_peak_nonpaged: usize,
++            quota_nonpaged: usize,
++            pagefile: usize,
++            peak_pagefile: usize,
++        }
++        unsafe extern "system" {
++            fn GetCurrentProcess() -> isize;
++            fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, size: u32) -> i32;
++        }
++        let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
++        // SAFETY: c is a PROCESS_MEMORY_COUNTERS of the size passed.
++        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
++            return c.working_set as u64 >> 20;
++        }
++        0
++    }
++    #[cfg(not(windows))]
++    {
++        std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0) / 1024
++    }
++}
++
++/// `b"KSH1"`, u32 count, then u32 length + bytes per program.
++fn parse_programs(data: &[u8]) -> Option<(Vec<u8>, Vec<(usize, usize)>)> {
++    if data.get(..4)? != b"KSH1" {
++        return None;
++    }
++    let n = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
++    let mut p = 8;
++    let mut out = Vec::with_capacity(n);
++    for _ in 0..n {
++        let len = u32::from_le_bytes(data.get(p..p + 4)?.try_into().ok()?) as usize;
++        p += 4;
++        data.get(p..p + len)?;
++        out.push((p, len));
++        p += len;
++    }
++    Some((data.to_vec(), out))
++}
++
++fn compile_program(shared: &Shared, code: &[u8]) -> Result<(), ()> {
++    let header = kirikae_maxwell::sph::Header::parse(code).ok_or(())?;
++    let stage = match header.shader_type() {
++        1 => Stage::Vertex,
++        5 => Stage::Fragment,
++        _ => return Err(()),
++    };
++    let shader = std::panic::catch_unwind(|| kirikae_maxwell::translate(code, &options(stage), &NoEnv)).map_err(|_| ())?.map_err(|_| ())?;
++    if !shader.unsupported.is_empty() {
++        return Err(());
++    }
++    let id = shared.id(&shader.spirv);
++    let base = if stage == Stage::Fragment { FRAGMENT_BASE } else { VERTEX_BASE };
++    let set = set_key(bindings_of(&shader, base), stage);
++    match stage {
++        Stage::Vertex => {
++            shared.pre(id, &shader.spirv, &set, false, false).map_err(|_| ())?;
++            if !shared.clamp_dynamic {
++                shared.pre(id, &shader.spirv, &set, true, false).map_err(|_| ())?;
++            }
++        }
++        _ => {
++            shared.frag(id, Some(&shader.spirv), &set, [7, 0], false).map_err(|_| ())?;
++        }
++    }
++    Ok(())
++}
++
++impl Renderer {
++    pub(super) fn shaders_file() -> Option<std::path::PathBuf> {
++        if let Some(p) = crate::env_var!("KIRIKAE_SHADERS") {
++            return Some(p.into());
++        }
++        let exe = std::env::current_exe().ok()?;
++        let stem = exe.file_stem()?.to_string_lossy().into_owned();
++        Some(exe.with_file_name(format!("{stem}.shaders")))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Compiles programs from KIRIKAE_GPL_TEST_FILE (first KIRIKAE_GPL_TEST_LIMIT, default 400) as
++    /// libraries and links every vertex part with a few fragment parts. Run with
++    /// KIRIKAE_VK_VALIDATION=1 to have the validation layer check it all.
++    #[test]
++    #[ignore]
++    fn compile_and_link_game_shaders() {
++        let Ok(path) = std::env::var("KIRIKAE_GPL_TEST_FILE") else { return };
++        let limit: usize = std::env::var("KIRIKAE_GPL_TEST_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
++        let Ok(r) = Renderer::new() else { return };
++        let Some(g) = &r.gpl else {
++            eprintln!("no pipeline library support on this device");
++            return;
++        };
++        let data = std::fs::read(path).unwrap();
++        let (bytes, progs) = parse_programs(&data).unwrap();
++        let start = std::time::Instant::now();
++        let mut fails = 0;
++        let mut vs = Vec::new();
++        let mut fs = Vec::new();
++        for &(at, len) in progs.iter().take(limit) {
++            let code = &bytes[at..at + len];
++            if compile_program(&g.shared, code).is_err() {
++                fails += 1;
++            }
++            let h = kirikae_maxwell::sph::Header::parse(code).unwrap();
++            let stage = if h.shader_type() == 1 { Stage::Vertex } else { Stage::Fragment };
++            if let Ok(s) = kirikae_maxwell::translate(code, &options(stage), &NoEnv) {
++                let base = if stage == Stage::Fragment { FRAGMENT_BASE } else { VERTEX_BASE };
++                let m = g.shared.id(&s.spirv);
++                let entry = (m, set_key(bindings_of(&s, base), stage), s.inputs, s.spirv.clone());
++                if stage == Stage::Vertex { vs.push(entry) } else { fs.push(entry) }
++            }
++        }
++        eprintln!("{} programs compiled in {:.1} s, {fails} failed; {} vertex, {} fragment", limit.min(progs.len()), start.elapsed().as_secs_f64(), vs.len(), fs.len());
++        let mut g = r.gpl.as_ref().map(|g| Gpl {
++            shared: g.shared.clone(),
++            eds3: None,
++            vertex_inputs: HashMap::new(),
++            outputs: HashMap::new(),
++            layouts: HashMap::new(),
++            links: 0,
++            stop: Arc::new(AtomicBool::new(false)),
++            workers: Vec::new(),
++        }).unwrap();
++        let start = std::time::Instant::now();
++        let mut linked = 0;
++        let depth_only = (vk::ShaderModule::null(), set_key(vec![], Stage::Fragment), 0, Vec::new());
++        for (vm, vset, inputs, vcode) in vs.iter() {
++            for (fm, fset, _, fcode) in fs.iter().take(3).chain(std::iter::once(&depth_only)) {
++                let (layout, _) = g.link_layout(vset.clone(), fset.clone());
++                let attributes: Vec<(u32, u32, vk::Format, u32)> = (0..32).filter(|i| inputs >> i & 1 == 1).map(|i| (i, 0, vk::Format::R32G32B32A32_SFLOAT, 0)).collect();
++                let key = PipelineKey {
++                    vertex: *vm,
++                    fragment: *fm,
++                    layout,
++                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
++                    bindings: if attributes.is_empty() { vec![] } else { vec![(0, 16)] },
++                    attributes,
++                    colors: vec![vk::Format::R8G8B8A8_UNORM],
++                    depth: vk::Format::D24_UNORM_S8_UINT,
++                    blend: vec![[1, 1, 6, 7, 1, 2, 7, 0x1111]],
++                    depth_clamp: false,
++                    alpha_test: [7, 0],
++                };
++                match g.pipeline(&key, vcode, (!fcode.is_empty()).then_some(fcode.as_slice())) {
++                    Ok(p) => {
++                        linked += 1;
++                        unsafe { r.device.destroy_pipeline(p, None) };
++                    }
++                    Err(e) => panic!("link failed: {e}"),
++                }
++            }
++        }
++        eprintln!("{linked} pipelines linked in {:.2} s ({:.2} ms each)", start.elapsed().as_secs_f64(), start.elapsed().as_secs_f64() * 1e3 / linked.max(1) as f64);
++        unsafe {
++            for p in g.vertex_inputs.drain().map(|(_, p)| p).chain(g.outputs.drain().map(|(_, p)| p)) {
++                r.device.destroy_pipeline(p, None);
++            }
++        }
++        assert!(fails * 1000 <= limit.min(progs.len()), "{fails} programs did not compile");
++    }
++}
++
++#[cfg(test)]
++mod startup_tests {
++    use super::*;
++
++    fn rss_mb() -> u64 {
++        std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).unwrap_or(0) / 1024
++    }
++
++    /// The real startup path: Renderer::new starts compiling KIRIKAE_SHADERS; wait for it and
++    /// report time and memory.
++    #[test]
++    #[ignore]
++    fn startup_preload() {
++        if std::env::var("KIRIKAE_SHADERS").is_err() {
++            return;
++        }
++        let before = rss_mb();
++        let start = std::time::Instant::now();
++        let Ok(r) = Renderer::new() else { return };
++        let mut last = 0;
++        loop {
++            let (done, total) = (PRELOAD_DONE.load(Ordering::Relaxed), PRELOAD_TOTAL.load(Ordering::Relaxed));
++            if done >= total || r.gpl.is_none() {
++                break;
++            }
++            if done / 2000 != last / 2000 {
++                eprintln!("{done}/{total} after {:.0} s, {} MB", start.elapsed().as_secs_f64(), rss_mb());
++            }
++            last = done;
++            std::thread::sleep(std::time::Duration::from_millis(200));
++        }
++        let s = &r.gpl.as_ref().unwrap().shared;
++        eprintln!(
++            "preload: {:.1} s, {} parts, memory {} MB -> {} MB",
++            start.elapsed().as_secs_f64(),
++            s.preloaded.load(Ordering::Relaxed),
++            before,
++            rss_mb()
++        );
++    }
++}
+diff --git a/crates/rt/src/gpu/vulkan/mod.rs b/crates/rt/src/gpu/vulkan/mod.rs
+index 9ecef0f..b45c970 100644
+--- a/crates/rt/src/gpu/vulkan/mod.rs
++++ b/crates/rt/src/gpu/vulkan/mod.rs
+@@ -24,6 +24,7 @@ mod tiling;
+ mod volumes;
+ mod lines;
+ mod overlay;
++pub mod gpl;
+ 
+ pub use images::{Surface, color_surface};
+ pub use present::Presented;
+@@ -123,6 +124,7 @@ pub struct Renderer {
+     compiler: Option<PipelineCompiler>,
+     preload: preload::PreloadState,
+     overlay: Option<overlay::OverlayGpu>,
++    gpl: Option<gpl::Gpl>,
+     overlay_failed: bool,
+     cache_file: Option<std::path::PathBuf>,
+     cache_saved: (u64, std::time::Instant),
+@@ -179,6 +181,9 @@ unsafe impl Send for Renderer {}
+ impl Drop for Renderer {
+     fn drop(&mut self) {
+         self.stop_preload();
++        if let Some(g) = self.gpl.as_mut() {
++            g.stop();
++        }
+         if let Some(mut c) = self.compiler.take() {
+             for (key, r) in c.stop() {
+                 if let Ok(p) = r {
+@@ -191,8 +196,22 @@ impl Drop for Renderer {
+             let _ = self.device.device_wait_idle();
+         }
+         self.destroy_overlay();
+-        let modules: std::collections::HashSet<vk::ShaderModule> =
+-            self.shaders.values().map(|s| s.module).chain(self.preload.spirv_by_module.keys().copied()).chain(self.preload.module_by_spirv.values().copied()).collect();
++        // library mode: graphics shaders carry ids, not modules (only compute has real ones)
++        let library = self.gpl.is_some();
++        let modules: std::collections::HashSet<vk::ShaderModule> = self
++            .shaders
++            .iter()
++            .filter(|(k, _)| !library || k.stage == kirikae_maxwell::Stage::Compute as u8)
++            .map(|(_, s)| s.module)
++            .chain(self.preload.spirv_by_module.keys().copied())
++            .chain(self.preload.module_by_spirv.values().copied())
++            .collect();
++        if let Some(mut g) = self.gpl.take() {
++            for p in self.pipelines.drain().map(|(_, p)| p) {
++                unsafe { self.device.destroy_pipeline(p, None) };
++            }
++            unsafe { g.destroy(&self.device) };
++        }
+         unsafe {
+             let d = &self.device;
+             let _ = d.device_wait_idle();
+@@ -348,6 +367,33 @@ impl Renderer {
+         if push_supported {
+             extensions.push(ash::khr::push_descriptor::NAME.as_ptr());
+         }
++        // Graphics pipeline libraries: shaders compile on their own, ahead of time.
++        let mut gpl_features = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
++        let mut eds3_features = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
++        let mut gpl_props = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
++        {
++            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut gpl_features).push_next(&mut eds3_features);
++            unsafe { instance.get_physical_device_features2(physical, &mut f2) };
++            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut gpl_props);
++            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
++        }
++        let use_gpl = crate::env_var!("KIRIKAE_NO_GPL").is_none()
++            && has(ash::khr::pipeline_library::NAME)
++            && has(ash::ext::graphics_pipeline_library::NAME)
++            && gpl_features.graphics_pipeline_library == vk::TRUE
++            && gpl_props.graphics_pipeline_library_fast_linking == vk::TRUE;
++        let use_eds3_clamp = use_gpl && has(ash::ext::extended_dynamic_state3::NAME) && eds3_features.extended_dynamic_state3_depth_clamp_enable == vk::TRUE;
++        if use_gpl {
++            extensions.push(ash::khr::pipeline_library::NAME.as_ptr());
++            extensions.push(ash::ext::graphics_pipeline_library::NAME.as_ptr());
++        }
++        if use_eds3_clamp {
++            extensions.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
++        }
++        eprintln!(
++            "kirikae: shader compilation: {}",
++            if use_gpl { if use_eds3_clamp { "pipeline libraries (ahead of time)" } else { "pipeline libraries, no dynamic depth clamp" } } else { "whole pipelines (no pipeline library support)" }
++        );
+         let swapchains = surfaces && has(ash::khr::swapchain::NAME);
+         if swapchains {
+             extensions.push(ash::khr::swapchain::NAME.as_ptr());
+@@ -366,7 +412,15 @@ impl Renderer {
+         let mut v13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+         let priorities = [1.0];
+         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
+-        let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions).enabled_features(&features).push_next(&mut v13);
++        let mut gpl_enable = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default().graphics_pipeline_library(true);
++        let mut eds3_enable = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default().extended_dynamic_state3_depth_clamp_enable(true);
++        let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&extensions).enabled_features(&features).push_next(&mut v13);
++        if use_gpl {
++            info = info.push_next(&mut gpl_enable);
++        }
++        if use_eds3_clamp {
++            info = info.push_next(&mut eds3_enable);
++        }
+         let device = unsafe { instance.create_device(physical, &info, None)? };
+         let queue = unsafe { device.get_device_queue(family, 0) };
+         let push = push_supported.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+@@ -426,6 +480,7 @@ impl Renderer {
+         let pipeline_cache = unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&initial), None) }
+             .or_else(|_| unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })?;
+         let compiler = PipelineCompiler::new(&device, pipeline_cache);
++        let gpl = use_gpl.then(|| gpl::Gpl::new(&device, pipeline_cache, use_eds3_clamp.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device))));
+ 
+         let mut renderer = Renderer {
+             entry,
+@@ -512,6 +567,7 @@ impl Renderer {
+             compiler,
+             preload: Default::default(),
+             overlay: None,
++            gpl,
+             overlay_failed: false,
+             cache_file,
+             cache_saved: (0, std::time::Instant::now()),
+@@ -521,7 +577,15 @@ impl Renderer {
+             stats: RenderStats::default(),
+             trace_state: String::new(),
+         };
+-        renderer.start_preload();
++        if let Some(g) = renderer.gpl.as_mut() {
++            if let Some(f) = Self::shaders_file().filter(|f| f.exists()) {
++                g.start_preload(&f);
++            } else {
++                eprintln!("kirikae: no shader file next to the executable; shaders compile when first drawn");
++            }
++        } else {
++            renderer.start_preload();
++        }
+         Ok(renderer)
+     }
+ 
+diff --git a/crates/rt/src/gpu/vulkan/pipeline.rs b/crates/rt/src/gpu/vulkan/pipeline.rs
+index dceb28f..edbfeec 100644
+--- a/crates/rt/src/gpu/vulkan/pipeline.rs
++++ b/crates/rt/src/gpu/vulkan/pipeline.rs
+@@ -67,6 +67,20 @@ pub(super) fn alpha_test_func(regs: &[u32]) -> u32 {
+     (if f >= 0x200 { f - 0x200 } else { f.saturating_sub(1) }) & 7
+ }
+ 
++pub(super) fn blend_attachment(b: &[u32; 8]) -> vk::PipelineColorBlendAttachmentState {
++    let mask = b[7];
++    let write = vk::ColorComponentFlags::from_raw((mask & 1 != 0) as u32 | ((mask >> 4 & 1 != 0) as u32) << 1 | ((mask >> 8 & 1 != 0) as u32) << 2 | ((mask >> 12 & 1 != 0) as u32) << 3);
++    vk::PipelineColorBlendAttachmentState::default()
++        .blend_enable(b[0] == 1)
++        .color_blend_op(formats::blend_op(b[1]))
++        .src_color_blend_factor(formats::blend_factor(b[2]))
++        .dst_color_blend_factor(formats::blend_factor(b[3]))
++        .alpha_blend_op(formats::blend_op(b[4]))
++        .src_alpha_blend_factor(formats::blend_factor(b[5]))
++        .dst_alpha_blend_factor(formats::blend_factor(b[6]))
++        .color_write_mask(write)
++}
++
+ pub(super) fn build_pipeline(device: &ash::Device, cache: vk::PipelineCache, key: &PipelineKey) -> Result<vk::Pipeline, vk::Result> {
+         let entries = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }, vk::SpecializationMapEntry { constant_id: 1, offset: 4, size: 4 }];
+         let alpha_data: Vec<u8> = key.alpha_test.iter().flat_map(|w| w.to_ne_bytes()).collect();
+@@ -86,25 +100,7 @@ pub(super) fn build_pipeline(device: &ash::Device, cache: vk::PipelineCache, key
+         let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).line_width(1.0).depth_clamp_enable(key.depth_clamp);
+         let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+         let depth = vk::PipelineDepthStencilStateCreateInfo::default().depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+-        let attachments: Vec<vk::PipelineColorBlendAttachmentState> = key
+-            .blend
+-            .iter()
+-            .map(|b| {
+-                let mask = b[7];
+-                let write = vk::ColorComponentFlags::from_raw(
+-                    (mask & 1 != 0) as u32 | ((mask >> 4 & 1 != 0) as u32) << 1 | ((mask >> 8 & 1 != 0) as u32) << 2 | ((mask >> 12 & 1 != 0) as u32) << 3,
+-                );
+-                vk::PipelineColorBlendAttachmentState::default()
+-                    .blend_enable(b[0] == 1)
+-                    .color_blend_op(formats::blend_op(b[1]))
+-                    .src_color_blend_factor(formats::blend_factor(b[2]))
+-                    .dst_color_blend_factor(formats::blend_factor(b[3]))
+-                    .alpha_blend_op(formats::blend_op(b[4]))
+-                    .src_alpha_blend_factor(formats::blend_factor(b[5]))
+-                    .dst_alpha_blend_factor(formats::blend_factor(b[6]))
+-                    .color_write_mask(write)
+-            })
+-            .collect();
++        let attachments: Vec<vk::PipelineColorBlendAttachmentState> = key.blend.iter().map(blend_attachment).collect();
+         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+         let dynamic = [
+             vk::DynamicState::VIEWPORT,
+@@ -279,7 +275,9 @@ impl Renderer {
+         };
+         let types = attribute_types.iter().chain(output_types.iter()).fold(0u64, |h, k| h.wrapping_mul(3).wrapping_add(*k as u64));
+         let types = compute.map_or(types, |q| q.block.iter().chain([&q.local]).fold(types, |h, &n| h.wrapping_mul(0x1_0001).wrapping_add(n as u64)));
+-        let depth = (stage == Stage::Vertex).then(|| depth_transform(regs)).flatten();
++        let gpl = self.gpl.is_some() && compute.is_none();
++        // library mode: the depth transform is a push constant, not part of the SPIR-V
++        let depth = (stage == Stage::Vertex && !gpl).then(|| depth_transform(regs)).flatten();
+         let types = depth.map_or(types, |(s, o)| types.wrapping_mul(0x1_0000_0001).wrapping_add((s.to_bits() as u64) << 32 | o.to_bits() as u64));
+         let alpha_test = stage == Stage::Fragment && alpha_test_func(regs) != 7;
+         let types = types.wrapping_mul(2).wrapping_add(alpha_test as u64);
+@@ -317,6 +315,8 @@ impl Renderer {
+             depth_unorm16,
+             alpha_test,
+             exact_texel_rounding: crate::env_var!("KIRIKAE_NO_TEXEL_ROUNDING").is_some(),
++            descriptor_set: (gpl && stage == Stage::Fragment) as u32,
++            depth_push: gpl && stage == Stage::Vertex,
+             ..Options::new(stage, base)
+         };
+         struct Env<'a> {
+@@ -357,7 +357,11 @@ impl Renderer {
+             let bytes: Vec<u8> = shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{va:010x}_{stage:?}.spv")), bytes);
+         }
+-        let module = self.module_for(&shader.spirv).map_err(|e| format!("shader module: {e:?}"))?;
++        let module = match &self.gpl {
++            Some(g) if gpl => Ok(g.shared.id(&shader.spirv)),
++            _ => self.module_for(&shader.spirv),
++        }
++        .map_err(|e| format!("shader module: {e:?}"))?;
+         let vertex_index = reads_vertex_index(&shader.spirv);
+         let writes = shader.storage_written != 0 || !shader.images.is_empty();
+         *self.shader_writes.entry(va).or_default() |= writes;
+@@ -384,6 +388,17 @@ impl Renderer {
+         (set, layout)
+     }
+ 
++    /// Library mode: link (compiling any shader part the preload did not cover).
++    pub(super) fn library_pipeline(&mut self, key: &PipelineKey, vs: &[u32], fs: Option<&[u32]>) -> Result<vk::Pipeline, String> {
++        if let Some(&p) = self.pipelines.get(key) {
++            return Ok(p);
++        }
++        let p = self.gpl.as_mut().unwrap().pipeline(key, vs, fs)?;
++        self.pipelines.insert(key.clone(), p);
++        self.stats.pipelines += 1;
++        Ok(p)
++    }
++
+     pub(super) fn pipeline(&mut self, key: &PipelineKey, now: bool) -> Result<vk::Pipeline, String> {
+         if let Some(&p) = self.pipelines.get(key) {
+             return Ok(p);
+diff --git a/crates/rt/src/overlay.rs b/crates/rt/src/overlay.rs
+index 7ebf60a..aaed88a 100644
+--- a/crates/rt/src/overlay.rs
++++ b/crates/rt/src/overlay.rs
+@@ -131,6 +131,12 @@ pub fn pausing() -> bool {
+     is_open()
+ }
+ 
++/// First launch: the game waits on its first frame until every shader is compiled.
++pub fn holding_for_shaders() -> bool {
++    let (done, total) = (PRELOAD_DONE.load(Ordering::Relaxed), PRELOAD_TOTAL.load(Ordering::Relaxed));
++    total > 0 && done < total && crate::env_var!("KIRIKAE_NO_SHADER_WAIT").is_none()
++}
++
+ /// 1 when the keyboard page waits for a key, 2 when the controller page waits for an input.
+ pub fn capturing() -> u8 {
+     let ui = UI.lock().unwrap();
+@@ -410,12 +416,19 @@ pub fn build(ww: u32, wh: u32) -> Vec<Vertex> {
+         b.rect(ww - tw - 16.0 * s, 8.0 * s, tw + 12.0 * s, FONT_CH * s * 0.8 + 6.0 * s, SHADE);
+         b.text(ww - tw - 10.0 * s, 11.0 * s, s * 0.8, t, WHITE);
+     }
+-    if preloading {
+-        let t = format!("Preloading shaders  {done} / {total}");
+-        let tw = t.len() as f32 * FONT_CW * s * 0.8;
+-        let y = wh - FONT_CH * s * 0.8 - 14.0 * s;
+-        b.rect(8.0 * s, y - 3.0 * s, tw + 12.0 * s, FONT_CH * s * 0.8 + 6.0 * s, SHADE);
+-        b.text(14.0 * s, y, s * 0.8, &t, GOLD);
++    if preloading && !open {
++        let lh = FONT_CH * s * 1.35;
++        let (pw, ph) = (46.0 * FONT_CW * s, 6.0 * lh);
++        let (px, py) = ((ww - pw) / 2.0, (wh - ph) / 2.0);
++        b.rect(0.0, 0.0, ww, wh, SHADE);
++        b.rect(px, py, pw, ph, PANEL);
++        b.text(px + 20.0 * s, py + 14.0 * s, s, "PREPARING SHADERS", GOLD);
++        let pct = done as f32 / total as f32;
++        let (bx, by, bw, bh) = (px + 20.0 * s, py + 14.0 * s + lh * 1.6, pw - 40.0 * s, lh * 0.7);
++        b.rect(bx, by, bw, bh, [0.12, 0.14, 0.25, 1.0]);
++        b.rect(bx, by, bw * pct, bh, HIGHLIGHT);
++        b.text(px + 20.0 * s, by + lh * 1.1, s, &format!("{done} / {total}  ({:.0}%)", pct * 100.0), WHITE);
++        b.text(px + 20.0 * s, by + lh * 2.2, s * 0.75, "First launch, and after a graphics driver update.", GREY);
+     }
+     if open && keys_page != 0 {
+         let n = keys_rows();
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index d3fadc8..a3d4083 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -269,6 +269,18 @@ fn start_stats(p: &'static Process) {
+                 p.stats.native_calls.load(Ordering::Relaxed),
+                 p.stats.interpreted.load(Ordering::Relaxed),
+             );
++            {
++                use crate::gpu::vulkan::gpl::{LINKED, PARTS_ON_DEMAND, PARTS_PRELOADED};
++                eprintln!(
++                    "kirikae:         smoothness: {} frames over 33 ms, {} over 100 ms; shaders: {} compiled ahead, {} compiled while playing, {} pipelines linked; memory {} MB",
++                    crate::display::HITCHES.load(Ordering::Relaxed),
++                    crate::display::BIG_HITCHES.load(Ordering::Relaxed),
++                    PARTS_PRELOADED.load(Ordering::Relaxed),
++                    PARTS_ON_DEMAND.load(Ordering::Relaxed),
++                    LINKED.load(Ordering::Relaxed),
++                    crate::gpu::vulkan::gpl::process_memory_mb(),
++                );
++            }
+             if let Some(r) = p.gpu.render_stats() {
+                 eprintln!(
+                     "kirikae:         vulkan: {} draws, {} skipped, {} writing nothing, {} with the descriptors of the one before, {} dispatches, {} skipped, {} uploads ({} refreshed), {} pipelines; {:.1}s drawing, {:.1}s waiting for the GPU, {:.1}s reading back, {:.1}s translating shaders",
+diff --git a/crates/rt/src/services/vi.rs b/crates/rt/src/services/vi.rs
+index 1dba84d..c5be229 100644
+--- a/crates/rt/src/services/vi.rs
++++ b/crates/rt/src/services/vi.rs
+@@ -241,7 +241,7 @@ fn transact(c: &Cpu, id: i32, code: u32, input: &[u8]) -> Vec<u8> {
+                     let _prof = crate::prof::enter(crate::prof::Cat::Sleep);
+                     pace(crate::games::pace_interval(p, interval));
+                     // settings menu open: hold the game here and keep showing its last frame
+-                    while crate::overlay::pausing() && !p.sched.exiting.load(Ordering::Relaxed) {
++                    while (crate::overlay::pausing() || crate::overlay::holding_for_shaders()) && !p.sched.exiting.load(Ordering::Relaxed) {
+                         present(p, &s, transform);
+                         let _ = crate::input::state(); // the controller drives the menu
+                         std::thread::sleep(std::time::Duration::from_millis(16));

@@ -43,6 +43,9 @@ Output stays local (gitignored).
 
 ## Tools
 
+`tools/extract_shaders.py` - pulls every compiled Switch shader program out of the game's Unity
+data (`pip install UnityPy lz4`); the build runs it.
+
 `tools/nsp_extract.py` - decrypts an NSP with your `prod.keys` and pulls ExeFS and RomFS.
 Handles standard crypto, common tickets, and update patch RomFS (BKTR indirect + AES-CTR-EX, layered over the base RomFS). Only needs the `cryptography` package.
 
@@ -78,7 +81,7 @@ backtraces and stats on, logging to `run.log`.
 - Playable on Windows (i9-13900K / RTX 4070 Ti) at 60 fps: boot, menus, car select with the
   3D car and the rendered car icons in the selector, races with the full 3D scene,
   post-processing and HUD; FMOD audio works
-- Kirikae patches 0001-0013 (see `patches/kirikae/README.md`): function discovery, bindless
+- Kirikae patches 0001-0014 (see `patches/kirikae/README.md`): function discovery, bindless
   textures (NVN texture|sampler handles), TLD/TXQ, compressed-texture aliasing, layout-aware
   inline uploads, MSAA resolve blits, render-target write-back for copy-engine reads, plus
   diagnostics
@@ -86,12 +89,15 @@ backtraces and stats on, logging to `run.log`.
   aspect ratio, VSync, fullscreen, scaling, anisotropic filtering, frame rate, vibration,
   A/B swap, frame-rate display, keyboard and controller rebinding. Saved to
   `build\cruisn-blast.ini`
-- Shader preloading: pipelines are recorded to `build\cruisn-blast.pipelines` and built at
-  startup on spare cores, so tracks and cars seen before never stutter on first appearance.
-  Ship that file with a build and testers get it from their first run
+- Every shader in the game compiles at startup: `tools/extract_shaders.py` (run by the build)
+  pulls all 32,501 Switch shader programs out of the game's Unity data into
+  `build\cruisn-blast.shaders`, and the runtime compiles them as Vulkan pipeline libraries
+  behind a "Preparing shaders" screen on the first launch, so nothing compiles mid-race
+  (patch 0014). The `.pipelines` recording (0013) remains the fallback for drivers without
+  pipeline library support
 - Open issues:
-  - Content never seen by any run still compiles on first sight (until it is in the
-    `.pipelines` file)
+  - First-launch shader compile time and memory on real hardware still to be measured
+    (the stats line reports both)
   - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
     unpatched Kirikae
 

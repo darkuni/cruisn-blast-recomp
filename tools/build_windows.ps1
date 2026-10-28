@@ -116,5 +116,21 @@ if ($Relink) {
     $code = Run-Logged $k $kargs (Join-Path $Root 'build.log')
     if ($code) { Fail 'recompile failed - build.log has the details' }
 }
+Step 'Shader programs for startup compilation'
+$shaders = Join-Path $Out 'cruisn-blast.shaders'
+if (Test-Path $shaders) {
+    Write-Host "already there: $shaders"
+} else {
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
+    if ($py) {
+        & $py.Source -m pip install --quiet UnityPy lz4
+        & $py.Source (Join-Path $Tools 'extract_shaders.py') (Join-Path $Dump 'romfs\Data') $shaders
+    }
+    if (-not (Test-Path $shaders)) {
+        Write-Host ('No shader file: the game will compile shaders while it runs (stutter on first sight).' +
+            "`nInstall Python (winget install --id Python.Python.3.12 -e) and rerun, or run tools\extract_shaders.py yourself.") -ForegroundColor Yellow
+    }
+}
 Write-Host ("`nDone in {0:N1} min: {1}" -f $sw.Elapsed.TotalMinutes, (Join-Path $Out 'cruisn-blast.exe')) -ForegroundColor Green
 Write-Host 'Run it with:  powershell -ExecutionPolicy Bypass -File tools\run.ps1'
