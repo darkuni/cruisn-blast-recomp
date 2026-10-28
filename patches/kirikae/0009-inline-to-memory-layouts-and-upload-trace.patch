@@ -1,0 +1,87 @@
+diff --git a/crates/rt/src/gpu/mod.rs b/crates/rt/src/gpu/mod.rs
+index fbd7d55..46478a8 100644
+--- a/crates/rt/src/gpu/mod.rs
++++ b/crates/rt/src/gpu/mod.rs
+@@ -46,7 +46,7 @@ thread_local! {
+ struct Engines {
+     classes: [u32; 8],
+     regs: fxhash::FastMap<u32, Vec<u32>>,
+-    inline: Option<(u64, u64, Vec<u8>)>,
++    inline: Option<(Side, u64, u64, Vec<u8>)>,
+     cb_upload: (u64, Vec<u8>),
+     threed: threed::State,
+ }
+@@ -598,19 +598,31 @@ impl Gpu {
+         if matches!(class, CLASS_3D | CLASS_COMPUTE | CLASS_INLINE) {
+             match m {
+                 0x6d => {
+-                    if let Some((_, len, data)) = eng.inline.as_mut() {
++                    if let Some((_, line, lines, data)) = eng.inline.as_mut() {
+                         data.extend_from_slice(&v.to_le_bytes());
+-                        if data.len() as u64 >= *len {
+-                            let (dst, len, data) = eng.inline.take().unwrap();
+-                            self.write(mem, dst, &data[..len as usize]);
++                        if data.len() as u64 >= *line * *lines {
++                            let (to, line, lines, data) = eng.inline.take().unwrap();
++                            to.write(self, mem, &data[..(line * lines) as usize], line, lines);
+                         }
+                     }
+                     return;
+                 }
+                 0x6c => {
++                    // Inline-to-memory. LAUNCH_DMA bit 0 picks the destination layout: 1 pitch
++                    // (lines PITCH_OUT apart), 0 block-linear (DST_BLOCK_SIZE, DST_WIDTH in bytes,
++                    // origin in bytes/rows), as for the copy engine.
+                     let dst = (regs[0x62] as u64 & 0xff) << 32 | regs[0x63] as u64;
+-                    let len = regs[0x60] as u64 * regs[0x61].max(1) as u64;
+-                    eng.inline = Some((dst, len, Vec::new()));
++                    let (line, lines) = (regs[0x60] as u64, regs[0x61].max(1) as u64);
++                    let to = if v & 1 == 1 {
++                        let pitch = if regs[0x64] == 0 { line } else { regs[0x64] as u64 };
++                        Side::Pitch { base: dst, pitch }
++                    } else {
++                        Side::BlockLinear { base: dst, block_height_log2: regs[0x65] >> 4 & 0xf, width: regs[0x66] as u64, x: regs[0x6a] as u64, y: regs[0x6b] as u64 }
++                    };
++                    if trace_uploads() {
++                        eprintln!("gpu: upload inline {dst:#x} {line}x{lines} bytes {} width {} height {} origin {},{} block height {}", if v & 1 == 1 { "pitch" } else { "block-linear" }, regs[0x66], regs[0x67], regs[0x6a], regs[0x6b], 1u32 << (regs[0x65] >> 4 & 0xf));
++                    }
++                    eng.inline = Some((to, line, lines, Vec::new()));
+                     return;
+                 }
+                 _ => {}
+@@ -642,6 +654,9 @@ impl Gpu {
+         };
+         let src_pitch_layout = launch >> 7 & 1 == 1;
+         let dst_pitch_layout = launch >> 8 & 1 == 1;
++        if trace_uploads() {
++            eprintln!("gpu: upload dma {src:#x} -> {dst:#x} {len}x{lines} src {} dst {} remap {}", if src_pitch_layout { "pitch" } else { "block-linear" }, if dst_pitch_layout { "pitch" } else { "block-linear" }, remap.is_some());
++        }
+         if !(src_pitch_layout && dst_pitch_layout) {
+             if trace() {
+                 eprintln!("gpu: dma block-linear launch {launch:#x} src {src:#x} dst {dst:#x} pitch {pitch_in:#x}/{pitch_out:#x} len {len:#x} lines {lines} regs {:x?}", &regs[0x1c0..0x1d0]);
+@@ -817,6 +832,12 @@ impl Side {
+     }
+ }
+ 
++/// KIRIKAE_TRACE_UPLOADS: log every inline, copy-engine and 2D transfer with its destination.
++pub(crate) fn trace_uploads() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("KIRIKAE_TRACE_UPLOADS").is_some())
++}
++
+ pub(crate) fn trace() -> bool {
+     static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+     let range = *RANGE.get_or_init(|| {
+diff --git a/crates/rt/src/gpu/twod.rs b/crates/rt/src/gpu/twod.rs
+index 5db5378..01d9b02 100644
+--- a/crates/rt/src/gpu/twod.rs
++++ b/crates/rt/src/gpu/twod.rs
+@@ -36,7 +36,7 @@ impl Gpu {
+         let src_rect = [sx as f32, sy as f32, (sx + dw as f64 * du_dx) as f32, (sy + dh as f64 * dv_dy) as f32];
+         let dst_rect = [dx, dy, dx + dw, dy + dh];
+         let linear = regs[0x223] >> 4 & 1 == 1;
+-        if trace() {
++        if trace() || super::trace_uploads() {
+             eprintln!("gpu: 2D blit {src:x?} {src_rect:?} -> {dst:x?} {dst_rect:?} (filter {})", if linear { "linear" } else { "point" });
+         }
+         let done = self.with_renderer(|r| r.blit(self, mem, &src, &dst, src_rect, dst_rect, linear)).unwrap_or(false);

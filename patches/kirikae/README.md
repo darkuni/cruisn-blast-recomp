@@ -102,3 +102,15 @@ that image is GPU-written. Runtime unit tests: 198 pass.
 `KIRIKAE_TEX_DUMP=dir:` plus `KIRIKAE_TEX_DUMP_SIZE=WxH` dumps every texture of that size
 on each upload: decoded bytes (.bin), raw guest memory (.raw) and the texture header (.txt),
 so a bad texture can be decoded offline under other layouts.
+
+## 0009 - inline-to-memory honors the destination layout; upload trace
+
+Inline-to-memory (3D/compute/inline class, LAUNCH_DMA 0x6c + LOAD_INLINE_DATA 0x6d) wrote
+its data as one linear run at the destination, ignoring LAUNCH_DMA bit 0 (1 pitch, 0
+block-linear), PITCH_OUT, DST_BLOCK_SIZE, DST_WIDTH and the origin. It now writes pitch
+lines PITCH_OUT apart and block-linear destinations through the same block-linear writer as
+the copy engine.
+
+`KIRIKAE_TRACE_UPLOADS=1` logs every inline, copy-engine and 2D transfer with its
+destination and layout, without the cost of the full GPU trace.
+Runtime unit tests: 198 pass (no dedicated test for the block-linear inline path yet).
