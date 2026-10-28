@@ -114,7 +114,7 @@ class Section:
         self.enc_type = fsh[4]
         self.ctr_upper = fsh[0x140:0x148][::-1]
 
-    def read(self, off, n):
+    def read(self, off, n, generation=None):
         a = off & ~0xF
         pad = off - a
         ln = (n + pad + 0xF) & ~0xF
@@ -122,9 +122,15 @@ class Section:
         data = self.nca.f.read(ln)
         if self.enc_type == 1:  # none
             return data[pad:pad + n]
-        ctr = self.ctr_upper + ((self.base + a) >> 4).to_bytes(8, 'big')
+        upper = self.ctr_upper
+        if generation is not None:  # AesCtrEx: generation replaces the low 4 bytes
+            upper = upper[:4] + generation.to_bytes(4, 'big')
+        ctr = upper + ((self.base + a) >> 4).to_bytes(8, 'big')
         d = Cipher(algorithms.AES(self.nca.ctr_key), modes.CTR(ctr)).decryptor()
         return (d.update(data) + d.finalize())[pad:pad + n]
+
+    def read_plain_ctr(self, off, n):
+        return self.read(off, n)
 
     def copy_out(self, off, size, dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -146,6 +152,74 @@ class Section:
             off, size = struct.unpack('<QQ', iv[0x10 + 5 * 0x18:0x10 + 5 * 0x18 + 16])
             return off, size
         raise ValueError(f'unknown hash type {self.hash_type}')
+
+
+def bucket_entries(read, off, entry_size, parse):
+    """Read a BucketTree (0x4000-byte nodes) at `off` -> (flat entry list, end offset)."""
+    _, set_count, end = struct.unpack('<IIQ', read(off, 0x10))
+    out = []
+    for i in range(set_count):
+        node = read(off + 0x4000 * (i + 1), 0x4000)
+        _, cnt, _ = struct.unpack('<IIQ', node[:0x10])
+        for j in range(cnt):
+            out.append(parse(node[0x10 + j * entry_size:0x10 + (j + 1) * entry_size]))
+    return out, end
+
+
+class PatchedSection:
+    """Virtual view of an update's RomFS section: BKTR indirect table over base + patch data."""
+
+    def __init__(self, patch_sec, base_sec):
+        import bisect
+        self._bisect = bisect
+        self.patch, self.base, self.fsh = patch_sec, base_sec, patch_sec.fsh
+        self.hash_type = patch_sec.hash_type
+        plain = patch_sec.read_plain_ctr
+        ind_off, ind_size = struct.unpack('<QQ', self.fsh[0x100:0x110])
+        ctr_off, ctr_size = struct.unpack('<QQ', self.fsh[0x120:0x130])
+        if self.fsh[0x110:0x114] != b'BKTR' or self.fsh[0x130:0x134] != b'BKTR':
+            raise ValueError('patch section has no BKTR tables')
+        # (virtual offset, physical offset, storage index 0=base 1=patch)
+        self.ind, self.ind_end = bucket_entries(plain, ind_off, 0x14,
+                                                lambda b: struct.unpack('<QQi', b))
+        self.ind_keys = [e[0] for e in self.ind]
+        # (patch offset, generation)
+        self.ctr, self.ctr_end = bucket_entries(
+            plain, ctr_off, 0x10,
+            lambda b: (struct.unpack('<Q', b[:8])[0], struct.unpack('<I', b[12:16])[0]))
+        self.ctr_keys = [e[0] for e in self.ctr]
+
+    def _patch_read(self, off, n):
+        out = bytearray()
+        while n > 0:
+            i = self._bisect.bisect_right(self.ctr_keys, off) - 1
+            start, gen = self.ctr[i]
+            end = self.ctr[i + 1][0] if i + 1 < len(self.ctr) else self.ctr_end
+            take = min(n, end - off)
+            if take <= 0:
+                raise ValueError(f'patch read past AesCtrEx table at {off:#x}')
+            out += self.patch.read(off, take, generation=gen)
+            off += take
+            n -= take
+        return bytes(out)
+
+    def read(self, off, n):
+        out = bytearray()
+        while n > 0:
+            i = self._bisect.bisect_right(self.ind_keys, off) - 1
+            virt, phys, storage = self.ind[i]
+            end = self.ind[i + 1][0] if i + 1 < len(self.ind) else self.ind_end
+            take = min(n, end - off)
+            if take <= 0:
+                raise ValueError(f'virtual read past indirect table at {off:#x}')
+            p = phys + (off - virt)
+            out += self.base.read(p, take) if storage == 0 else self._patch_read(p, take)
+            off += take
+            n -= take
+        return bytes(out)
+
+    copy_out = Section.copy_out
+    data_region = Section.data_region
 
 
 def romfs_files(sec, ro):
@@ -172,10 +246,28 @@ def romfs_files(sec, ro):
     return files
 
 
+def find_program(path, keys):
+    f = open(path, 'rb')
+
+    def raw(off, n):
+        f.seek(off)
+        return f.read(n)
+
+    ents = read_pfs0(raw)
+    tks = ticket_titlekeys(f, ents, keys)
+    for name, (off, _) in ents.items():
+        if name.endswith('.nca'):
+            nca = Nca(f, off, keys, tks)
+            if nca.content_type == 0:
+                return nca
+    raise ValueError(f'no Program NCA in {path}')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('nsp')
     ap.add_argument('--keys', required=True, help='your prod.keys')
+    ap.add_argument('--base', help='base game NSP (needed for an update\'s RomFS)')
     ap.add_argument('--out', default='extracted')
     ap.add_argument('--info', action='store_true', help='print layout only')
     ap.add_argument('--no-exefs', action='store_true')
@@ -223,9 +315,11 @@ def main():
 
     if not a.no_romfs:
         sec = program.section(1)
-        if sec is None or sec.enc_type == 4:
-            print('romfs: update patch (BKTR/AesCtrEx) section, needs the base RomFS; skipped')
-            return
+        if sec is not None and sec.enc_type == 4:
+            if not a.base:
+                print('romfs: this is an update (patch RomFS); pass --base BASE.nsp to extract it')
+                return
+            sec = PatchedSection(sec, find_program(a.base, keys).section(1))
         ro, _ = sec.data_region()
         files = romfs_files(sec, ro)
         os.makedirs(a.out, exist_ok=True)

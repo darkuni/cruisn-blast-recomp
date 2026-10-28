@@ -12,7 +12,7 @@ Tools and runtime only. Bring your own dump and your own console keys. Nothing f
 | Title ID | `0100B41013C82000` (base), `0100B41013C82800` (update) |
 | Target version | v131072 (2.0.0) |
 | Engine | Unity 2019.4.18f1, IL2CPP scripting backend |
-| IL2CPP metadata | v24 (`Data/Managed/Metadata/global-metadata.dat`) |
+| IL2CPP metadata | v24 (`Data/Managed/Metadata/global-metadata.dat`, 8,527,172 bytes in 2.0.0) |
 | Graphics | NVN |
 | Asset loading | Addressables (`Data/StreamingAssets/aa/`) |
 
@@ -28,11 +28,11 @@ Tools and runtime only. Bring your own dump and your own console keys. Nothing f
 ## Tools
 
 `tools/nsp_extract.py` - decrypts an NSP with your `prod.keys` and pulls ExeFS and RomFS.
-Handles standard crypto and common tickets. Patch RomFS (BKTR) is not handled yet. Only needs the `cryptography` package.
+Handles standard crypto, common tickets, and update patch RomFS (BKTR indirect + AES-CTR-EX, layered over the base RomFS). Only needs the `cryptography` package.
 
 ```
 python3 tools/nsp_extract.py "base.nsp" --keys prod.keys --out extracted
-python3 tools/nsp_extract.py "update.nsp" --keys prod.keys --out extracted_v2 --no-romfs
+python3 tools/nsp_extract.py "update.nsp" --keys prod.keys --base "base.nsp" --out extracted_v2 --romfs-filter global-metadata
 python3 tools/nsp_extract.py "base.nsp" --keys prod.keys --info
 ```
 
