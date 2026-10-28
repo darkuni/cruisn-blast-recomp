@@ -73,11 +73,17 @@ backtraces and stats on, logging to `run.log`.
 ## Status
 
 - Recompiles: 247,518 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links
-- Boots through Nintendo SDK init (about 100 threads, 17 services) under the recompiled code
-- On Windows with the full RomFS: Unity boots, streams assets and presents frames (2.4 fps,
-  black). 7,916 of 7,941 draws skipped: 4,939 with no color/depth target, about 2,970 using
-  bindless textures (patch 0003 addresses those). Main thread spends most time in
-  out-of-line SIMD/FP helpers (495M calls in 40 s)
+- Playable on Windows (i9-13900K / RTX 4070 Ti): boots, menus, car select with the 3D car,
+  races with full 3D scene, post-processing and HUD at 60 fps; FMOD audio works
+- Open issues:
+  - Hitches when new materials appear: driver pipeline compiles (151 -> 214 pipelines in a
+    race, spikes up to 1.9 s). Kirikae keeps a driver pipeline cache between runs
+  - Car-selector thumbnails blank: 4,939 draws skipped during loading with no color or
+    depth target (patch 0006 reports why)
+  - About 1.8 ms/frame on the main thread still runs in the interpreter; the run writes
+    `build/cruisn-blast.profile`, and a full rebuild compiles those addresses natively
+  - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
+    unpatched Kirikae
 
 ## Plan
 

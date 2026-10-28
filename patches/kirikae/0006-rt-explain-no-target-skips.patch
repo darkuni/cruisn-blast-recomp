@@ -1,0 +1,25 @@
+diff --git a/crates/rt/src/gpu/vulkan/draw.rs b/crates/rt/src/gpu/vulkan/draw.rs
+index a65150b..2f5e777 100644
+--- a/crates/rt/src/gpu/vulkan/draw.rs
++++ b/crates/rt/src/gpu/vulkan/draw.rs
+@@ -228,7 +228,19 @@ impl Renderer {
+         let depth = self.depth_target(gpu, regs);
+         self.lap(1, &mut lap);
+         if targets.is_empty() && depth.is_none() {
+-            return Err("no color or depth target".into());
++            // Say why, so the skip statistics separate the cases.
++            let why = if regs[0x54e] & 1 == 0 {
++                format!("{count} color slots unset, depth off")
++            } else if self.depth_format(regs[0x3fa]).is_none() {
++                format!("depth format {:#x} unsupported", regs[0x3fa])
++            } else if gpu.translate(address(regs, 0x3f8)).is_none() {
++                "depth address unmapped".to_string()
++            } else if regs[0x48a] == 0 || regs[0x48b] & 0x1ffff == 0 {
++                "depth size 0".to_string()
++            } else {
++                "depth image not created".to_string()
++            };
++            return Err(format!("no color or depth target ({why})"));
+         }
+         if depth.is_some() {
+             sizes.push((regs[0x48a], regs[0x48b] & 0x1ffff));

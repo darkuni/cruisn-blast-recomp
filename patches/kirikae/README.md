@@ -76,3 +76,10 @@ All 1,332 shaders dumped from a Cruis'n Blast session: 753 translate completely 
 unpatched Kirikae, 1,324 with 0003-0005; nothing is reported missing. The other 8 fail naga
 validation with BreakOutsideOfLoopOrSwitch identically with and without these patches
 (pre-existing control-flow structuring issue).
+
+## 0006 - rt: explain "no color or depth target" skips (diagnostic)
+
+The skip reason now says whether depth was off with no color target, the depth format was
+unsupported, its address unmapped, its size zero, or its image not created, so the skip
+statistics separate the cases. Added to find why Cruis'n Blast's car-selector thumbnails
+(4,939 draws during loading) are blank.
