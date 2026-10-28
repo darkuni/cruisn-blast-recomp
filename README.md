@@ -62,6 +62,9 @@ powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1
 powershell -ExecutionPolicy Bypass -File tools\run.ps1
 ```
 
+After a patch that only touches the runtime or shader translator, add `-Relink` to skip
+regenerating the game's code.
+
 `build_windows.ps1` clones Kirikae at `patches/kirikae/BASE_COMMIT`, applies the patches,
 builds it, and recompiles `extracted_v2` with `tools\cruisn-blast.profile`
 (generate it with `tools/il2cpp_profile.py`). `run.ps1` runs the result with exit
@@ -71,8 +74,10 @@ backtraces and stats on, logging to `run.log`.
 
 - Recompiles: 247,518 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links
 - Boots through Nintendo SDK init (about 100 threads, 17 services) under the recompiled code
-- Then Unity's `nnMain` returns and the process exits cleanly; the interpreter-only run
-  exits at the same point. Suspected cause on the headless test box: incomplete RomFS
+- On Windows with the full RomFS: Unity boots, streams assets and presents frames (2.4 fps,
+  black). 7,916 of 7,941 draws skipped: 4,939 with no color/depth target, about 2,970 using
+  bindless textures (patch 0003 addresses those). Main thread spends most time in
+  out-of-line SIMD/FP helpers (495M calls in 40 s)
 
 ## Plan
 

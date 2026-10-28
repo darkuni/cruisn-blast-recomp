@@ -1,0 +1,203 @@
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index a1467a8..fe3a571 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -1567,7 +1567,7 @@ impl<'a> Translator<'a> {
+             "texs" => self.texs(i),
+             "tlds" => self.tlds(i),
+             "sust" => self.sust(pc, i),
+-            "tex" => self.tex(i),
++            "tex" => self.tex(pc, i),
+             "tld4" => self.tld4(i),
+             "tld4s" => self.tld4s(i),
+             "hadd2" | "hmul2" | "hfma2" => self.half(i),
+@@ -2692,9 +2692,49 @@ impl<'a> Translator<'a> {
+     }
+ 
+     fn cbuf_source(&self, pc: u32, reg: u8) -> Option<(u32, u32)> {
++        self.cbuf_source_depth(pc, reg, 4)
++    }
++
++    /// Where a register's value was loaded from a constant buffer: `MOV Rd, c[s][o]`,
++    /// `LDC Rd, c[s][imm]` with no index register (also the later words of a 64/128-bit
++    /// LDC), or a register copy of either. Bindless texture handles reach TEX.B this way.
++    fn cbuf_source_depth(&self, pc: u32, reg: u8, depth: u32) -> Option<(u32, u32)> {
+         const NO_RD: &[&str] = &["st", "stg", "sts", "stl", "sust", "red", "exit", "bra", "brx", "sync", "ssy", "pbk", "brk", "kil", "depbar", "bar", "membar", "nop", "isetp", "fsetp", "psetp", "hsetp2", "csetp", "dsetp"];
+-        let (_, def) = self.insns.range(..pc).rev().take(512).find(|(_, i)| i.rd() == reg && !NO_RD.contains(&i.name()))?;
+-        (def.name() == "mov" && def.form() == Form::Cbuf).then(|| def.cbuf())
++        const LDC: u64 = 0xef90000000000000;
++        if reg == RZ {
++            return None;
++        }
++        let words = |i: &Insn| -> u8 {
++            if i.op.value == LDC {
++                match i.bits(48, 3) {
++                    5 => 2,
++                    6 => 4,
++                    _ => 1,
++                }
++            } else {
++                1
++            }
++        };
++        let (&def_pc, def) = self.insns.range(..pc).rev().take(512).find(|(_, i)| {
++            !NO_RD.contains(&i.name()) && i.rd() != RZ && reg >= i.rd() && (reg - i.rd()) < words(i)
++        })?;
++        if def.op.value == LDC {
++            if def.ra() != RZ || def.bits(44, 2) != 0 {
++                return None;
++            }
++            let slot = def.bits(36, 5) as u32;
++            let imm = ((def.bits(20, 16) as u32) << 16) as i32 >> 16;
++            let off = imm + 4 * (reg - def.rd()) as i32;
++            return (off >= 0 && off % 4 == 0).then_some((slot, off as u32));
++        }
++        if def.name() == "mov" && reg == def.rd() {
++            match def.form() {
++                Form::Cbuf => return Some(def.cbuf()),
++                Form::Reg if depth > 0 => return self.cbuf_source_depth(def_pc, def.rb(), depth - 1),
++                _ => {}
++            }
++        }
++        None
+     }
+ 
+     fn storage_slot(&mut self, pc: u32, reg: u8) -> Option<u32> {
+@@ -3303,8 +3343,8 @@ impl<'a> Translator<'a> {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    fn sample(&mut self, handle: u32, dim: TexDim, array: bool, shadow: bool, coords: Vec<Word>, layer: Option<Word>, lod: Lod, dref: Option<Word>, offset: Option<Word>) -> R<[Word; 4]> {
+-        let (image_var, sampler_var, image_ty, sampled_ty) = self.texture(None, handle, dim, array, shadow);
++    fn sample(&mut self, slot: Option<u32>, handle: u32, dim: TexDim, array: bool, shadow: bool, coords: Vec<Word>, layer: Option<Word>, lod: Lod, dref: Option<Word>, offset: Option<Word>) -> R<[Word; 4]> {
++        let (image_var, sampler_var, image_ty, sampled_ty) = self.texture(slot, handle, dim, array, shadow);
+         let img = self.b.load(image_ty, None, image_var, None, [])?;
+         let sampler_ty = self.b.type_sampler();
+         let smp = self.b.load(sampler_ty, None, sampler_var, None, [])?;
+@@ -3622,7 +3662,7 @@ impl<'a> Translator<'a> {
+                 return Ok(());
+             }
+         };
+-        let result = self.sample(handle, dim, array, shadow, coords, layer, lod, dref, None)?;
++        let result = self.sample(None, handle, dim, array, shadow, coords, layer, lod, dref, None)?;
+         self.texs_results(i, result)
+     }
+ 
+@@ -3755,12 +3795,25 @@ impl<'a> Translator<'a> {
+         Ok(())
+     }
+ 
+-    fn tex(&mut self, i: &Insn) -> R {
+-        if i.op.value != 0xc038000000000000 {
+-            self.unsupported.push("tex (bindless)");
++    fn tex(&mut self, pc: u32, i: &Insn) -> R {
++        // TEX.B takes its handle from Rb (traced back to the constant buffer it was
++        // loaded from) and moves the LOD mode to bits 37-39 and AOFFI to bit 36.
++        let bindless = i.op.value == 0xdeb8000000000000;
++        if !bindless && i.op.value != 0xc038000000000000 {
++            self.unsupported.push("tex (form)");
+             return Ok(());
+         }
+-        let handle = i.bits(36, 13) as u32;
++        let (slot, handle) = if bindless {
++            match self.cbuf_source(pc, i.rb()) {
++                Some((slot, offset)) => (Some(slot), offset / 4),
++                None => {
++                    self.unsupported.push("tex (bindless)");
++                    return Ok(());
++                }
++            }
++        } else {
++            (None, i.bits(36, 13) as u32)
++        };
+         let dim = match i.bits(29, 2) {
+             0 => TexDim::D1,
+             1 => TexDim::D2,
+@@ -3783,7 +3836,7 @@ impl<'a> Translator<'a> {
+             let v = take_a(self)?;
+             coords.push(self.cast_f(v)?);
+         }
+-        let mut reg_b = i.rb();
++        let mut reg_b = if bindless { i.rb() + 1 } else { i.rb() };
+         let mut take_b = |t: &mut Self| -> R<Word> {
+             let r = reg_b;
+             if reg_b != RZ {
+@@ -3791,7 +3844,7 @@ impl<'a> Translator<'a> {
+             }
+             t.r(r)
+         };
+-        let lod = match i.bits(55, 3) {
++        let lod = match if bindless { i.bits(37, 3) } else { i.bits(55, 3) } {
+             1 => Lod::Zero,
+             2 => {
+                 let v = take_b(self)?;
+@@ -3807,9 +3860,9 @@ impl<'a> Translator<'a> {
+                 Lod::Implicit
+             }
+         };
+-        let offset = if i.bit(54) { Some(take_b(self)?) } else { None };
++        let offset = if i.bit(if bindless { 36 } else { 54 }) { Some(take_b(self)?) } else { None };
+         let dref = if shadow { Some(take_b(self)?) } else { None };
+-        let result = self.sample(handle, dim, array, shadow, coords, layer, lod, dref, offset)?;
++        let result = self.sample(slot, handle, dim, array, shadow, coords, layer, lod, dref, offset)?;
+         let mut reg = i.rd();
+         for (c, &value) in result.iter().enumerate() {
+             if i.bit(31 + c as u32) && reg != RZ {
+diff --git a/crates/maxwell/tests/translate.rs b/crates/maxwell/tests/translate.rs
+index 660be31..eaf407f 100644
+--- a/crates/maxwell/tests/translate.rs
++++ b/crates/maxwell/tests/translate.rs
+@@ -322,3 +322,53 @@ fn half_pair_operands() {
+     assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
+     validate(&shader.spirv);
+ }
++
++fn tex_b_2d(rd: u64, ra: u64, rb: u64, lod: u64) -> u64 {
++    0xdeb8_0000_0000_0000 | lod << 37 | 0xf << 31 | 1 << 29 | rb << 20 | PT | ra << 8 | rd
++}
++fn ldc64(rd: u64, slot: u64, offset: u64) -> u64 {
++    0xef90_0000_0000_0000 | 5 << 48 | slot << 36 | offset << 20 | PT | 0xff << 8 | rd
++}
++fn mov_reg(rd: u64, rb: u64) -> u64 {
++    0x5c98_0000_0000_0000 | 0xf << 39 | rb << 20 | PT | rd
++}
++
++#[test]
++fn bindless_tex_from_ldc() {
++    let code = program(fragment_header(1), &[ldc(6, 3, 0x18), ipa(0, 0x80, 0xff), ipa(1, 0x84, 0xff), tex_b_2d(8, 0, 6, 0), EXIT]);
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    assert_eq!(shader.textures.len(), 1);
++    assert_eq!((shader.textures[0].slot, shader.textures[0].handle), (Some(3), 6));
++    validate(&shader.spirv);
++}
++
++#[test]
++fn bindless_tex_from_the_high_word_of_a_64_bit_ldc_with_explicit_lod() {
++    // R6:R7 = c[2][0x20..0x28]; the handle is R7, so c[2][0x24], word 9. LOD "ll" reads R8.
++    let code = program(
++        fragment_header(1),
++        &[ldc64(6, 2, 0x20), mov32i(8, 0), ipa(0, 0x80, 0xff), ipa(1, 0x84, 0xff), tex_b_2d(10, 0, 7, 3), EXIT],
++    );
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    assert_eq!((shader.textures[0].slot, shader.textures[0].handle), (Some(2), 9));
++    validate(&shader.spirv);
++}
++
++#[test]
++fn bindless_tex_through_a_register_copy() {
++    let code = program(fragment_header(1), &[ldc(6, 4, 0x8), mov_reg(5, 6), ipa(0, 0x80, 0xff), ipa(1, 0x84, 0xff), tex_b_2d(8, 0, 5, 0), EXIT]);
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.is_empty(), "{:?}", shader.unsupported);
++    assert_eq!((shader.textures[0].slot, shader.textures[0].handle), (Some(4), 2));
++    validate(&shader.spirv);
++}
++
++#[test]
++fn bindless_tex_with_a_computed_handle_stays_unsupported() {
++    let code = program(fragment_header(1), &[ldc(6, 3, 0x18), iadd32i(6, 6, 1), ipa(0, 0x80, 0xff), ipa(1, 0x84, 0xff), tex_b_2d(8, 0, 6, 0), EXIT]);
++    let shader = translate(&code, &options(Stage::Fragment), &kirikae_maxwell::NoEnv).unwrap();
++    assert!(shader.unsupported.contains(&"tex (bindless)"), "{:?}", shader.unsupported);
++    assert!(shader.textures.is_empty());
++}

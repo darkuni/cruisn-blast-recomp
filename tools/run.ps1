@@ -22,6 +22,10 @@ foreach ($kv in $Extra + $args) {
 Write-Host "Starting $Exe (log: $Log)"
 Push-Location (Split-Path $Exe)
 try {
-    & $Exe 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $Log
-    Write-Host "`nexit code $LASTEXITCODE - send me run.log" -ForegroundColor Cyan
+    # Through cmd so stderr stays plain text; the log is written as UTF-8.
+    $lines = New-Object System.Collections.Generic.List[string]
+    cmd /s /c "`"`"$Exe`" 2>&1`"" | ForEach-Object { Write-Host $_; $lines.Add($_) }
+    $code = $LASTEXITCODE
+    [IO.File]::WriteAllLines($Log, $lines, (New-Object Text.UTF8Encoding $false))
+    Write-Host "`nexit code $code - run.log is ready" -ForegroundColor Cyan
 } finally { Pop-Location }

@@ -27,3 +27,17 @@ function at that address, so control flow is unchanged. Kirikae's recompiler tes
 Diagnostics. `KIRIKAE_TRACE_FS=1` logs each RomFS lookup (GetEntryType, OpenFile,
 OpenDirectory) and its result. `KIRIKAE_TRACE_EXIT=1` prints a guest frame-pointer
 backtrace when the game calls svcExitProcess. Off by default.
+
+## 0003 - maxwell: bindless TEX (TEX.B)
+
+TEX.B was rejected outright, so every Unity/NVN draw sampling a texture was skipped
+(about 2,970 of 7,941 draws in the first 40 s of Cruis'n Blast). The handle register
+(Rb) is now traced back to the constant buffer it was loaded from and the access becomes
+a bound texture at that slot and word, which the runtime already supports.
+
+- `cbuf_source` also accepts `LDC Rd, c[s][imm]` with no index register (including the
+  later words of a 64/128-bit LDC) and follows plain register `MOV` copies.
+- TEX.B field positions per envytools gm107: LOD mode in bits 37-39 (TEX: 55-57), AOFFI in
+  bit 36 (TEX: 54); the remaining B operands start at Rb+1.
+- Tests: handle from LDC, from the high word of LDC.64 with explicit LOD, through a register
+  copy, and a computed handle that stays unsupported. All translator tests pass.

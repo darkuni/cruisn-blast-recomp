@@ -2,13 +2,17 @@
 #
 # Run from the project folder (the one holding extracted_v2\ and tools\):
 #   powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1
+#   powershell -ExecutionPolicy Bypass -File tools\build_windows.ps1 -Relink   (after runtime-only patches)
 #
 # Needs: git, Rust (rustup), Visual Studio Build Tools with the C++ desktop workload,
 # a Vulkan 1.3 GPU. The script checks for each and stops with instructions if one is missing.
 
 param(
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
-    [int]$Jobs = 0
+    [int]$Jobs = 0,
+    # Only the runtime or shader translator changed: rebuild them and relink the game
+    # without regenerating its code. Needs a previous full build.
+    [switch]$Relink
 )
 
 # Continue, not Stop: Windows PowerShell 5.1 turns native stderr (Kirikae's progress
@@ -25,6 +29,17 @@ $SeedProfile = Join-Path $Tools 'cruisn-blast.profile'
 
 function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 function Fail($msg) { Write-Host "`nSTOP: $msg" -ForegroundColor Red; exit 1 }
+
+# Run a native command through cmd so its stderr comes back as plain text (PowerShell 5.1
+# wraps redirected stderr in red error records) and log it as UTF-8.
+function Run-Logged([string]$exe, [string[]]$argv, [string]$log) {
+    $line = '"' + $exe + '" ' + (($argv | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    $lines = New-Object System.Collections.Generic.List[string]
+    cmd /s /c "`"$line 2>&1`"" | ForEach-Object { Write-Host $_; $lines.Add($_) }
+    $code = $LASTEXITCODE
+    [IO.File]::WriteAllLines($log, $lines, (New-Object Text.UTF8Encoding $false))
+    return $code
+}
 
 Step 'Checking prerequisites'
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -74,12 +89,22 @@ try {
     if ($LASTEXITCODE) { Fail 'Kirikae build failed - send me the error above' }
 } finally { Pop-Location }
 
-Step 'Recompiling Cruis''n Blast'
-$k = Join-Path $Target 'release\kirikae.exe'
-$kargs = @('build', $Dump, '-o', $Out, '--name', 'cruisn-blast', '--profile', $SeedProfile)
-if ($Jobs -gt 0) { $kargs += @('-j', "$Jobs") }
 $sw = [Diagnostics.Stopwatch]::StartNew()
-& $k @kargs 2>&1 | Tee-Object -FilePath (Join-Path $Root 'build.log')
-if ($LASTEXITCODE) { Fail 'recompile failed - build.log has the details' }
+$project = Join-Path $Out 'cruisn-blast-build'
+if ($Relink) {
+    Step 'Relinking Cruis''n Blast against the patched runtime'
+    if (-not (Test-Path (Join-Path $project 'Cargo.toml'))) { Fail 'no previous build to relink - run without -Relink first' }
+    Push-Location $project
+    try { $code = Run-Logged 'cargo' @('build', '--release') (Join-Path $Root 'build.log') } finally { Pop-Location }
+    if ($code) { Fail 'relink failed - build.log has the details' }
+    Copy-Item (Join-Path $Target 'release\cruisn-blast.exe') (Join-Path $Out 'cruisn-blast.exe') -Force
+} else {
+    Step 'Recompiling Cruis''n Blast'
+    $k = Join-Path $Target 'release\kirikae.exe'
+    $kargs = @('build', $Dump, '-o', $Out, '--name', 'cruisn-blast', '--profile', $SeedProfile)
+    if ($Jobs -gt 0) { $kargs += @('-j', "$Jobs") }
+    $code = Run-Logged $k $kargs (Join-Path $Root 'build.log')
+    if ($code) { Fail 'recompile failed - build.log has the details' }
+}
 Write-Host ("`nDone in {0:N1} min: {1}" -f $sw.Elapsed.TotalMinutes, (Join-Path $Out 'cruisn-blast.exe')) -ForegroundColor Green
 Write-Host 'Run it with:  powershell -ExecutionPolicy Bypass -File tools\run.ps1'
