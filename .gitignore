@@ -1,0 +1,11 @@
+# Never commit keys or anything derived from the game dump
+*.keys
+keys/
+*.nsp
+*.xci
+*.nca
+*.nso
+extracted*/
+global-metadata.dat
+il2cpp_dump/
+__pycache__/
