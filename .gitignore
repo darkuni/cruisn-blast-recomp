@@ -9,3 +9,4 @@ extracted*/
 global-metadata.dat
 il2cpp_dump/
 __pycache__/
+*.profile
