@@ -83,3 +83,16 @@ The skip reason now says whether depth was off with no color target, the depth f
 unsupported, its address unmapped, its size zero, or its image not created, so the skip
 statistics separate the cases. Added to find why Cruis'n Blast's car-selector thumbnails
 (4,939 draws during loading) are blank.
+
+## 0007 - compressed textures never alias render-target images
+
+Cruis'n Blast's car-selector tiles are eight 500x300 BC1 textures streamed from asset
+bundles. They sampled black (one striped). `find_image` matches any existing image at a
+texture's address in any format, and Unity's memory pool reuses freed render-target memory
+for textures, so the lookup could return a stale render target. Render targets are marked
+GPU-written, which also stops the texture from ever being re-read from memory.
+
+A GPU cannot render into BC/ETC2/EAC/ASTC formats, so a block-compressed texture now only
+reuses an image of the same format class and is otherwise uploaded from memory. With
+KIRIKAE_TRACE_GPU on, each texture bind also logs which image it resolved to and whether
+that image is GPU-written. Runtime unit tests: 198 pass.

@@ -1,0 +1,36 @@
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index ee0bb34..8ca8053 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -165,7 +165,11 @@ impl Renderer {
+         self.lap(12, &mut lap);
+         let layered = self.layered_image(gpu, mem, cpu, &header, &format)?;
+         self.lap(13, &mut lap);
+-        let key = match layered.map(|(k, _)| k).or_else(|| self.find_image(cpu, header.width, header.height, format.vk)) {
++        // A block-compressed texture always comes from memory: the GPU cannot render into
++        // BC/ETC/ASTC, so an image of another format at this address is stale (a render
++        // target whose memory was freed and reused) and must not stand in for it.
++        let found = self.find_image(cpu, header.width, header.height, format.vk).filter(|k| !compressed(format.vk) || same_class(k.format, format.vk));
++        let key = match layered.map(|(k, _)| k).or(found) {
+             Some(k) => {
+                 if layered.is_none() {
+                     self.refresh_texture(gpu, mem, k, &header, &format, layers);
+@@ -186,6 +190,9 @@ impl Renderer {
+             }
+         };
+         self.lap(14, &mut lap);
++        if crate::gpu::trace() {
++            eprintln!("gpu: texture {:#x} {}x{} {:?} uses image {:#x} {}x{} {:?}{}", header.address, header.width, header.height, format.vk, key.cpu, key.width, key.height, key.format, if self.images[&key].gpu_dirty { " (gpu written)" } else { "" });
++        }
+         let swizzle = swizzle(&header);
+         let view_format = if same_class(key.format, format.vk) { format.vk } else { key.format };
+         let swizzle = if aspect_of(view_format) == vk::ImageAspectFlags::COLOR {
+@@ -633,3 +640,8 @@ pub(super) fn border_color(border: &[u32; 4]) -> vk::BorderColor {
+         (false, false) => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+     }
+ }
++
++/// Block-compressed formats (BC1-BC7, ETC2/EAC, ASTC): never render targets.
++pub(super) fn compressed(f: vk::Format) -> bool {
++    (vk::Format::BC1_RGB_UNORM_BLOCK.as_raw()..=vk::Format::ASTC_12X12_SRGB_BLOCK.as_raw()).contains(&f.as_raw())
++}
