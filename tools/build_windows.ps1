@@ -101,7 +101,17 @@ if ($Relink) {
 } else {
     Step 'Recompiling Cruis''n Blast'
     $k = Join-Path $Target 'release\kirikae.exe'
-    $kargs = @('build', $Dump, '-o', $Out, '--name', 'cruisn-blast', '--profile', $SeedProfile)
+    # Seed profile (IL2CPP method entries) plus whatever previous runs had to interpret,
+    # which the game writes next to the exe.
+    $runProfile = Join-Path $Out 'cruisn-blast.profile'
+    $merged = Join-Path $Root 'merged.profile'
+    $all = @(Get-Content $SeedProfile)
+    if (Test-Path $runProfile) {
+        $all += Get-Content $runProfile
+        Write-Host "merging $((Get-Content $runProfile | Where-Object { $_ -notmatch '^#' }).Count) interpreted addresses from previous runs"
+    }
+    [IO.File]::WriteAllLines($merged, [string[]]$all, (New-Object Text.UTF8Encoding $false))
+    $kargs = @('build', $Dump, '-o', $Out, '--name', 'cruisn-blast', '--profile', $merged)
     if ($Jobs -gt 0) { $kargs += @('-j', "$Jobs") }
     $code = Run-Logged $k $kargs (Join-Path $Root 'build.log')
     if ($code) { Fail 'recompile failed - build.log has the details' }
