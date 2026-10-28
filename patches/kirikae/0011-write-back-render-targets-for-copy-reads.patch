@@ -1,0 +1,53 @@
+diff --git a/crates/rt/src/gpu/mod.rs b/crates/rt/src/gpu/mod.rs
+index 46478a8..2ef0c59 100644
+--- a/crates/rt/src/gpu/mod.rs
++++ b/crates/rt/src/gpu/mod.rs
+@@ -671,6 +671,21 @@ impl Gpu {
+             };
+             let from = side(src_pitch_layout, src, 0x1ca, pitch_in, in_bytes);
+             let to = side(dst_pitch_layout, dst, 0x1c3, pitch_out, out_bytes);
++            // Reading a render target (ReadPixels): host targets live in Vulkan images, so
++            // write the image back into guest memory with this copy's block-linear geometry
++            // before reading it.
++            if let Side::BlockLinear { base, block_height_log2, width, .. } = from
++                && let Some(cpu) = self.translate(base)
++                && let Some(Some((bytes, w, h, bpp))) = self.with_renderer(|r| r.target_bytes(cpu))
++            {
++                let row = w as u64 * bpp as u64;
++                if row <= width {
++                    Side::BlockLinear { base, block_height_log2, width, x: 0, y: 0 }.write(self, mem, &bytes, row, h as u64);
++                    if trace_uploads() {
++                        eprintln!("gpu: wrote back render target {base:#x} {w}x{h} ({bpp} bytes/texel) for a copy-engine read");
++                    }
++                }
++            }
+             let rows = if remap.as_ref().is_none_or(Remap::reads_source) { from.read(self, mem, len * in_bytes, lines) } else { Some(Vec::new()) };
+             let Some(rows) = rows else { return };
+             to.write(self, mem, &convert(rows), len * out_bytes, lines);
+diff --git a/crates/rt/src/gpu/vulkan/readback.rs b/crates/rt/src/gpu/vulkan/readback.rs
+index 038ef74..43da1b2 100644
+--- a/crates/rt/src/gpu/vulkan/readback.rs
++++ b/crates/rt/src/gpu/vulkan/readback.rs
+@@ -24,6 +24,22 @@ impl Renderer {
+         Some(out)
+     }
+ 
++    /// The newest GPU-written single-level color image starting at `cpu`, read back from
++    /// the GPU as raw texels: (bytes, width, height, bytes per texel). Used to give the copy
++    /// engine a render target's real contents when it reads that memory (ReadPixels).
++    pub fn target_bytes(&mut self, cpu: u64) -> Option<(Vec<u8>, u32, u32, u32)> {
++        let key = self
++            .at(cpu)
++            .iter()
++            .copied()
++            .filter(|k| k.cpu & DERIVED == 0 && aspect_of(k.format) == vk::ImageAspectFlags::COLOR)
++            .filter(|k| self.images.get(k).is_some_and(|i| i.gpu_dirty && i.levels == 1 && i.layers == 1))
++            .max_by_key(|k| self.images[k].stamp)?;
++        let bpp = bytes_per_pixel(key.format)?;
++        let raw = self.read_raw(key, 1)?;
++        Some((raw, key.width, key.height, bpp))
++    }
++
+     pub(super) fn read_image(&mut self, key: ImageKey) -> Option<Vec<u32>> {
+         let start = std::time::Instant::now();
+         let r = self.read_image_inner(key);

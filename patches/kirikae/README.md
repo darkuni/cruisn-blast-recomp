@@ -130,3 +130,16 @@ Render-target images now record the sample grid of MULTISAMPLE_MODE (method 0x57
 0x15d0, envytools g80_msaa_mode) they were drawn with. A 2D blit from such an image whose
 scale factors equal that grid and whose destination is exactly storage / grid copies the
 top-left logical region 1:1. Other blits are unchanged. Runtime tests: 198 pass.
+
+## 0011 - write render targets back for copy-engine reads (ReadPixels)
+
+The car icons: render into an 8x MSAA target, resolve (0010), bloom, composite into a second
+MSAA target, resolve, then a resolve-shader draw into a 500x300 staging target, and finally
+`ReadPixels` reads that target with the copy engine (block-linear -> pitch, 4000 bytes x 300).
+Kirikae keeps render targets in Vulkan images and had no path writing them back to guest
+memory for copy-engine reads, so the readback returned zeros and every icon was black.
+
+When a copy-engine transfer reads block-linear memory that starts at a GPU-written,
+single-level color image, the image is now read back from the GPU and written into guest
+memory with the transfer's own block-linear geometry before the copy. With
+KIRIKAE_TRACE_UPLOADS set, each write-back is logged. Runtime tests: 198 pass.
