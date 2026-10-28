@@ -1,0 +1,85 @@
+diff --git a/crates/rt/src/gpu/vulkan/draw.rs b/crates/rt/src/gpu/vulkan/draw.rs
+index 2f5e777..6ee6989 100644
+--- a/crates/rt/src/gpu/vulkan/draw.rs
++++ b/crates/rt/src/gpu/vulkan/draw.rs
+@@ -225,6 +225,12 @@ impl Renderer {
+         while targets.last().is_some_and(Option::is_none) {
+             targets.pop();
+         }
++        let grid = super::images::msaa_grid(regs);
++        for (key, _) in targets.iter().flatten() {
++            if let Some(img) = self.images.get_mut(key) {
++                img.msaa = grid;
++            }
++        }
+         let depth = self.depth_target(gpu, regs);
+         self.lap(1, &mut lap);
+         if targets.is_empty() && depth.is_none() {
+diff --git a/crates/rt/src/gpu/vulkan/images.rs b/crates/rt/src/gpu/vulkan/images.rs
+index f9ed0c3..28fce6a 100644
+--- a/crates/rt/src/gpu/vulkan/images.rs
++++ b/crates/rt/src/gpu/vulkan/images.rs
+@@ -31,6 +31,9 @@ pub struct Image {
+     pub(super) drawn: Option<u64>,
+     pub(super) cleared: Option<u64>,
+     pub(super) clear_streak: u32,
++    /// Sample grid (x, y) of the MULTISAMPLE_MODE this image was last drawn with as a render
++    /// target; (1, 1) when single-sampled or never drawn.
++    pub(super) msaa: (u32, u32),
+ }
+ 
+ impl Image {
+@@ -121,7 +124,7 @@ impl Renderer {
+             self.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &barrier);
+         }
+         self.clock += 1;
+-        self.images.insert(key, Image { image, memory, views: HashMap::default(), levels: levels.max(1), layers: layers.max(1), gpu_dirty: false, stamp: self.clock, source: None, drawn: None, cleared: None, clear_streak: 0 });
++        self.images.insert(key, Image { image, memory, views: HashMap::default(), levels: levels.max(1), layers: layers.max(1), gpu_dirty: false, stamp: self.clock, source: None, drawn: None, cleared: None, clear_streak: 0, msaa: (1, 1) });
+         if key.cpu & DERIVED == 0 {
+             self.generation += 1;
+             self.forget_textures(key.cpu, layers > 1);
+@@ -441,6 +444,28 @@ impl Renderer {
+             }
+         };
+         let linear = linear && aspect == vk::ImageAspectFlags::COLOR;
++        // MSAA resolve. A multisampled target's registers describe its sample storage (8x as
++        // 4x2 makes a 500x300 target 2000x600), while host targets are single-sample: the
++        // content sits in the top-left logical region. A downsample by exact sample-grid
++        // factors from such a target therefore copies that region 1:1 instead of shrinking
++        // the whole image.
++        let (dw, dh) = (dst_rect[2] - dst_rect[0], dst_rect[3] - dst_rect[1]);
++        let factor = |span: f32, out: i32| -> Option<u32> {
++            let f = (span / out as f32).round();
++            (out > 0 && (span / out as f32 - f).abs() < 0.01 && [1.0, 2.0, 4.0].contains(&f)).then_some(f as u32)
++        };
++        let resolve = match (factor(src_rect[2] - src_rect[0], dw), factor(src_rect[3] - src_rect[1], dh)) {
++            (Some(fx), Some(fy)) => (fx, fy) != (1, 1)
++                && aspect == vk::ImageAspectFlags::COLOR
++                && self.images[&sk].msaa == (fx, fy)
++                && dw as u32 * fx == src.width
++                && dh as u32 * fy == src.height,
++            _ => false,
++        };
++        let src_rect = if resolve { [0.0, 0.0, dw as f32, dh as f32] } else { src_rect };
++        if resolve && crate::gpu::trace_uploads() {
++            eprintln!("gpu: 2D blit treated as MSAA resolve: {}x{} sample storage -> {dw}x{dh}", src.width, src.height);
++        }
+         self.begin();
+         self.end_rendering();
+         let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+@@ -556,3 +581,15 @@ fn clear_area(regs: &[u32], key: ImageKey) -> Option<Option<vk::Rect2D>> {
+     }
+     Some(Some(vk::Rect2D { offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 }, extent: vk::Extent2D { width: x1 - x0, height: y1 - y0 } }))
+ }
++
++/// Sample grid of the 3D engine's MULTISAMPLE_MODE (method 0x574, byte offset 0x15d0;
++/// envytools g80_msaa_mode).
++pub(super) fn msaa_grid(regs: &[u32]) -> (u32, u32) {
++    match regs[0x574] & 0xf {
++        1 | 5 => (2, 1),
++        2 | 8 | 9 => (2, 2),
++        3 | 4 | 0xa | 0xb => (4, 2),
++        6 => (4, 4),
++        _ => (1, 1),
++    }
++}

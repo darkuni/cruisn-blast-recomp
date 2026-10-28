@@ -114,3 +114,19 @@ the copy engine.
 `KIRIKAE_TRACE_UPLOADS=1` logs every inline, copy-engine and 2D transfer with its
 destination and layout, without the cost of the full GPU trace.
 Runtime unit tests: 198 pass (no dedicated test for the block-linear inline path yet).
+
+## 0010 - MSAA resolve blits
+
+The car-selector tiles come from `CarSelectScreen.RefreshIconRenderTexture`: an icon camera
+renders each car into a shared 8x MSAA RenderTexture, then `Texture2D.ReadPixels` + `Apply`,
+and later `Texture2D.Compress` (BC1). ReadPixels first resolves the MSAA target with a 2D
+blit from the 2000x600 sample storage (4x2) to 500x300, source rect [1.5, 0.5, 2001.5, 600.5].
+
+Host render targets are single-sample, so Kirikae draws the 500x300 viewport into the
+top-left of a 2000x600 image; the resolve then shrank the whole image, giving a quarter-size
+car in a mostly empty icon.
+
+Render-target images now record the sample grid of MULTISAMPLE_MODE (method 0x574 / byte
+0x15d0, envytools g80_msaa_mode) they were drawn with. A 2D blit from such an image whose
+scale factors equal that grid and whose destination is exactly storage / grid copies the
+top-left logical region 1:1. Other blits are unchanged. Runtime tests: 198 pass.
