@@ -234,3 +234,10 @@ vs while playing, pipelines linked.
 Verified offline: every program translates; library compiles and links of the game programs
 pass the Khronos validation layer on lavapipe; tests `game_shaders` (maxwell) and
 `compile_and_link_game_shaders` (rt), both ignored by default and driven by KIRIKAE_SHADERS.
+
+## 0015 - explain slow frames
+
+With KIRIKAE_STATS set, every frame over 50 ms logs where the renderer's time went (drawing,
+GPU waits, readbacks, shader translation, pipeline links, shader compiles, texture uploads,
+new images, pipeline cache saves, streamed MiB); what is left is the game's own CPU time.
+Pipelines that take over 5 ms and pipeline cache saves (size, time) are logged too.
