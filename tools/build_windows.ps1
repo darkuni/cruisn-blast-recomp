@@ -118,6 +118,10 @@ if ($Relink) {
     if ($code) { Fail 'recompile failed - build.log has the details' }
 }
 Step 'Shader programs for startup compilation'
+# Shaders the game is known to use: compiled behind the start screen, the rest in the background.
+$usedSeed = Join-Path $Tools 'cruisn-blast.shaders-used'
+$used = Join-Path $Out 'cruisn-blast.shaders-used'
+if ((Test-Path $usedSeed) -and -not (Test-Path $used)) { Copy-Item $usedSeed $used }
 $shaders = Join-Path $Out 'cruisn-blast.shaders'
 if (Test-Path $shaders) {
     Write-Host "already there: $shaders"
