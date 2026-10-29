@@ -1,0 +1,413 @@
+diff --git a/crates/rt/src/gpu/vulkan/gpl.rs b/crates/rt/src/gpu/vulkan/gpl.rs
+index df1ee09..8aa9c62 100644
+--- a/crates/rt/src/gpu/vulkan/gpl.rs
++++ b/crates/rt/src/gpu/vulkan/gpl.rs
+@@ -27,6 +27,20 @@ pub static PARTS_PRELOADED: AtomicUsize = AtomicUsize::new(0);
+ pub static PARTS_ON_DEMAND: AtomicUsize = AtomicUsize::new(0);
+ pub static LINKED: AtomicUsize = AtomicUsize::new(0);
+ 
++/// Why a shader part is compiled.
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) enum Use {
++    /// A draw needs it now (the preload did not cover it).
++    Draw,
++    /// Startup preload of a part the game is known to use: kept.
++    Preload,
++    /// Background compile of a part not seen in use yet: only fills the driver's cache.
++    Warm,
++}
++
++/// Shader parts compiled in the background without being kept.
++pub static PARTS_WARMED: AtomicUsize = AtomicUsize::new(0);
++
+ /// `{ f32 depth scale, f32 depth offset }` for the vertex stage.
+ pub(super) const PUSH_SIZE: u32 = 8;
+ 
+@@ -116,6 +130,13 @@ pub(super) struct Shared {
+     frag: Mutex<HashMap<FragKey, vk::Pipeline>>,
+     /// Shader parts compiled while the game was running (not preloaded).
+     pub(super) on_demand: AtomicUsize,
++    /// Shader parts the game has drawn with (ids), from `<exe>.shaders-used` and this session.
++    used: Mutex<std::collections::HashSet<u64>>,
++    used_known: AtomicBool,
++    used_dirty: AtomicBool,
++    used_saved: Mutex<std::time::Instant>,
++    /// Parts already compiled in the background (identical programs share a part).
++    warmed: Mutex<std::collections::HashSet<u64>>,
+     pub(super) preloaded: AtomicUsize,
+ }
+ 
+@@ -156,14 +177,37 @@ impl Shared {
+         *self.lib_layouts.lock().unwrap().entry(key).or_insert(l)
+     }
+ 
+-    fn library(&self, info: vk::GraphicsPipelineCreateInfo, parts: vk::GraphicsPipelineLibraryFlagsEXT) -> Result<vk::Pipeline, vk::Result> {
++    fn library(&self, info: vk::GraphicsPipelineCreateInfo, parts: vk::GraphicsPipelineLibraryFlagsEXT, why: Use) -> Result<vk::Pipeline, vk::Result> {
+         let mut lib = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(parts);
+         let info = info.flags(vk::PipelineCreateFlags::LIBRARY_KHR).push_next(&mut lib);
+-        unsafe { self.device.create_graphics_pipelines(self.cache, &[info], None) }.map(|p| p[0]).map_err(|(_, e)| e)
++        // warmed parts only go to the driver's own cache, keeping ours (and its saves) small
++        let cache = if why == Use::Warm { vk::PipelineCache::null() } else { self.cache };
++        unsafe { self.device.create_graphics_pipelines(cache, &[info], None) }.map(|p| p[0]).map_err(|(_, e)| e)
++    }
++
++    /// Keep or drop a freshly built part.
++    fn finish(&self, p: vk::Pipeline, why: Use) -> Option<vk::Pipeline> {
++        match why {
++            Use::Warm => {
++                unsafe { self.device.destroy_pipeline(p, None) };
++                PARTS_WARMED.fetch_add(1, Ordering::Relaxed);
++                None
++            }
++            Use::Draw => {
++                self.on_demand.fetch_add(1, Ordering::Relaxed);
++                PARTS_ON_DEMAND.fetch_add(1, Ordering::Relaxed);
++                Some(p)
++            }
++            Use::Preload => {
++                self.preloaded.fetch_add(1, Ordering::Relaxed);
++                PARTS_PRELOADED.fetch_add(1, Ordering::Relaxed);
++                Some(p)
++            }
++        }
+     }
+ 
+     /// The vertex shader part; `clamp` is ignored when depth clamp is dynamic.
+-    pub(super) fn pre(&self, id: vk::ShaderModule, spirv: &[u32], set: &LayoutKey, clamp: bool, on_demand: bool) -> Result<vk::Pipeline, vk::Result> {
++    pub(super) fn pre(&self, id: vk::ShaderModule, spirv: &[u32], set: &LayoutKey, clamp: bool, why: Use) -> Result<vk::Pipeline, vk::Result> {
+         let clamp = clamp && !self.clamp_dynamic;
+         let key = (id, set.clone(), clamp);
+         if let Some(&p) = self.pre.lock().unwrap().get(&key) {
+@@ -184,15 +228,14 @@ impl Shared {
+             .dynamic_state(&dynamic)
+             .layout(layout)
+             .push_next(&mut rendering);
+-        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS);
++        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS, why);
+         unsafe { self.device.destroy_shader_module(module, None) };
+-        let p = p?;
+-        self.count(on_demand);
++        let Some(p) = self.finish(p?, why) else { return Ok(vk::Pipeline::null()) };
+         Ok(*self.pre.lock().unwrap().entry(key).or_insert(p))
+     }
+ 
+     /// The fragment shader part (`module` null for depth-only draws).
+-    pub(super) fn frag(&self, id: vk::ShaderModule, spirv: Option<&[u32]>, set: &LayoutKey, alpha_test: [u32; 2], on_demand: bool) -> Result<vk::Pipeline, vk::Result> {
++    pub(super) fn frag(&self, id: vk::ShaderModule, spirv: Option<&[u32]>, set: &LayoutKey, alpha_test: [u32; 2], why: Use) -> Result<vk::Pipeline, vk::Result> {
+         let key = (id, set.clone(), alpha_test);
+         if let Some(&p) = self.frag.lock().unwrap().get(&key) {
+             return Ok(p);
+@@ -222,25 +265,14 @@ impl Shared {
+             .dynamic_state(&dynamic)
+             .layout(layout)
+             .push_next(&mut rendering);
+-        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
++        let p = self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER, why);
+         if module != vk::ShaderModule::null() {
+             unsafe { self.device.destroy_shader_module(module, None) };
+         }
+-        let p = p?;
+-        self.count(on_demand);
++        let Some(p) = self.finish(p?, why) else { return Ok(vk::Pipeline::null()) };
+         Ok(*self.frag.lock().unwrap().entry(key).or_insert(p))
+     }
+ 
+-    fn count(&self, on_demand: bool) {
+-        if on_demand {
+-            self.on_demand.fetch_add(1, Ordering::Relaxed);
+-            PARTS_ON_DEMAND.fetch_add(1, Ordering::Relaxed);
+-        } else {
+-            self.preloaded.fetch_add(1, Ordering::Relaxed);
+-            PARTS_PRELOADED.fetch_add(1, Ordering::Relaxed);
+-        }
+-    }
+-
+     pub(super) fn vertex_input(&self, key: &PipelineKey) -> Result<vk::Pipeline, vk::Result> {
+         let bindings: Vec<vk::VertexInputBindingDescription> = key.bindings.iter().map(|&(b, stride)| vk::VertexInputBindingDescription { binding: b, stride, input_rate: vk::VertexInputRate::VERTEX }).collect();
+         let attributes: Vec<vk::VertexInputAttributeDescription> = key.attributes.iter().map(|&(location, binding, format, offset)| vk::VertexInputAttributeDescription { location, binding, format, offset }).collect();
+@@ -249,7 +281,7 @@ impl Shared {
+         let dynamic = dynamic_states(self.clamp_dynamic);
+         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+         let info = vk::GraphicsPipelineCreateInfo::default().vertex_input_state(&vertex_input).input_assembly_state(&assembly).dynamic_state(&dynamic);
+-        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE)
++        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE, Use::Draw)
+     }
+ 
+     pub(super) fn fragment_output(&self, key: &PipelineKey) -> Result<vk::Pipeline, vk::Result> {
+@@ -263,7 +295,7 @@ impl Shared {
+             rendering = rendering.stencil_attachment_format(key.depth);
+         }
+         let info = vk::GraphicsPipelineCreateInfo::default().color_blend_state(&blend).multisample_state(&multisample).dynamic_state(&dynamic).push_next(&mut rendering);
+-        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE)
++        self.library(info, vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE, Use::Draw)
+     }
+ 
+     pub(super) fn link(&self, parts: &[vk::Pipeline; 4], layout: vk::PipelineLayout) -> Result<vk::Pipeline, vk::Result> {
+@@ -272,6 +304,41 @@ impl Shared {
+         unsafe { self.device.create_graphics_pipelines(self.cache, &[info], None) }.map(|p| p[0]).map_err(|(_, e)| e)
+     }
+ 
++    pub(super) fn record_use(&self, id: vk::ShaderModule) {
++        use ash::vk::Handle;
++        if id == vk::ShaderModule::null() {
++            return;
++        }
++        if self.used.lock().unwrap().insert(id.as_raw()) {
++            self.used_dirty.store(true, Ordering::Relaxed);
++            let mut saved = self.used_saved.lock().unwrap();
++            if saved.elapsed() > std::time::Duration::from_secs(30) {
++                *saved = std::time::Instant::now();
++                drop(saved);
++                self.save_used();
++            }
++        }
++    }
++
++    fn is_used(&self, id: vk::ShaderModule) -> bool {
++        use ash::vk::Handle;
++        self.used.lock().unwrap().contains(&id.as_raw())
++    }
++
++    pub(super) fn save_used(&self) {
++        if !self.used_dirty.swap(false, Ordering::Relaxed) {
++            return;
++        }
++        let Some(path) = used_file() else { return };
++        let mut ids: Vec<u64> = self.used.lock().unwrap().iter().copied().collect();
++        ids.sort_unstable();
++        let text: String = ids.iter().map(|i| format!("{i:016x}\n")).collect();
++        let tmp = path.with_extension("tmp");
++        if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
++            let _ = std::fs::remove_file(&tmp);
++        }
++    }
++
+     /// Everything this owns.
+     unsafe fn destroy(&self) {
+         unsafe {
+@@ -313,6 +380,11 @@ impl Gpl {
+                 pre: Default::default(),
+                 frag: Default::default(),
+                 on_demand: AtomicUsize::new(0),
++                used: Default::default(),
++                used_known: AtomicBool::new(false),
++                used_dirty: AtomicBool::new(false),
++                used_saved: Mutex::new(std::time::Instant::now()),
++                warmed: Default::default(),
+                 preloaded: AtomicUsize::new(0),
+             }),
+             eds3,
+@@ -338,8 +410,10 @@ impl Gpl {
+ 
+     pub(super) fn pipeline(&mut self, key: &PipelineKey, vs: &[u32], fs: Option<&[u32]>) -> Result<vk::Pipeline, String> {
+         let (vset, fset, _) = self.layouts.get(&key.layout).cloned().ok_or("pipeline layout not from the library path")?;
+-        let pre = self.shared.pre(key.vertex, vs, &vset, key.depth_clamp, true).map_err(|e| format!("vertex library: {e:?}"))?;
+-        let frag = self.shared.frag(key.fragment, fs, &fset, key.alpha_test, true).map_err(|e| format!("fragment library: {e:?}"))?;
++        self.shared.record_use(key.vertex);
++        self.shared.record_use(key.fragment);
++        let pre = self.shared.pre(key.vertex, vs, &vset, key.depth_clamp, Use::Draw).map_err(|e| format!("vertex library: {e:?}"))?;
++        let frag = self.shared.frag(key.fragment, fs, &fset, key.alpha_test, Use::Draw).map_err(|e| format!("fragment library: {e:?}"))?;
+         let vi_key = (key.attributes.clone(), key.bindings.clone(), key.topology);
+         let vi = match self.vertex_inputs.get(&vi_key) {
+             Some(&p) => p,
+@@ -369,34 +443,73 @@ impl Gpl {
+             return;
+         };
+         let total = programs.1.len();
++        // parts seen in use by earlier sessions
++        if let Some(text) = used_file().and_then(|f| std::fs::read_to_string(f).ok()) {
++            let mut used = self.shared.used.lock().unwrap();
++            used.extend(text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()));
++            self.shared.used_known.store(!used.is_empty(), Ordering::Relaxed);
++        }
++        let known = self.shared.used.lock().unwrap().len();
+         PRELOAD_TOTAL.store(total, Ordering::Relaxed);
+         PRELOAD_DONE.store(0, Ordering::Relaxed);
+-        eprintln!("kirikae: compiling {total} shader programs from {} in the background", file.display());
++        eprintln!(
++            "kirikae: {total} shader programs in {}; {}",
++            file.display(),
++            if known > 0 { format!("compiling the {known} parts the game uses now, the rest in the background") } else { "no record of used shaders yet: compiling all of them now".to_string() }
++        );
+         let programs = Arc::new(programs);
+         let next = Arc::new(AtomicUsize::new(0));
+         let failed = Arc::new(AtomicUsize::new(0));
++        let finished = Arc::new(AtomicUsize::new(0));
++        let deferred = Arc::new(Mutex::new(Vec::<usize>::new()));
+         let start = std::time::Instant::now();
+         let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(2).clamp(1, 32);
++        let warmers = (threads / 2).max(1);
+         for i in 0..threads {
+-            let (programs, next, failed, stop, shared) = (programs.clone(), next.clone(), failed.clone(), self.stop.clone(), self.shared.clone());
++            let (programs, next, failed, finished, deferred, stop, shared) =
++                (programs.clone(), next.clone(), failed.clone(), finished.clone(), deferred.clone(), self.stop.clone(), self.shared.clone());
+             let w = std::thread::Builder::new().name(format!("kirikae-shaders-{i}")).stack_size(64 << 20).spawn(move || {
+                 while !stop.load(Ordering::Relaxed) {
+                     let k = next.fetch_add(1, Ordering::Relaxed);
+-                    let Some(&(start_at, len)) = programs.1.get(k) else { return };
+-                    let code = &programs.0[start_at..start_at + len];
+-                    if compile_program(&shared, code).is_err() {
+-                        failed.fetch_add(1, Ordering::Relaxed);
++                    let Some(&(start_at, len)) = programs.1.get(k) else { break };
++                    match compile_program(&shared, &programs.0[start_at..start_at + len], false) {
++                        Ok(true) => {}
++                        Ok(false) => deferred.lock().unwrap().push(k),
++                        Err(()) => {
++                            failed.fetch_add(1, Ordering::Relaxed);
++                        }
+                     }
+-                    let done = PRELOAD_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+-                    if done == programs.1.len() {
+-                        eprintln!(
+-                            "kirikae: compiled {done} shader programs in {:.1} s ({} unique parts, {} not compiled), process memory {} MB",
+-                            start.elapsed().as_secs_f64(),
+-                            shared.preloaded.load(Ordering::Relaxed),
+-                            failed.load(Ordering::Relaxed),
+-                            process_memory_mb()
+-                        );
++                    PRELOAD_DONE.fetch_add(1, Ordering::Relaxed);
++                }
++                if finished.fetch_add(1, Ordering::Relaxed) + 1 == threads {
++                    eprintln!(
++                        "kirikae: shaders ready in {:.1} s: {} parts compiled, {} left for the background, {} not compiled; process memory {} MB",
++                        start.elapsed().as_secs_f64(),
++                        shared.preloaded.load(Ordering::Relaxed),
++                        deferred.lock().unwrap().len(),
++                        failed.load(Ordering::Relaxed),
++                        process_memory_mb()
++                    );
++                }
++                if i >= warmers {
++                    return;
++                }
++                // background: wait for the startup pass, then fill the driver cache with the rest
++                while finished.load(Ordering::Relaxed) < threads && !stop.load(Ordering::Relaxed) {
++                    std::thread::sleep(std::time::Duration::from_millis(50));
++                }
++                lower_priority();
++                let warm_start = std::time::Instant::now();
++                loop {
++                    if stop.load(Ordering::Relaxed) {
++                        return;
+                     }
++                    let Some(k) = deferred.lock().unwrap().pop() else { break };
++                    let (start_at, len) = programs.1[k];
++                    let _ = compile_program(&shared, &programs.0[start_at..start_at + len], true);
++                }
++                if finished.fetch_add(1, Ordering::Relaxed) + 1 == threads + warmers {
++                    eprintln!("kirikae: background shader compile done in {:.0} s ({} parts), process memory {} MB", warm_start.elapsed().as_secs_f64(), PARTS_WARMED.load(Ordering::Relaxed), process_memory_mb());
+                 }
+             });
+             if let Ok(w) = w {
+@@ -407,6 +520,7 @@ impl Gpl {
+ 
+     pub(super) fn stop(&mut self) {
+         self.stop.store(true, Ordering::Relaxed);
++        self.shared.save_used();
+         for w in self.workers.drain(..) {
+             let _ = w.join();
+         }
+@@ -458,6 +572,26 @@ pub fn process_memory_mb() -> u64 {
+     }
+ }
+ 
++/// `<exe>.shaders-used`: one shader-part id (16 hex digits) per line.
++fn used_file() -> Option<std::path::PathBuf> {
++    let exe = std::env::current_exe().ok()?;
++    let stem = exe.file_stem()?.to_string_lossy().into_owned();
++    Some(exe.with_file_name(format!("{stem}.shaders-used")))
++}
++
++#[cfg(windows)]
++fn lower_priority() {
++    unsafe extern "system" {
++        fn GetCurrentThread() -> isize;
++        fn SetThreadPriority(thread: isize, priority: i32) -> i32;
++    }
++    // SAFETY: lowers this thread's own priority (THREAD_PRIORITY_LOWEST).
++    unsafe { SetThreadPriority(GetCurrentThread(), -2) };
++}
++
++#[cfg(not(windows))]
++fn lower_priority() {}
++
+ /// `b"KSH1"`, u32 count, then u32 length + bytes per program.
+ fn parse_programs(data: &[u8]) -> Option<(Vec<u8>, Vec<(usize, usize)>)> {
+     if data.get(..4)? != b"KSH1" {
+@@ -476,7 +610,10 @@ fn parse_programs(data: &[u8]) -> Option<(Vec<u8>, Vec<(usize, usize)>)> {
+     Some((data.to_vec(), out))
+ }
+ 
+-fn compile_program(shared: &Shared, code: &[u8]) -> Result<(), ()> {
++/// Startup: compile parts known to be used (or everything when nothing is known yet) and
++/// keep them; returns Ok(false) for a part left for the background. Background: compile into
++/// the driver's cache only, unless the game has started using the part meanwhile.
++fn compile_program(shared: &Shared, code: &[u8], background: bool) -> Result<bool, ()> {
+     let header = kirikae_maxwell::sph::Header::parse(code).ok_or(())?;
+     let stage = match header.shader_type() {
+         1 => Stage::Vertex,
+@@ -488,20 +625,31 @@ fn compile_program(shared: &Shared, code: &[u8]) -> Result<(), ()> {
+         return Err(());
+     }
+     let id = shared.id(&shader.spirv);
++    let keep = !shared.used_known.load(Ordering::Relaxed) || shared.is_used(id);
++    if !background && !keep {
++        return Ok(false);
++    }
++    let why = if keep { Use::Preload } else { Use::Warm };
++    if why == Use::Warm {
++        use ash::vk::Handle;
++        if !shared.warmed.lock().unwrap().insert(id.as_raw()) {
++            return Ok(true);
++        }
++    }
+     let base = if stage == Stage::Fragment { FRAGMENT_BASE } else { VERTEX_BASE };
+     let set = set_key(bindings_of(&shader, base), stage);
+     match stage {
+         Stage::Vertex => {
+-            shared.pre(id, &shader.spirv, &set, false, false).map_err(|_| ())?;
++            shared.pre(id, &shader.spirv, &set, false, why).map_err(|_| ())?;
+             if !shared.clamp_dynamic {
+-                shared.pre(id, &shader.spirv, &set, true, false).map_err(|_| ())?;
++                shared.pre(id, &shader.spirv, &set, true, why).map_err(|_| ())?;
+             }
+         }
+         _ => {
+-            shared.frag(id, Some(&shader.spirv), &set, [7, 0], false).map_err(|_| ())?;
++            shared.frag(id, Some(&shader.spirv), &set, [7, 0], why).map_err(|_| ())?;
+         }
+     }
+-    Ok(())
++    Ok(true)
+ }
+ 
+ impl Renderer {
+@@ -540,7 +688,7 @@ mod tests {
+         let mut fs = Vec::new();
+         for &(at, len) in progs.iter().take(limit) {
+             let code = &bytes[at..at + len];
+-            if compile_program(&g.shared, code).is_err() {
++            if compile_program(&g.shared, code, false).is_err() {
+                 fails += 1;
+             }
+             let h = kirikae_maxwell::sph::Header::parse(code).unwrap();
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index e5d8734..63c6f27 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -270,12 +270,13 @@ fn start_stats(p: &'static Process) {
+                 p.stats.interpreted.load(Ordering::Relaxed),
+             );
+             {
+-                use crate::gpu::vulkan::gpl::{LINKED, PARTS_ON_DEMAND, PARTS_PRELOADED};
++                use crate::gpu::vulkan::gpl::{LINKED, PARTS_ON_DEMAND, PARTS_PRELOADED, PARTS_WARMED};
+                 eprintln!(
+-                    "kirikae:         smoothness: {} frames over 33 ms, {} over 100 ms; shaders: {} compiled ahead, {} compiled while playing, {} pipelines linked; memory {} MB",
++                    "kirikae:         smoothness: {} frames over 33 ms, {} over 100 ms; shaders: {} compiled ahead, {} in the background, {} compiled while playing, {} pipelines linked; memory {} MB",
+                     crate::display::HITCHES.load(Ordering::Relaxed),
+                     crate::display::BIG_HITCHES.load(Ordering::Relaxed),
+                     PARTS_PRELOADED.load(Ordering::Relaxed),
++                    PARTS_WARMED.load(Ordering::Relaxed),
+                     PARTS_ON_DEMAND.load(Ordering::Relaxed),
+                     LINKED.load(Ordering::Relaxed),
+                     crate::gpu::vulkan::gpl::process_memory_mb(),

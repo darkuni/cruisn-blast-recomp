@@ -291,3 +291,14 @@ In race slow frames about 18% of the main thread samples were in system code and
 runtime itself. Those addresses are now named with dbghelp (system DLL exports, and the
 runtime functions from the PDB the build writes), per slow frame and in an exit summary of
 host code.
+
+## 0021 - compile the shaders the game uses first, the rest in the background
+
+Compiling all 32,501 programs (21-26k unique parts) kept every part in memory: 108 s on the
+first launch and 5-6 GB. Now every part the game draws with is recorded in
+`<exe>.shaders-used` (one id per line: hashes, no game data). On start, only recorded parts are
+compiled and kept behind the "Preparing shaders" screen; the rest compile afterwards on half
+the threads at the lowest priority, straight into the driver's cache (not ours) and are then
+dropped, so a later first use is a driver-cache hit. With no record yet, everything is compiled
+as before. On lavapipe with 3,000 programs: 17.4 s / 1.9 GB without a record, 1.9 s / 110 MB
+with one.
