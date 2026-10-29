@@ -12,3 +12,9 @@ __pycache__/
 *.profile
 # recorded game shaders (derived from the game)
 *.pipelines
+# tester packages (contain the recompiled exe)
+dist/
+# game files made by setup
+game/
+*.shaders
+romfs.bin

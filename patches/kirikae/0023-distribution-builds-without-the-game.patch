@@ -1,0 +1,359 @@
+diff --git a/crates/kirikae/src/main.rs b/crates/kirikae/src/main.rs
+index 7af80c6..0f1b0d3 100644
+--- a/crates/kirikae/src/main.rs
++++ b/crates/kirikae/src/main.rs
+@@ -31,6 +31,8 @@ usage:
+   kirikae dev extract <dump> <dir>                   write <dir>/exefs and <dir>/romfs
+   kirikae dev module-dump <file> <module> <out>         write a module's loaded image
+   kirikae dev syms <file> [pattern]                     list exported functions
++  kirikae dev external-package <package.bin> <out>      package for distribution: the game's
++                                                     files are read from game/ beside the exe
+ 
+ Only use executables dumped from your own console.";
+ 
+@@ -407,7 +409,18 @@ fn cmd_dev(args: &[String]) -> Result<ExitCode, String> {
+             }
+             Ok(ExitCode::SUCCESS)
+         }
+-        _ => Err("dev commands: simd-cases, simd-check, romfs-ls, romfs-find, extract, module-dump, syms".into()),
++        Some("external-package") => {
++            let input = Path::new(args.get(1).ok_or("missing package.bin")?);
++            let out = Path::new(args.get(2).ok_or("missing output")?);
++            let blob = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
++            let ext = kirikae_loader::package::externalize(&blob, "romfs.bin").map_err(|e| e.to_string())?;
++            std::fs::write(out, &ext).map_err(|e| format!("{}: {e}", out.display()))?;
++            for f in kirikae_loader::package::unpack_external(&ext).map_err(|e| e.to_string())?.files {
++                println!("{:<12} {:>12} bytes  {:016x}", f.name, f.size, f.hash);
++            }
++            Ok(ExitCode::SUCCESS)
++        }
++        _ => Err("dev commands: simd-cases, simd-check, romfs-ls, romfs-find, extract, module-dump, syms, external-package".into()),
+     }
+ }
+ 
+diff --git a/crates/loader/src/package.rs b/crates/loader/src/package.rs
+index 4e9bba6..1325124 100644
+--- a/crates/loader/src/package.rs
++++ b/crates/loader/src/package.rs
+@@ -353,10 +353,158 @@ pub fn unpack(blob: &[u8]) -> Result<Executable, Error> {
+     from_source(&unpack_source(blob)?)
+ }
+ 
++/// A package for distribution: names, sizes and hashes of the ExeFS files instead of the files,
++/// and the RomFS image as a path relative to the game folder. The player supplies the files
++/// from their own dump (`game\exefs\...` and `game\romfs.bin` next to the executable).
++const EXTERNAL_MAGIC: &[u8; 8] = b"KRKEXT01";
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ExternalFile {
++    pub name: String,
++    pub size: u64,
++    pub hash: u64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct External {
++    pub title: Option<u64>,
++    pub files: Vec<ExternalFile>,
++    /// Relative to the game folder.
++    pub romfs: Option<String>,
++}
++
++/// FNV-1a 64: tells one dump version from another (not a security check).
++pub fn file_hash(bytes: &[u8]) -> u64 {
++    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
++    for &b in bytes {
++        h ^= u64::from(b);
++        h = h.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    h
++}
++
++pub fn is_external(blob: &[u8]) -> bool {
++    blob.starts_with(EXTERNAL_MAGIC)
++}
++
++/// Turn a normal embedded package into a distribution package.
++pub fn externalize(blob: &[u8], romfs_name: &str) -> Result<Vec<u8>, Error> {
++    let Source::ExeFs(files, title, romfs) = unpack_source(blob)? else {
++        return Err(Error::Malformed("only ExeFS dumps can be packaged without the game"));
++    };
++    let mut out = EXTERNAL_MAGIC.to_vec();
++    out.extend_from_slice(&title.unwrap_or(0).to_le_bytes());
++    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
++    for (name, bytes) in &files {
++        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
++        out.extend_from_slice(name.as_bytes());
++        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
++        out.extend_from_slice(&file_hash(bytes).to_le_bytes());
++    }
++    let r = if romfs.is_some() { romfs_name } else { "" };
++    out.extend_from_slice(&(r.len() as u16).to_le_bytes());
++    out.extend_from_slice(r.as_bytes());
++    Ok(out)
++}
++
++pub fn unpack_external(blob: &[u8]) -> Result<External, Error> {
++    let bad = || Error::Malformed("bad distribution package");
++    let take = |at: &mut usize, n: usize| -> Result<&[u8], Error> {
++        let s = blob.get(*at..*at + n).ok_or_else(bad)?;
++        *at += n;
++        Ok(s)
++    };
++    let mut at = 0;
++    if take(&mut at, 8)? != EXTERNAL_MAGIC {
++        return Err(bad());
++    }
++    let title = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
++    let count = u32::from_le_bytes(take(&mut at, 4)?.try_into().unwrap());
++    let mut files = Vec::new();
++    for _ in 0..count {
++        let len = u16::from_le_bytes(take(&mut at, 2)?.try_into().unwrap()) as usize;
++        let name = String::from_utf8_lossy(take(&mut at, len)?).into_owned();
++        let size = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
++        let hash = u64::from_le_bytes(take(&mut at, 8)?.try_into().unwrap());
++        files.push(ExternalFile { name, size, hash });
++    }
++    let len = u16::from_le_bytes(take(&mut at, 2)?.try_into().unwrap()) as usize;
++    let romfs = String::from_utf8_lossy(take(&mut at, len)?).into_owned();
++    Ok(External { title: (title != 0).then_some(title), files, romfs: (!romfs.is_empty()).then_some(romfs) })
++}
++
++/// Why the player's game folder does not match what the executable was built from.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Mismatch {
++    Missing(String),
++    Different(String),
++    NoRomFs(String),
++}
++
++impl std::fmt::Display for Mismatch {
++    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
++        match self {
++            Mismatch::Missing(p) => write!(f, "{p} is missing"),
++            Mismatch::Different(p) => write!(f, "{p} is from a different version of the game"),
++            Mismatch::NoRomFs(p) => write!(f, "{p} is missing"),
++        }
++    }
++}
++
++/// Read the ExeFS files from `<game>/exefs/` and check them; the RomFS image is `<game>/<romfs>`.
++pub fn load_external(ext: &External, game: &Path) -> Result<Source, Mismatch> {
++    let exefs = game.join("exefs");
++    let mut files = Vec::new();
++    for f in &ext.files {
++        let path = exefs.join(&f.name);
++        let shown = path.display().to_string();
++        let bytes = std::fs::read(&path).map_err(|_| Mismatch::Missing(shown.clone()))?;
++        if bytes.len() as u64 != f.size || file_hash(&bytes) != f.hash {
++            return Err(Mismatch::Different(shown));
++        }
++        files.push((f.name.clone(), bytes));
++    }
++    let romfs = match &ext.romfs {
++        Some(name) => {
++            let image = game.join(name);
++            let size = std::fs::metadata(&image).map_err(|_| Mismatch::NoRomFs(image.display().to_string()))?.len();
++            Some(RomFs { path: std::path::absolute(&image).unwrap_or(image), offset: 0, size, compression: None })
++        }
++        None => None,
++    };
++    Ok(Source::ExeFs(files, ext.title, romfs))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn distribution_package_checks_the_players_files() {
++        let dir = std::env::temp_dir().join(format!("kirikae-ext-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(dir.join("exefs")).unwrap();
++        let romfs = RomFs { path: dir.join("old-romfs.bin"), offset: 0, size: 4, compression: None };
++        let source = Source::ExeFs(vec![("main".into(), b"guest code".to_vec()), ("sdk".into(), b"sdk".to_vec())], Some(APP_ID), Some(romfs));
++        let ext_blob = externalize(&pack(&source), "romfs.bin").unwrap();
++        assert!(is_external(&ext_blob) && !is_external(&pack(&source)));
++        let ext = unpack_external(&ext_blob).unwrap();
++        assert_eq!(ext.files.len(), 2);
++        assert_eq!(ext.romfs.as_deref(), Some("romfs.bin"));
++        assert!(!String::from_utf8_lossy(&ext_blob).contains("guest code"));
++
++        assert!(matches!(load_external(&ext, &dir), Err(Mismatch::Missing(_))));
++        std::fs::write(dir.join("exefs/main"), b"guest cod3").unwrap();
++        std::fs::write(dir.join("exefs/sdk"), b"sdk").unwrap();
++        assert!(matches!(load_external(&ext, &dir), Err(Mismatch::Different(_))));
++        std::fs::write(dir.join("exefs/main"), b"guest code").unwrap();
++        assert!(matches!(load_external(&ext, &dir), Err(Mismatch::NoRomFs(_))));
++        std::fs::write(dir.join("romfs.bin"), b"romfs image").unwrap();
++        let Source::ExeFs(files, title, Some(r)) = load_external(&ext, &dir).unwrap() else { panic!() };
++        assert_eq!((files[0].1.as_slice(), title, r.size), (&b"guest code"[..], Some(APP_ID), 11));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     const APP_ID: u64 = 0x0100_0000_0000_0000;
+ 
+     #[test]
+diff --git a/crates/rt/src/launch.rs b/crates/rt/src/launch.rs
+new file mode 100644
+index 0000000..3738030
+--- /dev/null
++++ b/crates/rt/src/launch.rs
+@@ -0,0 +1,94 @@
++//! Starting a distribution build: the game's files come from a `game` folder next to the
++//! executable (made by the setup tool from the player's own dump), the log goes to
++//! `<exe name>.log` when there is no console, and startup problems are shown in a message box.
++
++use std::path::PathBuf;
++
++/// The folder holding the player's `exefs\` and `romfs.bin`.
++pub fn game_folder() -> PathBuf {
++    if let Some(p) = crate::env_var!("KIRIKAE_GAME") {
++        return p.into();
++    }
++    let exe = std::env::current_exe().unwrap_or_default();
++    exe.parent().map(|d| d.join("game")).unwrap_or_else(|| PathBuf::from("game"))
++}
++
++pub fn log_path() -> Option<PathBuf> {
++    let exe = std::env::current_exe().ok()?;
++    let stem = exe.file_stem()?.to_string_lossy().into_owned();
++    Some(exe.with_file_name(format!("{stem}.log")))
++}
++
++/// Without a console (started from Explorer), send stdout and stderr to the log file.
++pub fn log_without_console() {
++    #[cfg(windows)]
++    win::log_without_console();
++}
++
++/// Tell the player something went wrong before the window opened, and quit.
++pub fn fail(text: &str) -> ! {
++    eprintln!("kirikae: {text}");
++    #[cfg(windows)]
++    win::message_box(text);
++    std::process::exit(3)
++}
++
++#[cfg(windows)]
++mod win {
++    use std::ffi::c_void;
++    use std::os::windows::ffi::OsStrExt;
++    use std::os::windows::io::IntoRawHandle;
++
++    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
++    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
++    const MB_OK: u32 = 0;
++    const MB_ICONERROR: u32 = 0x10;
++
++    unsafe extern "system" {
++        fn GetStdHandle(which: u32) -> *mut c_void;
++        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
++        fn GetFileType(handle: *mut c_void) -> u32;
++    }
++    #[link(name = "user32")]
++    unsafe extern "system" {
++        fn MessageBoxW(owner: *mut c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
++    }
++
++    fn missing(h: *mut c_void) -> bool {
++        // NULL (GUI program), INVALID_HANDLE_VALUE, or a handle of unknown type.
++        h.is_null() || h as isize == -1 || unsafe { GetFileType(h) } == 0
++    }
++
++    pub fn log_without_console() {
++        let (out, err) = unsafe { (GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE)) };
++        if !missing(err) {
++            return;
++        }
++        let Some(path) = super::log_path() else { return };
++        let Ok(file) = std::fs::File::create(&path) else { return };
++        let h = file.into_raw_handle();
++        unsafe {
++            SetStdHandle(STD_ERROR_HANDLE, h);
++            if missing(out) {
++                SetStdHandle(STD_OUTPUT_HANDLE, h);
++            }
++        }
++        // Nobody sees a panic message without a console: say where it went.
++        let default = std::panic::take_hook();
++        std::panic::set_hook(Box::new(move |info| {
++            default(info);
++            static SHOWN: std::sync::Once = std::sync::Once::new();
++            SHOWN.call_once(|| message_box(&format!("The game crashed. Details are in {}.", path.display())));
++        }));
++    }
++
++    fn wide(s: &str) -> Vec<u16> {
++        std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
++    }
++
++    pub fn message_box(text: &str) {
++        let name = std::env::current_exe().ok().and_then(|e| e.file_stem().map(|s| s.to_string_lossy().into_owned()));
++        let (t, c) = (wide(text), wide(name.as_deref().unwrap_or("kirikae")));
++        unsafe { MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR) };
++    }
++}
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index 7ece5b7..e3b6f24 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod input;
+ pub mod interp;
+ pub mod ipc;
+ pub mod kernel;
++pub mod launch;
+ pub mod mem;
+ pub mod nvn;
+ pub mod process;
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index 63c6f27..671e519 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -614,11 +614,30 @@ pub fn run_executable(exe: &Executable, entries: &'static [Entry], opts: RunOpti
+ }
+ 
+ pub fn program_main(package: &'static [u8], entries: &'static [Entry]) -> ! {
+-    let exe = match kirikae_loader::package::unpack(package) {
+-        Ok(exe) => exe,
+-        Err(e) => {
+-            eprintln!("kirikae: the embedded executable is damaged: {e}");
+-            std::process::exit(3)
++    crate::launch::log_without_console();
++    let exe = if kirikae_loader::package::is_external(package) {
++        let game = crate::launch::game_folder();
++        let source = kirikae_loader::package::unpack_external(package)
++            .map_err(|e| format!("the executable is damaged: {e}"))
++            .and_then(|ext| {
++                kirikae_loader::package::load_external(&ext, &game).map_err(|m| {
++                    format!(
++                        "The game files are not set up: {m}.\n\nRun setup.exe next to this program with your own Cruis'n Blast v2.0.0 dump (base game and update NSPs plus your prod.keys). It creates {}.",
++                        game.display()
++                    )
++                })
++            });
++        match source.and_then(|s| kirikae_loader::package::from_source(&s).map_err(|e| format!("the game files cannot be loaded: {e}"))) {
++            Ok(exe) => exe,
++            Err(e) => crate::launch::fail(&e),
++        }
++    } else {
++        match kirikae_loader::package::unpack(package) {
++            Ok(exe) => exe,
++            Err(e) => {
++                eprintln!("kirikae: the embedded executable is damaged: {e}");
++                std::process::exit(3)
++            }
+         }
+     };
+     crate::coverage::start();
+@@ -635,9 +654,6 @@ pub fn program_main(package: &'static [u8], entries: &'static [Entry]) -> ! {
+             }
+             std::process::exit(r.exit_code)
+         }
+-        Err(e) => {
+-            eprintln!("kirikae: {e}");
+-            std::process::exit(3)
+-        }
++        Err(e) => crate::launch::fail(&e.to_string()),
+     }
+ }

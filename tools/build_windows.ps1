@@ -139,3 +139,4 @@ if (Test-Path $shaders) {
 }
 Write-Host ("`nDone in {0:N1} min: {1}" -f $sw.Elapsed.TotalMinutes, (Join-Path $Out 'cruisn-blast.exe')) -ForegroundColor Green
 Write-Host 'Run it with:  powershell -ExecutionPolicy Bypass -File tools\run.ps1'
+Write-Host 'Package it for testers with:  powershell -ExecutionPolicy Bypass -File tools\package.ps1'

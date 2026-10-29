@@ -73,6 +73,21 @@ builds it, and recompiles `extracted_v2` with `tools\cruisn-blast.profile`
 (generate it with `tools/il2cpp_profile.py`). `run.ps1` runs the result with exit
 backtraces and stats on, logging to `run.log`.
 
+## Packaging for testers
+
+```
+powershell -ExecutionPolicy Bypass -File tools\package.ps1
+```
+
+Makes `dist\CruisnBlast-<date>.zip` after a build: `cruisn-blast.exe`, `setup.exe`,
+`cruisn-blast.shaders-used` and a readme. The packaged exe carries the recompiled code and the
+runtime but none of the game's files: it reads `game\exefs\` (checked against v2.0.0) and
+`game\romfs.bin` next to itself, runs without a console and logs to `cruisn-blast.log`.
+`setup.exe` (`tools/setup_game.py`, frozen with PyInstaller) makes `game\` and
+`cruisn-blast.shaders` from the player's own base and update NSPs and `prod.keys`, without
+writing the RomFS out as loose files (39 s on the development PC). The tester instructions
+are `tools/README-testers.txt`.
+
 ## Status
 
 - Recompiles: 247,852 functions, 95.2% of guest instructions reachable, 587 MB x86 text, links.
@@ -81,7 +96,7 @@ backtraces and stats on, logging to `run.log`.
 - Playable on Windows (i9-13900K / RTX 4070 Ti) at 60 fps: boot, menus, car select with the
   3D car and the rendered car icons in the selector, races with the full 3D scene,
   post-processing and HUD; FMOD audio works
-- Kirikae patches 0001-0014 (see `patches/kirikae/README.md`): function discovery, bindless
+- Kirikae patches 0001-0023 (see `patches/kirikae/README.md`): function discovery, bindless
   textures (NVN texture|sampler handles), TLD/TXQ, compressed-texture aliasing, layout-aware
   inline uploads, MSAA resolve blits, render-target write-back for copy-engine reads, plus
   diagnostics
@@ -89,15 +104,19 @@ backtraces and stats on, logging to `run.log`.
   aspect ratio, VSync, fullscreen, scaling, anisotropic filtering, frame rate, vibration,
   A/B swap, frame-rate display, keyboard and controller rebinding. Saved to
   `build\cruisn-blast.ini`
-- Every shader in the game compiles at startup: `tools/extract_shaders.py` (run by the build)
-  pulls all 32,501 Switch shader programs out of the game's Unity data into
-  `build\cruisn-blast.shaders`, and the runtime compiles them as Vulkan pipeline libraries
-  behind a "Preparing shaders" screen on the first launch, so nothing compiles mid-race
-  (patch 0014). The `.pipelines` recording (0013) remains the fallback for drivers without
-  pipeline library support
+- Every shader in the game is prepared at startup: `tools/extract_shaders.py` (run by the build,
+  and by `setup.exe` for testers) pulls all 32,501 Switch shader programs out of the game's
+  Unity data into `cruisn-blast.shaders`, and the runtime compiles them as Vulkan pipeline
+  libraries. The parts the game is known to draw with (`tools/cruisn-blast.shaders-used`,
+  hashes only) compile behind a "Preparing shaders" screen (2.7 s on an i9-13900K / RTX 4070 Ti),
+  the rest in the background at low priority (5 s). The `.pipelines` recording (0013) remains
+  the fallback for drivers without pipeline library support
+- Profanity filter (`nn::ngc`) replaced, which fixed the crash after a race (0016)
 - Open issues:
-  - First-launch shader compile time and memory on real hardware still to be measured
-    (the stats line reports both)
+  - Short in-race hitches (about 30 slow frames over 100 ms per race) are bursts of the game's
+    own main-thread work, not shader compiles; the Switch version drops frames at the same
+    moments. A later pass can make the recompiled code faster (more vector instructions
+    translated instead of interpreted)
   - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
     unpatched Kirikae
 

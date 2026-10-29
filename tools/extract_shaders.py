@@ -91,15 +91,15 @@ def programs_in(blob, segments):
             m = nxt
 
 
-def main():
-    if len(sys.argv) != 3:
-        sys.exit(__doc__)
-    data, out = sys.argv[1], sys.argv[2]
-    start = time.time()
+def extract(sources, out, progress=None):
+    """sources: (name, path or bytes) pairs of Unity files. Writes `out`, returns
+    (shader objects, programs)."""
     seen_blobs, programs, order = set(), {}, []
     shaders = 0
-    for name in unity_files(data):
-        env = UnityPy.load(os.path.join(data, name))
+    for name, data in sources:
+        if progress:
+            progress(name)
+        env = UnityPy.load(data)
         for obj in env.objects:
             if obj.type.name != "Shader":
                 continue
@@ -122,7 +122,29 @@ def main():
         for h in order:
             f.write(struct.pack("<I", len(programs[h])) + programs[h])
     os.replace(out + ".tmp", out)
-    print(f"{shaders} shaders, {len(order)} programs -> {out} ({os.path.getsize(out) >> 20} MB, {time.time() - start:.0f} s)")
+    return shaders, len(order)
+
+
+def is_unity_file(rel):
+    """`rel`: path under Data/ with forward slashes (same selection as unity_files)."""
+    parts = rel.split("/")
+    if rel.endswith(".resS"):
+        return False
+    if len(parts) == 1:
+        n = parts[0]
+        return n.startswith("level") or n.endswith(".assets") or n.startswith("globalgamemanagers")
+    if len(parts) == 4 and parts[:2] == ["StreamingAssets", "aa"]:
+        return parts[3].endswith(".bundle")
+    return len(parts) == 2 and parts[0] == "Resources"
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    data, out = sys.argv[1], sys.argv[2]
+    start = time.time()
+    shaders, count = extract(((n, os.path.join(data, n)) for n in unity_files(data)), out)
+    print(f"{shaders} shaders, {count} programs -> {out} ({os.path.getsize(out) >> 20} MB, {time.time() - start:.0f} s)")
 
 
 if __name__ == "__main__":

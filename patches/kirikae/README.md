@@ -314,3 +314,15 @@ unconditionally; across-lanes reductions, narrowing shifts, high-half arithmetic
 and TBL too). These now use a 16-lane stack array (`Lanes`) and a fixed [u128; 4] table.
 a64 tests pass. Also: sampler names the module of system symbols from the address, and the
 Win32 declarations match the existing ones (no redeclaration warnings).
+
+## 0023 - distribution builds without the game
+
+A recompiled exe embeds `package.bin`: the game's ExeFS files and the absolute path of the
+RomFS image. For testers the exe must carry neither. `kirikae dev external-package` turns
+`package.bin` into a list of ExeFS file names, sizes and FNV-1a hashes plus a RomFS name
+(`romfs.bin`); `tools/package.ps1` links the distribution exe with it. At startup that exe
+reads `game\exefs\*` next to itself (or `KIRIKAE_GAME`), refuses files of another game
+version, and opens `game\romfs.bin` (any valid RomFS image: the game mounts the raw storage).
+Problems before the window opens are shown in a message box. When the process has no
+stderr (GUI subsystem, started from Explorer), stdout and stderr go to `<exe>.log`, and a
+panic shows a message box naming the log. Development builds are unchanged.
