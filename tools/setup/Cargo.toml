@@ -1,0 +1,16 @@
+[package]
+name = "setup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Makes the game folder for the native PC build of Cruis'n Blast from the player's own NSPs and prod.keys"
+
+[dependencies]
+aes = "0.8"
+ctr = "0.9"
+xts-mode = "0.5"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3

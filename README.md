@@ -83,9 +83,10 @@ Makes `dist\CruisnBlast-<date>.zip` after a build: `cruisn-blast.exe`, `setup.ex
 `cruisn-blast.shaders-used` and a readme. The packaged exe carries the recompiled code and the
 runtime but none of the game's files: it reads `game\exefs\` (checked against v2.0.0) and
 `game\romfs.bin` next to itself, runs without a console and logs to `cruisn-blast.log`.
-`setup.exe` (`tools/setup_game.py`, frozen with PyInstaller) makes `game\` and
+`setup.exe` (`tools/setup`, Rust, built by `package.ps1`; testers need nothing installed) makes `game\` and
 `cruisn-blast.shaders` from the player's own base and update NSPs and `prod.keys`, without
-writing the RomFS out as loose files (39 s on the development PC). The tester instructions
+writing the RomFS out as loose files (30 s on the development PC; every RomFS file and the
+shader set checked identical to the Python tools' output). The tester instructions
 are `tools/README-testers.txt`.
 
 ## Status

@@ -7,10 +7,9 @@
 #   cruisn-blast.exe            the recompiled game code and runtime (no console window). It does
 #                               not contain the game's files: it reads them from game\ next to it
 #   setup.exe                   makes game\ and the shader file from the player's own NSPs + keys
+#                               (tools\setup, Rust; no Python needed)
 #   cruisn-blast.shaders-used   which shaders to compile behind the start screen (hashes only)
 #   README.txt, THIRD_PARTY_NOTICES.txt
-#
-# Needs Python (winget install --id Python.Python.3.12 -e) to build setup.exe.
 
 param(
     [string]$Root = (Split-Path -Parent $PSScriptRoot)
@@ -30,12 +29,12 @@ function Fail($msg) { Write-Host "`nSTOP: $msg" -ForegroundColor Red; exit 1 }
 foreach ($p in @((Join-Path $Project 'Cargo.toml'), (Join-Path $Project 'src\package.bin'), (Join-Path $Project 'objects.txt'), $Kirikae)) {
     if (-not (Test-Path $p)) { Fail "missing $p - run tools\build_windows.ps1 first" }
 }
-$py = Get-Command py -ErrorAction SilentlyContinue
-if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
-if (-not $py) { Fail 'Python not found (needed for setup.exe): winget install --id Python.Python.3.12 -e' }
 
-if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
+# Only these files are packaged. Anything else in dist\CruisnBlast (your NSPs, game\, logs from
+# trying it) is left alone and never goes into the zip.
+$Files = @('cruisn-blast.exe', 'setup.exe', 'cruisn-blast.shaders-used', 'README.txt', 'THIRD_PARTY_NOTICES.txt')
 New-Item -ItemType Directory -Force $Out | Out-Null
+foreach ($f in $Files) { Remove-Item (Join-Path $Out $f) -Force -ErrorAction SilentlyContinue }
 
 Step 'Linking the distribution exe (game files read from game\ beside it, no console)'
 $pkg = Join-Path $Project 'src\package.bin'
@@ -74,16 +73,10 @@ try {
 if (-not $ok) { Fail 'the distribution exe was not built - see the error above' }
 
 Step 'Building setup.exe'
-$work = Join-Path $Dist 'setup-work'
-& $py.Source -m pip install --quiet --upgrade pyinstaller UnityPy lz4 cryptography
-if ($LASTEXITCODE) { Fail 'pip install failed' }
-Push-Location $Tools
-try {
-    & $py.Source -m PyInstaller --onefile --console --name setup --collect-all UnityPy --collect-all lz4 `
-        --distpath $Out --workpath $work --specpath $work -y (Join-Path $Tools 'setup_game.py')
-} finally { Pop-Location }
-if (-not (Test-Path (Join-Path $Out 'setup.exe'))) { Fail 'PyInstaller did not produce setup.exe' }
-Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+Push-Location (Join-Path $Tools 'setup')
+try { cargo build --release } finally { Pop-Location }
+if ($LASTEXITCODE) { Fail 'setup.exe build failed - see the error above' }
+Copy-Item (Join-Path $Target 'release\setup.exe') (Join-Path $Out 'setup.exe') -Force
 
 Step 'Readme and notices'
 # The list grows as the game is played: take the one next to the development build if there is one.
@@ -97,13 +90,12 @@ if (Test-Path $notices) { Copy-Item $notices (Join-Path $Out 'THIRD_PARTY_NOTICE
 Step 'Zip'
 $zip = Join-Path $Dist ("CruisnBlast-{0}.zip" -f (Get-Date -Format 'yyyy-MM-dd'))
 if (Test-Path $zip) { Remove-Item $zip -Force }
+$members = $Files | Where-Object { Test-Path (Join-Path $Out $_) } | ForEach-Object { "CruisnBlast/$_" }
 Push-Location $Dist
-try { tar.exe -a -c -f $zip CruisnBlast } finally { Pop-Location }
+try { tar.exe -a -c -f $zip @members } finally { Pop-Location }
 if ($LASTEXITCODE -or -not (Test-Path $zip)) { Fail 'zip failed' }
-
-# Nothing from the game may be in the package.
-$bad = Get-ChildItem -Recurse $Out | Where-Object { $_.Name -match '\.(shaders|nsp|nca|keys|pipelines|profile)$' -or $_.Name -eq 'romfs.bin' -or $_.Name -eq 'game' }
-if ($bad) { Fail ("game-derived files in the package: " + ($bad.Name -join ', ')) }
+$listed = tar.exe -t -f $zip
+Write-Host ($listed -join "`n")
 
 $mb = [math]::Round((Get-Item $zip).Length / 1MB)
 Write-Host ("`nDone: $zip ($mb MB)") -ForegroundColor Green
