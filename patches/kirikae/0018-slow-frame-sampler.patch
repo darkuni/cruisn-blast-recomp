@@ -1,0 +1,336 @@
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index ecce9e1..bee8560 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -31,9 +31,11 @@ pub static HITCHES: AtomicU64 = AtomicU64::new(0);
+ pub static BIG_HITCHES: AtomicU64 = AtomicU64::new(0);
+ static LAST_FRAME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+ 
+-fn note_frame() {
++fn note_frame() -> bool {
+     let now = std::time::Instant::now();
++    let mut slow = false;
+     if let Some(last) = LAST_FRAME.lock().unwrap().replace(now) {
++        slow = now - last > std::time::Duration::from_millis(50);
+         LONGEST.fetch_max((now - last).as_nanos() as u64, Ordering::Relaxed);
+         if now - last > std::time::Duration::from_millis(33) {
+             HITCHES.fetch_add(1, Ordering::Relaxed);
+@@ -46,6 +48,7 @@ fn note_frame() {
+             eprintln!("kirikae: hitch: frame {} took {:.0} ms, ending at {:.3}", FRAMES.load(Ordering::Relaxed), (now - last).as_secs_f64() * 1e3, unix.as_secs_f64());
+         }
+     }
++    slow
+ }
+ 
+ pub fn take_longest_frame() -> std::time::Duration {
+@@ -140,7 +143,8 @@ fn dumps(next: u64) -> bool {
+ 
+ pub fn presented(p: &Process, dump: Option<&Frame>) {
+     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+-    note_frame();
++    let slow = note_frame();
++    crate::sampler::frame(p, slow);
+     if n == 1 {
+         p.warn_once("display: first frame presented (Vulkan swapchain)".to_string());
+     }
+@@ -202,7 +206,8 @@ pub fn start(p: &'static Process, title: String) {
+ 
+ pub fn present(p: &Process, frame: Frame) {
+     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+-    note_frame();
++    let slow = note_frame();
++    crate::sampler::frame(p, slow);
+     if n == 1 {
+         p.warn_once(format!("display: first frame presented ({}x{})", frame.width, frame.height));
+     }
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index aa02121..7ece5b7 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -17,6 +17,7 @@ pub mod gpu;
+ pub mod hle;
+ pub mod ngc;
+ pub mod guest_env;
++pub mod sampler;
+ pub mod horizon;
+ pub mod host1x;
+ pub mod input;
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index f960b3c..e5d8734 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -84,7 +84,7 @@ pub struct Process {
+     pub title_id: u64,
+     code_size: u64,
+     stack_size: u64,
+-    entries: &'static [Entry],
++    pub(crate) entries: &'static [Entry],
+     lookup_cache: Box<[AtomicU32]>,
+     pub(crate) interp_cache: std::sync::RwLock<HashMap<u64, Arc<Insn>>>,
+     pub(crate) heap: Mutex<u64>,
+@@ -603,6 +603,7 @@ pub fn run_executable(exe: &Executable, entries: &'static [Entry], opts: RunOpti
+         Sink::Capture(buf) => std::mem::take(buf),
+         Sink::Stdout => Vec::new(),
+     };
++    crate::sampler::summary(process);
+     Ok(RunResult {
+         exit_code: process.exit_code.load(Ordering::Relaxed),
+         output,
+diff --git a/crates/rt/src/sampler.rs b/crates/rt/src/sampler.rs
+new file mode 100644
+index 0000000..e81f92a
+--- /dev/null
++++ b/crates/rt/src/sampler.rs
+@@ -0,0 +1,232 @@
++//! Sampling profiler for slow frames (Windows, KIRIKAE_SAMPLE=1).
++//!
++//! A sampler thread interrupts every guest thread about every millisecond and records where
++//! its host instruction pointer is. Recompiled code maps back to the guest function it came
++//! from. For each slow frame the hottest guest functions of the busiest thread are logged, so
++//! stalls inside the game's own code can be named.
++
++use std::sync::Mutex;
++
++use crate::process::Process;
++
++#[derive(Clone, Copy)]
++struct Sample {
++    thread: u16,
++    rip: u64,
++}
++
++static SAMPLES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
++static TOTALS: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
++
++pub fn enabled() -> bool {
++    cfg!(windows) && crate::env_var!("KIRIKAE_SAMPLE").is_some()
++}
++
++#[cfg(windows)]
++mod os {
++    use std::ffi::c_void;
++    use std::sync::Mutex;
++
++    pub type Handle = isize;
++
++    #[repr(C, align(16))]
++    pub struct Context([u8; 1232]);
++
++    unsafe extern "system" {
++        fn GetCurrentThreadId() -> u32;
++        fn OpenThread(access: u32, inherit: i32, id: u32) -> Handle;
++        fn SuspendThread(h: Handle) -> u32;
++        fn ResumeThread(h: Handle) -> u32;
++        fn GetThreadContext(h: Handle, ctx: *mut Context) -> i32;
++        fn CloseHandle(h: Handle) -> i32;
++        fn GetModuleHandleA(name: *const u8) -> *const c_void;
++    }
++
++    pub static THREADS: Mutex<Vec<(String, Handle, bool)>> = Mutex::new(Vec::new());
++
++    pub fn register(name: &str) -> usize {
++        // SAFETY: plain Win32 calls on the current thread.
++        let h = unsafe { OpenThread(0x0002 | 0x0008 | 0x0040, 0, GetCurrentThreadId()) };
++        let mut t = THREADS.lock().unwrap();
++        t.push((name.to_string(), h, h != 0));
++        t.len() - 1
++    }
++
++    pub fn unregister(i: usize) {
++        let mut t = THREADS.lock().unwrap();
++        if let Some(e) = t.get_mut(i)
++            && e.2
++        {
++            e.2 = false;
++            // SAFETY: the handle came from OpenThread.
++            unsafe { CloseHandle(e.1) };
++        }
++    }
++
++    /// The thread's instruction pointer, or None.
++    pub fn sample(h: Handle) -> Option<u64> {
++        // SAFETY: suspend, read the control registers, resume; nothing is allocated while the
++        // thread is stopped (it may hold the allocator lock).
++        unsafe {
++            if SuspendThread(h) == u32::MAX {
++                return None;
++            }
++            let mut ctx = Context([0; 1232]);
++            ctx.0[0x30..0x34].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // CONTEXT_CONTROL
++            let ok = GetThreadContext(h, &mut ctx) != 0;
++            ResumeThread(h);
++            ok.then(|| u64::from_le_bytes(ctx.0[0xf8..0x100].try_into().unwrap()))
++        }
++    }
++
++    /// Start and size of the executable image.
++    pub fn image() -> (u64, u64) {
++        // SAFETY: reading the PE headers of the loaded executable.
++        unsafe {
++            let base = GetModuleHandleA(std::ptr::null()) as *const u8;
++            let pe = base.add(u32::from_le_bytes(*(base.add(0x3c) as *const [u8; 4])) as usize);
++            let size = u32::from_le_bytes(*(pe.add(24 + 56) as *const [u8; 4]));
++            (base as u64, size as u64)
++        }
++    }
++}
++
++/// Called on each guest thread when it starts; returns a token for `unregister`.
++pub fn register(name: &str) -> usize {
++    if !enabled() {
++        return usize::MAX;
++    }
++    #[cfg(windows)]
++    {
++        start();
++        os::register(name)
++    }
++    #[cfg(not(windows))]
++    {
++        let _ = name;
++        usize::MAX
++    }
++}
++
++pub fn unregister(token: usize) {
++    #[cfg(windows)]
++    if token != usize::MAX {
++        os::unregister(token);
++    }
++    let _ = token;
++}
++
++#[cfg(windows)]
++fn start() {
++    static STARTED: std::sync::Once = std::sync::Once::new();
++    STARTED.call_once(|| {
++        let _ = std::thread::Builder::new().name("kirikae-sampler".into()).spawn(|| {
++            let mut handles: Vec<(u16, os::Handle)> = Vec::new();
++            let mut batch: Vec<Sample> = Vec::with_capacity(64);
++            loop {
++                handles.clear();
++                handles.extend(os::THREADS.lock().unwrap().iter().enumerate().filter(|(_, t)| t.2).map(|(i, t)| (i as u16, t.1)));
++                for &(i, h) in &handles {
++                    if let Some(rip) = os::sample(h) {
++                        batch.push(Sample { thread: i, rip });
++                    }
++                }
++                SAMPLES.lock().unwrap().append(&mut batch);
++                std::thread::sleep(std::time::Duration::from_millis(1));
++            }
++        });
++    });
++}
++
++/// Maps host instruction pointers to guest functions.
++struct Map {
++    funcs: Vec<(u64, u64)>,
++    code: (u64, u64),
++    image: (u64, u64),
++}
++
++fn map(p: &Process) -> &'static Map {
++    static MAP: std::sync::OnceLock<Map> = std::sync::OnceLock::new();
++    MAP.get_or_init(|| {
++        let mut funcs: Vec<(u64, u64)> = p.entries.iter().map(|e| (e.func as usize as u64, e.addr)).collect();
++        funcs.sort_unstable();
++        let code = (funcs.first().map_or(0, |f| f.0), funcs.last().map_or(0, |f| f.0 + 0x10000));
++        #[cfg(windows)]
++        let image = os::image();
++        #[cfg(not(windows))]
++        let image = (0, 0);
++        Map { funcs, code, image }
++    })
++}
++
++fn place(p: &Process, rip: u64) -> String {
++    let m = map(p);
++    if (m.code.0..m.code.1).contains(&rip) {
++        let i = m.funcs.partition_point(|f| f.0 <= rip);
++        if let Some(&(_, guest)) = i.checked_sub(1).map(|i| &m.funcs[i]) {
++            return p.describe(guest);
++        }
++    }
++    if (m.image.0..m.image.0 + m.image.1).contains(&rip) {
++        return format!("runtime exe+{:#x}", rip - m.image.0);
++    }
++    "outside the exe (system, driver or waiting)".to_string()
++}
++
++/// Called at each present. For a slow frame, logs the busiest thread's hottest functions.
++pub fn frame(p: &Process, slow: bool) {
++    if !enabled() {
++        return;
++    }
++    let samples = std::mem::take(&mut *SAMPLES.lock().unwrap());
++    if !slow || samples.is_empty() {
++        return;
++    }
++    #[cfg(windows)]
++    let names: Vec<String> = os::THREADS.lock().unwrap().iter().map(|t| t.0.clone()).collect();
++    #[cfg(not(windows))]
++    let names: Vec<String> = Vec::new();
++    let m = map(p);
++    // busiest thread: most samples inside recompiled code
++    let mut per_thread: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
++    for s in &samples {
++        if (m.code.0..m.code.1).contains(&s.rip) || (m.image.0..m.image.0 + m.image.1).contains(&s.rip) {
++            *per_thread.entry(s.thread).or_default() += 1;
++        }
++    }
++    let Some((&thread, _)) = per_thread.iter().max_by_key(|e| *e.1) else { return };
++    let mine: Vec<&Sample> = samples.iter().filter(|s| s.thread == thread).collect();
++    let mut hist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
++    let mut totals = TOTALS.lock().unwrap();
++    let totals = totals.get_or_insert_with(Default::default);
++    for s in &mine {
++        *hist.entry(place(p, s.rip)).or_default() += 1;
++        let i = m.funcs.partition_point(|f| f.0 <= s.rip);
++        if (m.code.0..m.code.1).contains(&s.rip)
++            && let Some(&(_, guest)) = i.checked_sub(1).map(|i| &m.funcs[i])
++        {
++            *totals.entry(guest).or_default() += 1;
++        }
++    }
++    let mut top: Vec<(String, usize)> = hist.into_iter().collect();
++    top.sort_by(|a, b| b.1.cmp(&a.1));
++    let n = mine.len().max(1);
++    let line: Vec<String> = top.iter().take(8).map(|(f, c)| format!("{}% {f}", c * 100 / n)).collect();
++    eprintln!("kirikae:   samples ({}, {} samples): {}", names.get(thread as usize).map_or("?", |s| s.as_str()), mine.len(), line.join(" | "));
++}
++
++/// Hottest guest functions over all slow frames so far.
++pub fn summary(p: &Process) {
++    if !enabled() {
++        return;
++    }
++    let totals = TOTALS.lock().unwrap();
++    let Some(t) = totals.as_ref() else { return };
++    let sum: u64 = t.values().sum::<u64>().max(1);
++    let mut top: Vec<(&u64, &u64)> = t.iter().collect();
++    top.sort_by(|a, b| b.1.cmp(a.1));
++    eprintln!("kirikae: hottest game functions in slow frames ({sum} samples):");
++    for (addr, n) in top.iter().take(40) {
++        eprintln!("kirikae:   {:5.1}%  {}", **n as f64 * 100.0 / sum as f64, p.describe(**addr));
++    }
++}
+diff --git a/crates/rt/src/sched.rs b/crates/rt/src/sched.rs
+index 662e06b..5d52209 100644
+--- a/crates/rt/src/sched.rs
++++ b/crates/rt/src/sched.rs
+@@ -684,6 +684,7 @@ pub fn spawn(p: &'static Process, thread: Arc<KThread>, setup: impl FnOnce(&mut
+     std::thread::Builder::new().name(format!("guest-{}", thread.id)).stack_size(HOST_STACK).spawn(move || {
+         p.sched.gil.acquire(&thread);
+         let mut c = Cpu::new(p, thread.clone());
++        let sample_token = crate::sampler::register(&format!("guest-{}", thread.id));
+         c.x[30] = HALT_PC;
+         c.tpidrro_el0 = thread.tls;
+         setup(&mut c);
+@@ -701,6 +702,7 @@ pub fn spawn(p: &'static Process, thread: Arc<KThread>, setup: impl FnOnce(&mut
+             p.sched.notify();
+             drop(st);
+         }
++        crate::sampler::unregister(sample_token);
+         kernel_exit();
+         p.sched.gil.release(&thread);
+     })

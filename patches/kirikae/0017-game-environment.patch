@@ -1,0 +1,147 @@
+diff --git a/crates/rt/src/guest_env.rs b/crates/rt/src/guest_env.rs
+new file mode 100644
+index 0000000..4bf768b
+--- /dev/null
++++ b/crates/rt/src/guest_env.rs
+@@ -0,0 +1,62 @@
++//! Environment variables for the game's libc `getenv`.
++//!
++//! A Switch game sees no environment. Some of its libraries still read one: IL2CPP's Boehm
++//! garbage collector takes GC_FREE_SPACE_DIVISOR, GC_INITIAL_HEAP_SIZE, GC_PRINT_STATS and
++//! friends from it. The values come from the `[game_environment]` section of the settings file
++//! (and KIRIKAE_GUEST_ENV="NAME=VALUE;NAME=VALUE", which wins).
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++
++use crate::cpu::Cpu;
++use crate::mem::{perm, state};
++use crate::process::Process;
++
++/// Guest page holding the value strings (inside the address space, marked used).
++const STRINGS: u64 = 0x7f_fe00_0000;
++const STRINGS_SIZE: u64 = 0x10000;
++
++pub fn values() -> BTreeMap<String, String> {
++    let mut env = crate::settings::environment();
++    if let Ok(extra) = std::env::var("KIRIKAE_GUEST_ENV") {
++        for kv in extra.split(';') {
++            if let Some((k, v)) = kv.split_once('=') {
++                env.insert(k.trim().to_string(), v.trim().to_string());
++            }
++        }
++    }
++    env
++}
++
++pub fn install(p: &'static Process) {
++    let env = values();
++    let Some(&(addr, _)) = p.symbols.iter().find(|(_, n)| n == "getenv") else { return };
++    if env.is_empty() {
++        return;
++    }
++    if p.memory.map_as(STRINGS, STRINGS_SIZE, state::NORMAL, perm::R).is_err() {
++        p.warn_once("env: cannot map the string page; getenv left alone".to_string());
++        return;
++    }
++    let mut at = STRINGS;
++    let mut table: Vec<(String, u64)> = Vec::new();
++    for (k, v) in &env {
++        let bytes = [v.as_bytes(), &[0]].concat();
++        if at + bytes.len() as u64 > STRINGS + STRINGS_SIZE {
++            break;
++        }
++        p.memory.write(at, &bytes);
++        table.push((k.clone(), at));
++        at += bytes.len() as u64;
++    }
++    eprintln!("kirikae: game environment: {}", env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
++    let table = Arc::new(table);
++    p.hle.replace(
++        addr,
++        Arc::new(move |c: &mut Cpu| {
++            let name = crate::hle::guest_str(c, c.x[0]);
++            c.x[0] = table.iter().find(|(k, _)| *k == name).map_or(0, |(_, a)| *a);
++            c.pc = c.x[30];
++        }),
++    );
++}
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index c378ad2..aa02121 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod games;
+ pub mod gpu;
+ pub mod hle;
+ pub mod ngc;
++pub mod guest_env;
+ pub mod horizon;
+ pub mod host1x;
+ pub mod input;
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index f6f108a..f960b3c 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -558,6 +558,7 @@ pub fn run_executable(exe: &Executable, entries: &'static [Entry], opts: RunOpti
+     }
+     crate::nvn::install(process);
+     crate::ngc::install(process);
++    crate::guest_env::install(process);
+ 
+     let entry = exe.entry;
+     let main = Arc::new(KThread {
+diff --git a/crates/rt/src/settings.rs b/crates/rt/src/settings.rs
+index 83227e5..fe59fd8 100644
+--- a/crates/rt/src/settings.rs
++++ b/crates/rt/src/settings.rs
+@@ -64,6 +64,8 @@ pub struct File {
+     pub settings: Settings,
+     pub keys: BTreeMap<String, String>,
+     pub pad: BTreeMap<String, String>,
++    /// Environment variables the game's libraries see (getenv).
++    pub env: BTreeMap<String, String>,
+ }
+ 
+ pub fn path() -> Option<PathBuf> {
+@@ -128,6 +130,10 @@ pub fn pad() -> BTreeMap<String, String> {
+     with(|f| f.pad.clone())
+ }
+ 
++pub fn environment() -> BTreeMap<String, String> {
++    with(|f| f.env.clone())
++}
++
+ /// Change the settings or bindings and save the file.
+ pub fn update(change: impl FnOnce(&mut File)) {
+     with(|_| ());
+@@ -219,6 +225,10 @@ swap_ab_xy = {}
+     for (k, v) in &f.pad {
+         out += &format!("{k} = {v}\n");
+     }
++    out += "\n[game_environment]\n; Environment variables the game's libraries read (for example the IL2CPP garbage collector's GC_*).\n";
++    for (k, v) in &f.env {
++        out += &format!("{k} = {v}\n");
++    }
+     out
+ }
+ 
+@@ -249,6 +259,11 @@ pub fn parse(text: &str) -> (File, Vec<String>) {
+             f.pad.insert(key, raw_value.to_ascii_lowercase());
+             continue;
+         }
++        if section == "game_environment" {
++            let name = line.split_once('=').map(|(k, _)| k.trim().to_string()).unwrap_or_default();
++            f.env.insert(name, raw_value.to_string());
++            continue;
++        }
+         let value = raw_value.to_ascii_lowercase();
+         let num = |lo: u32, hi: u32| value.parse::<u32>().ok().filter(|v| (lo..=hi).contains(v));
+         let flag = || match value.as_str() {
+@@ -300,6 +315,7 @@ mod tests {
+         f.settings.swap_ab_xy = true;
+         f.keys.insert("a".into(), "Z Space".into());
+         f.pad.insert("zr".into(), "righttrigger".into());
++        f.env.insert("GC_FREE_SPACE_DIVISOR".into(), "1".into());
+         let (back, problems) = parse(&render(&f));
+         assert!(problems.is_empty(), "{problems:?}");
+         assert_eq!(back, f);

@@ -253,3 +253,26 @@ nothing masked, success.
 
 Slow frames (0015) now also list the busiest game threads in that frame by category (native
 code, SVCs, IPC, lock waits, ...), so stalls inside the game can be told apart.
+
+## 0017 - environment variables for the game's getenv
+
+The slow frames in races (0016's per-thread report) are the main game thread running 45-130 ms
+of the game's own code where a normal frame takes ~7 ms, every few seconds, with no rendering,
+file or lock activity: the pattern of garbage collections. Unity's IL2CPP runtime here uses the
+Boehm collector, which reads its tuning from the environment (GC_FREE_SPACE_DIVISOR,
+GC_INITIAL_HEAP_SIZE, GC_PRINT_STATS, GC_ENABLE_INCREMENTAL, GC_PAUSE_TIME_TARGET, ...).
+
+`guest_env.rs` replaces libc `getenv` (when any values are configured) with a host function
+answering from the `[game_environment]` section of the settings file, or
+KIRIKAE_GUEST_ENV="NAME=VALUE;...". Value strings live in a read-only guest page at
+0x7f_fe00_0000.
+
+## 0018 - sampling profiler for slow frames (Windows, KIRIKAE_SAMPLE=1)
+
+GC_FREE_SPACE_DIVISOR=1 barely changed the slow frames (86 vs 99) and GC_PRINT_STATS printed
+nothing, so the collector theory is unconfirmed. With KIRIKAE_SAMPLE=1 a sampler thread
+suspends each guest thread about every millisecond and reads its instruction pointer
+(SuspendThread / GetThreadContext / ResumeThread, nothing allocated while stopped). Pointers in
+recompiled code map back to the guest function (entries sorted by host address); each slow
+frame logs the busiest thread's hottest functions, and the exit summary lists the 40 hottest
+guest functions over all slow frames.
