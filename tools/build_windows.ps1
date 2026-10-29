@@ -76,6 +76,7 @@ try {
     git fetch --quiet origin
     git checkout --quiet --force $base
     git reset --quiet --hard $base
+    git clean -fdq   # files that earlier patch runs added (patches create them fresh)
     foreach ($patch in Get-ChildItem $Patches -Filter '*.patch' | Sort-Object Name) {
         Write-Host "applying $($patch.Name)"
         git apply --whitespace=nowarn $patch.FullName
