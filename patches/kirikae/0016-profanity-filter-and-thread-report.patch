@@ -1,0 +1,149 @@
+diff --git a/crates/rt/src/gpu/vulkan/mod.rs b/crates/rt/src/gpu/vulkan/mod.rs
+index db861c3..027b2cc 100644
+--- a/crates/rt/src/gpu/vulkan/mod.rs
++++ b/crates/rt/src/gpu/vulkan/mod.rs
+@@ -201,16 +201,44 @@ pub(super) struct FrameMark {
+     logged: u32,
+ }
+ 
++/// Per-thread time at the last present (prof categories), for slow frames.
++static THREAD_MARK: std::sync::Mutex<Vec<(String, [u64; crate::prof::CATS])>> = std::sync::Mutex::new(Vec::new());
++
++fn thread_report(slow: bool) -> Option<String> {
++    if !crate::prof::on() {
++        return None;
++    }
++    let now: Vec<(String, [u64; crate::prof::CATS])> = crate::prof::snapshot().into_iter().map(|(n, ns, _, _)| (n, ns)).collect();
++    let mut mark = THREAD_MARK.lock().unwrap();
++    let report = slow.then(|| {
++        let mut busy: Vec<(u64, String)> = now
++            .iter()
++            .map(|(name, ns)| {
++                let before = mark.iter().find(|(n, _)| n == name).map(|m| m.1).unwrap_or([0; crate::prof::CATS]);
++                let d: Vec<u64> = (0..crate::prof::CATS).map(|i| ns[i].saturating_sub(before[i])).collect();
++                // everything but blocked/sleep: the thread was doing or waiting on work
++                let active: u64 = (0..crate::prof::CATS).filter(|&i| i != crate::prof::Cat::Blocked as usize && i != crate::prof::Cat::Sleep as usize).map(|i| d[i]).sum();
++                let parts: Vec<String> = (0..crate::prof::CATS).filter(|&i| d[i] >= 2_000_000).map(|i| format!("{} {}", crate::prof::NAMES[i], d[i] / 1_000_000)).collect();
++                (active, format!("{name}: {}", parts.join(", ")))
++            })
++            .collect();
++        busy.sort_by(|a, b| b.0.cmp(&a.0));
++        busy.into_iter().take(4).filter(|b| b.0 >= 2_000_000).map(|b| b.1).collect::<Vec<_>>().join("; ")
++    });
++    *mark = now;
++    report
++}
++
+ impl Renderer {
+     /// With KIRIKAE_STATS set, explain every frame that took over 50 ms.
+     pub(super) fn mark_frame(&mut self) {
+         let now = std::time::Instant::now();
+-        let s = &self.stats;
+         let m = self.frame_mark;
++        let slow = m.at.is_some_and(|at| now - at > std::time::Duration::from_millis(50)) && m.logged < 400 && crate::env_var!("KIRIKAE_STATS").is_some();
++        let threads = thread_report(slow);
++        let s = &self.stats;
+         if let Some(at) = m.at
+-            && now - at > std::time::Duration::from_millis(50)
+-            && m.logged < 400
+-            && crate::env_var!("KIRIKAE_STATS").is_some()
++            && slow
+         {
+             let ms = |a: std::time::Duration, b: std::time::Duration| (a.saturating_sub(b)).as_secs_f64() * 1e3;
+             eprintln!(
+@@ -230,6 +258,9 @@ impl Renderer {
+                 ms(s.cache_save_time, m.cache_save),
+                 (s.ring_bytes - m.bytes) >> 20,
+             );
++            if let Some(t) = threads.filter(|t| !t.is_empty()) {
++                eprintln!("kirikae:   game threads (ms): {t}");
++            }
+             self.frame_mark.logged += 1;
+         }
+         let logged = self.frame_mark.logged;
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index 98f084c..c378ad2 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -15,6 +15,7 @@ pub mod fault;
+ pub mod games;
+ pub mod gpu;
+ pub mod hle;
++pub mod ngc;
+ pub mod horizon;
+ pub mod host1x;
+ pub mod input;
+diff --git a/crates/rt/src/ngc.rs b/crates/rt/src/ngc.rs
+new file mode 100644
+index 0000000..c739519
+--- /dev/null
++++ b/crates/rt/src/ngc.rs
+@@ -0,0 +1,47 @@
++//! nn::ngc::ProfanityFilter without the system NG word list.
++//!
++//! The filter reads system data 0x0100000000000823, which a dump of the game does not have;
++//! with an empty archive the SDK aborts inside CheckProfanityWords (Cruis'n Blast checks the
++//! initials typed after a race). These replacements answer like a console whose word list
++//! matches nothing: every word is clean and nothing is masked.
++
++use std::sync::Arc;
++
++use crate::cpu::Cpu;
++use crate::process::Process;
++
++fn ok(c: &mut Cpu) {
++    c.x[0] = 0;
++    c.pc = c.x[30];
++}
++
++pub fn install(p: &'static Process) {
++    let mut installed = 0;
++    for (addr, name) in &p.symbols {
++        let f: crate::hle::HostFn = if name.starts_with("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPj") {
++            // (this, u32* results, u32 region mask, const T** words, size_t count)
++            Arc::new(|c: &mut Cpu| {
++                let (results, count) = (c.x[1], c.x[4].min(4096));
++                if results != 0 {
++                    c.process().memory.write(results, &vec![0u8; 4 * count as usize]);
++                }
++                ok(c);
++            })
++        } else if name.starts_with("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPi") {
++            // (this, int* masked count, T* text, u32 region mask)
++            Arc::new(|c: &mut Cpu| {
++                if c.x[1] != 0 {
++                    c.process().memory.write(c.x[1], &0u32.to_le_bytes());
++                }
++                ok(c);
++            })
++        } else {
++            continue;
++        };
++        p.hle.replace(*addr, f);
++        installed += 1;
++    }
++    if installed > 0 {
++        p.warn_once(format!("ngc: profanity filter answers \"clean\" ({installed} entry points)"));
++    }
++}
+diff --git a/crates/rt/src/process.rs b/crates/rt/src/process.rs
+index a3d4083..f6f108a 100644
+--- a/crates/rt/src/process.rs
++++ b/crates/rt/src/process.rs
+@@ -80,7 +80,7 @@ enum Sink {
+ pub struct Process {
+     pub memory: GuestMemory,
+     modules: Vec<(String, std::ops::Range<u64>)>,
+-    symbols: Vec<(u64, String)>,
++    pub(crate) symbols: Vec<(u64, String)>,
+     pub title_id: u64,
+     code_size: u64,
+     stack_size: u64,
+@@ -557,6 +557,7 @@ pub fn run_executable(exe: &Executable, entries: &'static [Entry], opts: RunOpti
+         start_stats(process);
+     }
+     crate::nvn::install(process);
++    crate::ngc::install(process);
+ 
+     let entry = exe.entry;
+     let main = Arc::new(KThread {

@@ -241,3 +241,15 @@ With KIRIKAE_STATS set, every frame over 50 ms logs where the renderer's time we
 GPU waits, readbacks, shader translation, pipeline links, shader compiles, texture uploads,
 new images, pipeline cache saves, streamed MiB); what is left is the game's own CPU time.
 Pipelines that take over 5 ms and pipeline cache saves (size, time) are logged too.
+
+## 0016 - profanity filter without the system word list, per-thread slow-frame report
+
+After a race the game checks the typed initials with nn::ngc::ProfanityFilter. The filter needs
+system data 0x0100000000000823 (the NG word list), which a game dump does not contain; with
+the empty archive Kirikae serves, the SDK aborted (svcBreak from MaskProfanityWordsInTextImpl).
+`ngc.rs` replaces CheckProfanityWords (all character types) and MaskProfanityWordsInText with
+host functions that answer like a console whose list matches nothing: every word clean,
+nothing masked, success.
+
+Slow frames (0015) now also list the busiest game threads in that frame by category (native
+code, SVCs, IPC, lock waits, ...), so stalls inside the game can be told apart.
