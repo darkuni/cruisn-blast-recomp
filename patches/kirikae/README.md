@@ -276,3 +276,11 @@ suspends each guest thread about every millisecond and reads its instruction poi
 recompiled code map back to the guest function (entries sorted by host address); each slow
 frame logs the busiest thread's hottest functions, and the exit summary lists the 40 hottest
 guest functions over all slow frames.
+
+## 0019 - call stacks in the sampler
+
+The leaf profile of slow frames was diffuse (allocation, memcpy, strcmp, mutexes). The sampler
+now also copies the guest x29/x30 the thread last stored in its Cpu while it is suspended, walks
+the x29 frame-record chain after resuming, and reports which guest functions were anywhere on
+the stack (inclusive), per slow frame and in the exit summary, to find the game code that
+triggers the work.

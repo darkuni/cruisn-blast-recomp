@@ -1,0 +1,195 @@
+diff --git a/crates/rt/src/sampler.rs b/crates/rt/src/sampler.rs
+index e81f92a..5c0ede0 100644
+--- a/crates/rt/src/sampler.rs
++++ b/crates/rt/src/sampler.rs
+@@ -13,10 +13,15 @@ use crate::process::Process;
+ struct Sample {
+     thread: u16,
+     rip: u64,
++    /// guest frame pointer and link register as last stored in the thread's Cpu
++    fp: u64,
++    lr: u64,
+ }
+ 
+ static SAMPLES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
+ static TOTALS: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
++/// Inclusive (anywhere on the guest call stack) counts over all slow frames.
++static INCLUSIVE: Mutex<Option<(u64, std::collections::HashMap<u64, u64>)>> = Mutex::new(None);
+ 
+ pub fn enabled() -> bool {
+     cfg!(windows) && crate::env_var!("KIRIKAE_SAMPLE").is_some()
+@@ -42,13 +47,14 @@ mod os {
+         fn GetModuleHandleA(name: *const u8) -> *const c_void;
+     }
+ 
+-    pub static THREADS: Mutex<Vec<(String, Handle, bool)>> = Mutex::new(Vec::new());
++    /// name, thread handle, live, address of the thread's Cpu
++    pub static THREADS: Mutex<Vec<(String, Handle, bool, usize)>> = Mutex::new(Vec::new());
+ 
+-    pub fn register(name: &str) -> usize {
++    pub fn register(name: &str, cpu: usize) -> usize {
+         // SAFETY: plain Win32 calls on the current thread.
+         let h = unsafe { OpenThread(0x0002 | 0x0008 | 0x0040, 0, GetCurrentThreadId()) };
+         let mut t = THREADS.lock().unwrap();
+-        t.push((name.to_string(), h, h != 0));
++        t.push((name.to_string(), h, h != 0, cpu));
+         t.len() - 1
+     }
+ 
+@@ -63,8 +69,8 @@ mod os {
+         }
+     }
+ 
+-    /// The thread's instruction pointer, or None.
+-    pub fn sample(h: Handle) -> Option<u64> {
++    /// The thread's instruction pointer and its guest fp/lr, or None.
++    pub fn sample(h: Handle, cpu: usize) -> Option<(u64, u64, u64)> {
+         // SAFETY: suspend, read the control registers, resume; nothing is allocated while the
+         // thread is stopped (it may hold the allocator lock).
+         unsafe {
+@@ -74,8 +80,11 @@ mod os {
+             let mut ctx = Context([0; 1232]);
+             ctx.0[0x30..0x34].copy_from_slice(&0x0010_0001u32.to_le_bytes()); // CONTEXT_CONTROL
+             let ok = GetThreadContext(h, &mut ctx) != 0;
++            // the registers the recompiled code last stored (x29, x30)
++            let regs = cpu as *const u64;
++            let (fp, lr) = (std::ptr::read_volatile(regs.add(29)), std::ptr::read_volatile(regs.add(30)));
+             ResumeThread(h);
+-            ok.then(|| u64::from_le_bytes(ctx.0[0xf8..0x100].try_into().unwrap()))
++            ok.then(|| (u64::from_le_bytes(ctx.0[0xf8..0x100].try_into().unwrap()), fp, lr))
+         }
+     }
+ 
+@@ -92,18 +101,18 @@ mod os {
+ }
+ 
+ /// Called on each guest thread when it starts; returns a token for `unregister`.
+-pub fn register(name: &str) -> usize {
++pub fn register(name: &str, cpu: &crate::cpu::Cpu) -> usize {
+     if !enabled() {
+         return usize::MAX;
+     }
+     #[cfg(windows)]
+     {
+         start();
+-        os::register(name)
++        os::register(name, cpu as *const crate::cpu::Cpu as usize)
+     }
+     #[cfg(not(windows))]
+     {
+-        let _ = name;
++        let _ = (name, cpu);
+         usize::MAX
+     }
+ }
+@@ -121,14 +130,14 @@ fn start() {
+     static STARTED: std::sync::Once = std::sync::Once::new();
+     STARTED.call_once(|| {
+         let _ = std::thread::Builder::new().name("kirikae-sampler".into()).spawn(|| {
+-            let mut handles: Vec<(u16, os::Handle)> = Vec::new();
++            let mut handles: Vec<(u16, os::Handle, usize)> = Vec::new();
+             let mut batch: Vec<Sample> = Vec::with_capacity(64);
+             loop {
+                 handles.clear();
+-                handles.extend(os::THREADS.lock().unwrap().iter().enumerate().filter(|(_, t)| t.2).map(|(i, t)| (i as u16, t.1)));
+-                for &(i, h) in &handles {
+-                    if let Some(rip) = os::sample(h) {
+-                        batch.push(Sample { thread: i, rip });
++                handles.extend(os::THREADS.lock().unwrap().iter().enumerate().filter(|(_, t)| t.2).map(|(i, t)| (i as u16, t.1, t.3)));
++                for &(i, h, cpu) in &handles {
++                    if let Some((rip, fp, lr)) = os::sample(h, cpu) {
++                        batch.push(Sample { thread: i, rip, fp, lr });
+                     }
+                 }
+                 SAMPLES.lock().unwrap().append(&mut batch);
+@@ -173,6 +182,38 @@ fn place(p: &Process, rip: u64) -> String {
+     "outside the exe (system, driver or waiting)".to_string()
+ }
+ 
++/// Guest functions on the sample's call stack: lr, then the x29 frame-record chain.
++fn stack(p: &Process, s: &Sample) -> Vec<u64> {
++    let start_of = |a: u64| {
++        let i = p.entries.partition_point(|e| e.addr <= a);
++        i.checked_sub(1).map(|i| p.entries[i].addr)
++    };
++    let mut out: Vec<u64> = Vec::new();
++    let mut push = |f: Option<u64>| {
++        if let Some(f) = f
++            && !out.contains(&f)
++        {
++            out.push(f);
++        }
++    };
++    push(start_of(s.lr.wrapping_sub(4)));
++    let mut fp = s.fp;
++    for _ in 0..24 {
++        if fp == 0 || fp % 8 != 0 {
++            break;
++        }
++        let Some(rec) = p.memory.bytes(fp, 16) else { break };
++        let next = u64::from_le_bytes(rec[..8].try_into().unwrap());
++        let ret = u64::from_le_bytes(rec[8..].try_into().unwrap());
++        push(start_of(ret.wrapping_sub(4)));
++        if next <= fp {
++            break;
++        }
++        fp = next;
++    }
++    out
++}
++
+ /// Called at each present. For a slow frame, logs the busiest thread's hottest functions.
+ pub fn frame(p: &Process, slow: bool) {
+     if !enabled() {
+@@ -213,6 +254,25 @@ pub fn frame(p: &Process, slow: bool) {
+     let n = mine.len().max(1);
+     let line: Vec<String> = top.iter().take(8).map(|(f, c)| format!("{}% {f}", c * 100 / n)).collect();
+     eprintln!("kirikae:   samples ({}, {} samples): {}", names.get(thread as usize).map_or("?", |s| s.as_str()), mine.len(), line.join(" | "));
++    // inclusive: functions anywhere on the stack
++    let mut incl: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
++    for s in &mine {
++        for f in stack(p, s) {
++            *incl.entry(f).or_default() += 1;
++        }
++    }
++    {
++        let mut all = INCLUSIVE.lock().unwrap();
++        let all = all.get_or_insert_with(Default::default);
++        all.0 += mine.len() as u64;
++        for (f, c) in &incl {
++            *all.1.entry(*f).or_default() += c;
++        }
++    }
++    let mut itop: Vec<(u64, u64)> = incl.into_iter().collect();
++    itop.sort_by(|a, b| b.1.cmp(&a.1));
++    let line: Vec<String> = itop.iter().take(12).map(|(f, c)| format!("{}% {}", c * 100 / n as u64, p.describe(*f))).collect();
++    eprintln!("kirikae:   on the stack: {}", line.join(" | "));
+ }
+ 
+ /// Hottest guest functions over all slow frames so far.
+@@ -229,4 +289,12 @@ pub fn summary(p: &Process) {
+     for (addr, n) in top.iter().take(40) {
+         eprintln!("kirikae:   {:5.1}%  {}", **n as f64 * 100.0 / sum as f64, p.describe(**addr));
+     }
++    if let Some((total, incl)) = INCLUSIVE.lock().unwrap().as_ref() {
++        let mut top: Vec<(&u64, &u64)> = incl.iter().collect();
++        top.sort_by(|a, b| b.1.cmp(a.1));
++        eprintln!("kirikae: functions on the stack in slow frames ({total} samples, inclusive):");
++        for (addr, n) in top.iter().take(80) {
++            eprintln!("kirikae:   {:5.1}%  {}", **n as f64 * 100.0 / (*total).max(1) as f64, p.describe(**addr));
++        }
++    }
+ }
+diff --git a/crates/rt/src/sched.rs b/crates/rt/src/sched.rs
+index 5d52209..fe7ae6a 100644
+--- a/crates/rt/src/sched.rs
++++ b/crates/rt/src/sched.rs
+@@ -684,7 +684,7 @@ pub fn spawn(p: &'static Process, thread: Arc<KThread>, setup: impl FnOnce(&mut
+     std::thread::Builder::new().name(format!("guest-{}", thread.id)).stack_size(HOST_STACK).spawn(move || {
+         p.sched.gil.acquire(&thread);
+         let mut c = Cpu::new(p, thread.clone());
+-        let sample_token = crate::sampler::register(&format!("guest-{}", thread.id));
++        let sample_token = crate::sampler::register(&format!("guest-{}", thread.id), &c);
+         c.x[30] = HALT_PC;
+         c.tpidrro_el0 = thread.tls;
+         setup(&mut c);
