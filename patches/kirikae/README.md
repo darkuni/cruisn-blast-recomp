@@ -302,3 +302,15 @@ the threads at the lowest priority, straight into the driver's cache (not ours) 
 dropped, so a later first use is a driver-cache hit. With no record yet, everything is compiled
 as before. On lavapipe with 3,000 programs: 17.4 s / 1.9 GB without a record, 1.9 s / 110 MB
 with one.
+
+## 0022 - no heap allocation in the vector instruction interpreter
+
+The named sampler (0020) put 14% of the main thread's slow-frame time in the Windows heap
+(RtlAllocateHeap 7.7%, RtlFreeHeap 6.3%). The game does not use the host heap; the runtime
+does: NEON instructions the recompiler does not inline run through `kirikae_simd` ->
+`a64::simd::exec`, and several instruction families there collected lane values into a `Vec`
+for every executed instruction (two-register misc collected the destination lanes
+unconditionally; across-lanes reductions, narrowing shifts, high-half arithmetic, FP narrowing
+and TBL too). These now use a 16-lane stack array (`Lanes`) and a fixed [u128; 4] table.
+a64 tests pass. Also: sampler names the module of system symbols from the address, and the
+Win32 declarations match the existing ones (no redeclaration warnings).

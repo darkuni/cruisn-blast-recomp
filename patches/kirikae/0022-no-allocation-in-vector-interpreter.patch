@@ -1,0 +1,165 @@
+diff --git a/crates/a64/src/simd/mod.rs b/crates/a64/src/simd/mod.rs
+index 470e4a4..ba9a90e 100644
+--- a/crates/a64/src/simd/mod.rs
++++ b/crates/a64/src/simd/mod.rs
+@@ -3,6 +3,39 @@ pub mod fp;
+ mod fpscalar;
+ mod ldst;
+ mod neon;
++
++/// Up to 16 lane values on the stack: the interpreter runs for every vector instruction the
++/// recompiler does not inline, so it must not allocate.
++#[derive(Clone, Copy)]
++pub(crate) struct Lanes {
++    buf: [u64; 16],
++    n: usize,
++}
++
++impl std::ops::Deref for Lanes {
++    type Target = [u64];
++    fn deref(&self) -> &[u64] {
++        &self.buf[..self.n]
++    }
++}
++
++impl std::ops::Index<usize> for Lanes {
++    type Output = u64;
++    fn index(&self, i: usize) -> &u64 {
++        &self.buf[..self.n][i]
++    }
++}
++
++impl FromIterator<u64> for Lanes {
++    fn from_iter<I: IntoIterator<Item = u64>>(it: I) -> Lanes {
++        let mut l = Lanes { buf: [0; 16], n: 0 };
++        for v in it {
++            l.buf[l.n] = v;
++            l.n += 1;
++        }
++        l
++    }
++}
+ pub mod oracle;
+ 
+ pub trait Env {
+diff --git a/crates/a64/src/simd/neon.rs b/crates/a64/src/simd/neon.rs
+index 72e06bf..fcfe9c3 100644
+--- a/crates/a64/src/simd/neon.rs
++++ b/crates/a64/src/simd/neon.rs
+@@ -287,7 +287,7 @@ fn misc(e: &mut dyn Env, w: u32, scalar: bool) -> bool {
+         }
+         let n = if scalar { 1 } else { 64 / es };
+         let mut sat = false;
+-        let vals: Vec<u64> = (0..n).map(|i| narrow(lane(vn, 2 * es, i), es, kind, &mut sat)).collect();
++        let vals: super::Lanes = (0..n).map(|i| narrow(lane(vn, 2 * es, i), es, kind, &mut sat)).collect();
+         if scalar {
+             e.set_v(rd, vals[0] as u128);
+         } else {
+@@ -318,7 +318,7 @@ fn misc(e: &mut dyn Env, w: u32, scalar: bool) -> bool {
+             }
+             e.set_v(rd, out);
+         } else {
+-            let vals: Vec<u64> = if sz == 0 {
++            let vals: super::Lanes = if sz == 0 {
+                 (0..4).map(|i| super::fp::f32_to_f16(lane(vn, 32, i) as u32, c) as u64).collect()
+             } else {
+                 (0..2).map(|i| super::fp::f64_to_f32(lane(vn, 64, i), c) as u64).collect()
+@@ -453,7 +453,7 @@ fn misc(e: &mut dyn Env, w: u32, scalar: bool) -> bool {
+     }
+     let mut sat = false;
+     let vd = e.v(rd);
+-    let lanes_d: Vec<u64> = (0..s.elems()).map(|i| lane(vd, es, i)).collect();
++    let lanes_d: super::Lanes = (0..s.elems()).map(|i| lane(vd, es, i)).collect();
+     let current = std::cell::Cell::new(0usize);
+     let d0 = |_: u64| lanes_d[current.get()];
+     let f = |x: u64, sat: &mut bool| -> Option<u64> {
+@@ -519,7 +519,7 @@ fn across(e: &mut dyn Env, w: u32) -> bool {
+         }
+         let c = fpcr(e);
+         let min = bits(w, 23, 1) == 1;
+-        let vals: Vec<u64> = (0..4).map(|i| lane(vn, 32, i)).collect();
++        let vals: super::Lanes = (0..4).map(|i| lane(vn, 32, i)).collect();
+         let f = move |x: u64, y: u64| -> u64 {
+             let (x, y) = (x as u32, y as u32);
+             (match (opcode, min) {
+@@ -537,7 +537,7 @@ fn across(e: &mut dyn Env, w: u32) -> bool {
+         return false;
+     }
+     let n = datasize / es;
+-    let vals: Vec<u64> = (0..n).map(|i| lane(vn, es, i)).collect();
++    let vals: super::Lanes = (0..n).map(|i| lane(vn, es, i)).collect();
+     let r = match (opcode, u) {
+         (0b00011, 0) => vals.iter().map(|x| sx(*x, es)).sum::<i64>() as u64 & mask(2 * es),
+         (0b00011, _) => vals.iter().sum::<u64>() & mask(2 * es),
+@@ -585,7 +585,7 @@ fn shift_imm(e: &mut dyn Env, w: u32, scalar: bool) -> bool {
+         let wide = 2 * es;
+         let n = if scalar { 1 } else { 64 / es };
+         let mut sat = false;
+-        let vals: Vec<u64> = (0..n)
++        let vals: super::Lanes = (0..n)
+             .map(|i| {
+                 let x = lane(vn, wide, i);
+                 let v: i128 = if kind == 2 || (kind == 0 && u == 1) { x as i128 } else { sx(x, wide) as i128 };
+@@ -706,7 +706,7 @@ fn three_diff(e: &mut dyn Env, w: u32, scalar: bool) -> bool {
+     let ext_w = |x: u64| -> i128 { if u == 0 { sx(x, wide) as i128 } else { x as i128 } };
+ 
+     if opcode == 0b0100 || opcode == 0b0110 {
+-        let vals: Vec<u64> = (0..n)
++        let vals: super::Lanes = (0..n)
+             .map(|i| {
+                 let (a, b) = (lane(vn, wide, i), lane(vm, wide, i));
+                 let mut r = if opcode == 0b0100 { a.wrapping_add(b) } else { a.wrapping_sub(b) } & mask(wide);
+@@ -927,7 +927,7 @@ fn tbl(e: &mut dyn Env, w: u32) -> bool {
+     }
+     let (rm, len, tbx, rn, rd) = (bits(w, 16, 5), bits(w, 13, 2), bits(w, 12, 1), bits(w, 5, 5), bits(w, 0, 5));
+     let regs = len + 1;
+-    let table: Vec<u128> = (0..regs).map(|k| e.v((rn + k) % 32)).collect();
++    let table: [u128; 4] = std::array::from_fn(|k| if (k as u32) < regs { e.v((rn + k as u32) % 32) } else { 0 });
+     let (idx, vd) = (e.v(rm), e.v(rd));
+     let bytes = 8 << q;
+     let mut out = 0u128;
+diff --git a/crates/rt/src/sampler.rs b/crates/rt/src/sampler.rs
+index ba4eb3a..cd85385 100644
+--- a/crates/rt/src/sampler.rs
++++ b/crates/rt/src/sampler.rs
+@@ -97,10 +97,11 @@ mod os {
+         type FromAddr = unsafe extern "system" fn(isize, u64, *mut u64, *mut u8) -> i32;
+         type Options = unsafe extern "system" fn(u32) -> u32;
+         unsafe extern "system" {
+-            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+-            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
++            fn LoadLibraryA(name: *const std::ffi::c_char) -> *mut c_void;
++            fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+             fn GetCurrentProcess() -> isize;
+             fn GetModuleFileNameW(module: *const c_void, name: *mut u16, size: u32) -> u32;
++            fn GetModuleHandleExW(flags: u32, addr: *const c_void, module: *mut *const c_void) -> i32;
+         }
+         struct Dbg {
+             from: FromAddr,
+@@ -112,11 +113,11 @@ mod os {
+         let dbg = g.get_or_insert_with(|| {
+             // SAFETY: dbghelp's documented entry points, looked up by name.
+             unsafe {
+-                let m = LoadLibraryA(c"dbghelp.dll".as_ptr() as *const u8);
++                let m = LoadLibraryA(c"dbghelp.dll".as_ptr());
+                 if m.is_null() {
+                     return None;
+                 }
+-                let (init, from, opts) = (GetProcAddress(m, c"SymInitializeW".as_ptr() as *const u8), GetProcAddress(m, c"SymFromAddrW".as_ptr() as *const u8), GetProcAddress(m, c"SymSetOptions".as_ptr() as *const u8));
++                let (init, from, opts) = (GetProcAddress(m, c"SymInitializeW".as_ptr()), GetProcAddress(m, c"SymFromAddrW".as_ptr()), GetProcAddress(m, c"SymSetOptions".as_ptr()));
+                 if init.is_null() || from.is_null() || opts.is_null() {
+                     return None;
+                 }
+@@ -145,9 +146,10 @@ mod os {
+             } else {
+                 let len = (*(raw.add(76) as *const u32)).min(255) as usize;
+                 let name = String::from_utf16_lossy(std::slice::from_raw_parts(raw.add(84) as *const u16, len));
+-                let base = *(raw.add(32) as *const u64);
++                // the module containing the address (FROM_ADDRESS | UNCHANGED_REFCOUNT)
++                let mut module: *const c_void = std::ptr::null();
+                 let mut path = [0u16; 260];
+-                let n = GetModuleFileNameW(base as *const c_void, path.as_mut_ptr(), 260) as usize;
++                let n = if GetModuleHandleExW(0x4 | 0x2, addr as *const c_void, &mut module) != 0 { GetModuleFileNameW(module, path.as_mut_ptr(), 260) as usize } else { 0 };
+                 let file = String::from_utf16_lossy(&path[..n]);
+                 let module = file.rsplit(['\\', '/']).next().unwrap_or("?").to_string();
+                 Some(format!("{module}!{name}+{displacement:#x}"))
