@@ -1,0 +1,131 @@
+diff --git a/crates/rt/src/sampler.rs b/crates/rt/src/sampler.rs
+index 5c0ede0..ba4eb3a 100644
+--- a/crates/rt/src/sampler.rs
++++ b/crates/rt/src/sampler.rs
+@@ -20,6 +20,8 @@ struct Sample {
+ 
+ static SAMPLES: Mutex<Vec<Sample>> = Mutex::new(Vec::new());
+ static TOTALS: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
++/// Slow-frame samples outside game code, by named host function.
++static HOST_TOTALS: Mutex<Option<(u64, std::collections::HashMap<String, u64>)>> = Mutex::new(None);
+ /// Inclusive (anywhere on the guest call stack) counts over all slow frames.
+ static INCLUSIVE: Mutex<Option<(u64, std::collections::HashMap<u64, u64>)>> = Mutex::new(None);
+ 
+@@ -88,6 +90,73 @@ mod os {
+         }
+     }
+ 
++    /// Names host code with dbghelp: exports of system DLLs, and the runtime's own functions
++    /// from the PDB the build wrote. Only called with every thread running.
++    pub fn symbol(addr: u64) -> Option<String> {
++        type Init = unsafe extern "system" fn(isize, *const u16, i32) -> i32;
++        type FromAddr = unsafe extern "system" fn(isize, u64, *mut u64, *mut u8) -> i32;
++        type Options = unsafe extern "system" fn(u32) -> u32;
++        unsafe extern "system" {
++            fn LoadLibraryA(name: *const u8) -> *mut c_void;
++            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
++            fn GetCurrentProcess() -> isize;
++            fn GetModuleFileNameW(module: *const c_void, name: *mut u16, size: u32) -> u32;
++        }
++        struct Dbg {
++            from: FromAddr,
++            process: isize,
++            cache: std::collections::HashMap<u64, Option<String>>,
++        }
++        static DBG: Mutex<Option<Option<Dbg>>> = Mutex::new(None);
++        let mut g = DBG.lock().unwrap();
++        let dbg = g.get_or_insert_with(|| {
++            // SAFETY: dbghelp's documented entry points, looked up by name.
++            unsafe {
++                let m = LoadLibraryA(c"dbghelp.dll".as_ptr() as *const u8);
++                if m.is_null() {
++                    return None;
++                }
++                let (init, from, opts) = (GetProcAddress(m, c"SymInitializeW".as_ptr() as *const u8), GetProcAddress(m, c"SymFromAddrW".as_ptr() as *const u8), GetProcAddress(m, c"SymSetOptions".as_ptr() as *const u8));
++                if init.is_null() || from.is_null() || opts.is_null() {
++                    return None;
++                }
++                std::mem::transmute::<*mut c_void, Options>(opts)(0x2 | 0x4 | 0x10); // undecorate, deferred loads, line-free
++                let process = GetCurrentProcess();
++                if std::mem::transmute::<*mut c_void, Init>(init)(process, std::ptr::null(), 1) == 0 {
++                    return None;
++                }
++                Some(Dbg { from: std::mem::transmute::<*mut c_void, FromAddr>(from), process, cache: Default::default() })
++            }
++        });
++        let dbg = dbg.as_mut()?;
++        if let Some(c) = dbg.cache.get(&addr) {
++            return c.clone();
++        }
++        // SYMBOL_INFOW with room for a 255-character name
++        let mut buf = vec![0u64; (88 + 2 * 256) / 8 + 1];
++        let raw = buf.as_mut_ptr() as *mut u8;
++        let mut displacement = 0u64;
++        // SAFETY: buf is a SYMBOL_INFOW with SizeOfStruct and MaxNameLen set.
++        let name = unsafe {
++            *(raw as *mut u32) = 88;
++            *(raw.add(80) as *mut u32) = 255;
++            if (dbg.from)(dbg.process, addr, &mut displacement, raw) == 0 {
++                None
++            } else {
++                let len = (*(raw.add(76) as *const u32)).min(255) as usize;
++                let name = String::from_utf16_lossy(std::slice::from_raw_parts(raw.add(84) as *const u16, len));
++                let base = *(raw.add(32) as *const u64);
++                let mut path = [0u16; 260];
++                let n = GetModuleFileNameW(base as *const c_void, path.as_mut_ptr(), 260) as usize;
++                let file = String::from_utf16_lossy(&path[..n]);
++                let module = file.rsplit(['\\', '/']).next().unwrap_or("?").to_string();
++                Some(format!("{module}!{name}+{displacement:#x}"))
++            }
++        };
++        dbg.cache.insert(addr, name.clone());
++        name
++    }
++
+     /// Start and size of the executable image.
+     pub fn image() -> (u64, u64) {
+         // SAFETY: reading the PE headers of the loaded executable.
+@@ -176,6 +245,11 @@ fn place(p: &Process, rip: u64) -> String {
+             return p.describe(guest);
+         }
+     }
++    #[cfg(windows)]
++    if let Some(name) = os::symbol(rip) {
++        let name = name.split("+0x").next().unwrap_or(&name).to_string();
++        return if (m.image.0..m.image.0 + m.image.1).contains(&rip) { format!("runtime {name}") } else { format!("system {name}") };
++    }
+     if (m.image.0..m.image.0 + m.image.1).contains(&rip) {
+         return format!("runtime exe+{:#x}", rip - m.image.0);
+     }
+@@ -240,8 +314,15 @@ pub fn frame(p: &Process, slow: bool) {
+     let mut hist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+     let mut totals = TOTALS.lock().unwrap();
+     let totals = totals.get_or_insert_with(Default::default);
++    let mut host = HOST_TOTALS.lock().unwrap();
++    let host = host.get_or_insert_with(Default::default);
++    host.0 += mine.len() as u64;
+     for s in &mine {
+-        *hist.entry(place(p, s.rip)).or_default() += 1;
++        let at = place(p, s.rip);
++        if at.starts_with("runtime") || at.starts_with("system") || at.starts_with("outside") {
++            *host.1.entry(at.clone()).or_default() += 1;
++        }
++        *hist.entry(at).or_default() += 1;
+         let i = m.funcs.partition_point(|f| f.0 <= s.rip);
+         if (m.code.0..m.code.1).contains(&s.rip)
+             && let Some(&(_, guest)) = i.checked_sub(1).map(|i| &m.funcs[i])
+@@ -289,6 +370,14 @@ pub fn summary(p: &Process) {
+     for (addr, n) in top.iter().take(40) {
+         eprintln!("kirikae:   {:5.1}%  {}", **n as f64 * 100.0 / sum as f64, p.describe(**addr));
+     }
++    if let Some((total, host)) = HOST_TOTALS.lock().unwrap().as_ref() {
++        let mut top: Vec<(&String, &u64)> = host.iter().collect();
++        top.sort_by(|a, b| b.1.cmp(a.1));
++        eprintln!("kirikae: host code in slow frames ({total} samples of the busiest thread):");
++        for (name, n) in top.iter().take(40) {
++            eprintln!("kirikae:   {:5.1}%  {name}", **n as f64 * 100.0 / (*total).max(1) as f64);
++        }
++    }
+     if let Some((total, incl)) = INCLUSIVE.lock().unwrap().as_ref() {
+         let mut top: Vec<(&u64, &u64)> = incl.iter().collect();
+         top.sort_by(|a, b| b.1.cmp(a.1));

@@ -284,3 +284,10 @@ now also copies the guest x29/x30 the thread last stored in its Cpu while it is 
 the x29 frame-record chain after resuming, and reports which guest functions were anywhere on
 the stack (inclusive), per slow frame and in the exit summary, to find the game code that
 triggers the work.
+
+## 0020 - name host code in the sampler
+
+In race slow frames about 18% of the main thread samples were in system code and 9% in the
+runtime itself. Those addresses are now named with dbghelp (system DLL exports, and the
+runtime functions from the PDB the build writes), per slow frame and in an exit summary of
+host code.
