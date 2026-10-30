@@ -12,7 +12,10 @@ param(
     [int]$Jobs = 0,
     # Only the runtime or shader translator changed: rebuild them and relink the game
     # without regenerating its code. Needs a previous full build.
-    [switch]$Relink
+    [switch]$Relink,
+    # Keep guest CPU registers in memory between instructions (the slower code generation used
+    # before guest registers were kept in host registers). For comparing; off by default.
+    [switch]$SlowRegs
 )
 
 # Continue, not Stop: Windows PowerShell 5.1 turns native stderr (Kirikae's progress
@@ -113,6 +116,7 @@ if ($Relink) {
     }
     [IO.File]::WriteAllLines($merged, [string[]]$all, (New-Object Text.UTF8Encoding $false))
     $kargs = @('build', $Dump, '-o', $Out, '--name', 'cruisn-blast', '--profile', $merged)
+    if (-not $SlowRegs) { $kargs += '--fast-regs' }   # guest registers stay in host registers within a function
     if ($Jobs -gt 0) { $kargs += @('-j', "$Jobs") }
     $code = Run-Logged $k $kargs (Join-Path $Root 'build.log')
     if ($code) { Fail 'recompile failed - build.log has the details' }
