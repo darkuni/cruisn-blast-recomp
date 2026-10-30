@@ -113,11 +113,13 @@ are `tools/README-testers.txt`.
   the rest in the background at low priority (5 s). The `.pipelines` recording (0013) remains
   the fallback for drivers without pipeline library support
 - Profanity filter (`nn::ngc`) replaced, which fixed the crash after a race (0016)
+- Steam Deck: native Linux build (`tools/build_linux.sh`, links against glibc 2.31 with
+  cargo-zigbuild) runs at 42-45 fps at 720p (main thread about 20.5 ms a frame); under Proton
+  it was 28-32 fps. Patches 0024-0026 took the PC main thread from 10-14 ms to 6-7 ms a frame.
+  What is left for 60 on the Deck is guest register traffic around the game's many small
+  calls (registers go through the CPU state in memory at every call): passing guest registers
+  in host registers between compiled functions is the next large step
 - Open issues:
-  - Short in-race hitches (about 30 slow frames over 100 ms per race) are bursts of the game's
-    own main-thread work, not shader compiles; the Switch version drops frames at the same
-    moments. A later pass can make the recompiled code faster (more vector instructions
-    translated instead of interpreted)
   - 8 of 1,332 shaders fail naga validation (BreakOutsideOfLoopOrSwitch), same on
     unpatched Kirikae
 
