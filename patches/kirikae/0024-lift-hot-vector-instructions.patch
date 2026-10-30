@@ -1,0 +1,1151 @@
+diff --git a/crates/a64/examples/simd_coverage.rs b/crates/a64/examples/simd_coverage.rs
+new file mode 100644
+index 0000000..0470da5
+--- /dev/null
++++ b/crates/a64/examples/simd_coverage.rs
+@@ -0,0 +1,21 @@
++fn main() {
++    let path = std::env::args().nth(1).unwrap();
++    let (mut total, mut covered) = (0u64, 0u64);
++    let mut left: Vec<(u64, u32)> = Vec::new();
++    for line in std::fs::read_to_string(path).unwrap().lines() {
++        let mut it = line.split_whitespace();
++        let w = u32::from_str_radix(it.next().unwrap(), 16).unwrap();
++        let n: u64 = it.next().unwrap().parse().unwrap();
++        total += n;
++        let insn = kirikae_a64::lift::lift(0, w);
++        if insn.stmts.iter().any(|s| matches!(s, kirikae_a64::ir::Stmt::Simd(_))) {
++            left.push((n, w));
++        } else {
++            covered += n;
++        }
++    }
++    println!("covered {:.1}% of {} calls; {} words left", covered as f64 * 100.0 / total as f64, total, left.len());
++    for (n, w) in left.iter().take(40) {
++        println!("{n:>11} {w:08x}");
++    }
++}
+diff --git a/crates/a64/src/lib.rs b/crates/a64/src/lib.rs
+index 5d3a937..d849ea0 100644
+--- a/crates/a64/src/lib.rs
++++ b/crates/a64/src/lib.rs
+@@ -4,6 +4,7 @@ pub mod bits;
+ pub mod ir;
+ pub mod lift;
+ mod lift_fp;
++mod lift_neon;
+ pub mod simd;
+ pub mod ops;
+ 
+diff --git a/crates/a64/src/lift.rs b/crates/a64/src/lift.rs
+index ab83986..6d6a483 100644
+--- a/crates/a64/src/lift.rs
++++ b/crates/a64/src/lift.rs
+@@ -15,7 +15,7 @@ fn lift_stmts(pc: u64, w: u32) -> Option<Vec<Stmt>> {
+         0b0101 | 0b1101 => dp_reg(w),
+         _ => None,
+     };
+-    stmts.or_else(|| crate::lift_fp::lift(w)).or_else(|| crate::simd::supported(w).then(|| vec![Stmt::Simd(w)]))
++    stmts.or_else(|| crate::lift_fp::lift(w)).or_else(|| crate::lift_neon::lift(w)).or_else(|| crate::simd::supported(w).then(|| vec![Stmt::Simd(w)]))
+ }
+ 
+ fn field(w: u32, lo: u32, bits: u32) -> u32 {
+diff --git a/crates/a64/src/lift_fp.rs b/crates/a64/src/lift_fp.rs
+index 9bee607..a07c1ac 100644
+--- a/crates/a64/src/lift_fp.rs
++++ b/crates/a64/src/lift_fp.rs
+@@ -2,15 +2,15 @@ use crate::ir::*;
+ use crate::ops::{fp_mode, Op};
+ use crate::simd::fp::Round;
+ 
+-const SIGN32: u64 = 0x8000_0000;
+-const SIGN64: u64 = 1 << 63;
+-const LO32: u64 = 0xffff_ffff;
++pub(crate) const SIGN32: u64 = 0x8000_0000;
++pub(crate) const SIGN64: u64 = 1 << 63;
++pub(crate) const LO32: u64 = 0xffff_ffff;
+ 
+ fn bits(w: u32, lo: u32, n: u32) -> u32 {
+     (w >> lo) & ((1 << n) - 1)
+ }
+ 
+-fn fpcr() -> Expr {
++pub(crate) fn fpcr() -> Expr {
+     Expr::SysReg(SysReg::Fpcr)
+ }
+ 
+@@ -18,17 +18,17 @@ fn scalar(n: u32, double: bool) -> Expr {
+     if double { vlo(n) } else { op1(Op::Zext32, vlo(n)) }
+ }
+ 
+-fn lane32(n: u32, i: u32) -> Expr {
++pub(crate) fn lane32(n: u32, i: u32) -> Expr {
+     let half = if i >= 2 { vhi(n) } else { vlo(n) };
+     if i % 2 == 1 { op2(Op::Lsr64, half, c(32)) } else { op1(Op::Zext32, half) }
+ }
+ 
+-fn write_scalar(out: &mut Vec<Stmt>, d: u32, value: Expr) {
++pub(crate) fn write_scalar(out: &mut Vec<Stmt>, d: u32, value: Expr) {
+     out.push(Stmt::SetV { reg: d as u8, hi: false, value });
+     out.push(Stmt::SetV { reg: d as u8, hi: true, value: c(0) });
+ }
+ 
+-fn write_halves(out: &mut Vec<Stmt>, d: u32, lo: Expr, hi: Option<Expr>) {
++pub(crate) fn write_halves(out: &mut Vec<Stmt>, d: u32, lo: Expr, hi: Option<Expr>) {
+     out.push(Stmt::Let(0, lo));
+     let upper = match hi {
+         Some(hi) => {
+@@ -479,7 +479,7 @@ fn movi_bytes(out: &mut Vec<Stmt>, w: u32) {
+     out.push(Stmt::SetV { reg: rd, hi: true, value: c(if q { imm } else { 0 }) });
+ }
+ 
+-fn elem(n: u32, i: u32, es: u32) -> Expr {
++pub(crate) fn elem(n: u32, i: u32, es: u32) -> Expr {
+     let bit = i * es;
+     let half = if bit >= 64 { vhi(n) } else { vlo(n) };
+     let v = if bit.is_multiple_of(64) { half } else { op2(Op::Lsr64, half, c((bit % 64) as u64)) };
+@@ -491,7 +491,7 @@ fn elem(n: u32, i: u32, es: u32) -> Expr {
+     }
+ }
+ 
+-fn pack(elems: &[Expr], es: u32) -> Expr {
++pub(crate) fn pack(elems: &[Expr], es: u32) -> Expr {
+     let mut r = elems[0].clone();
+     for (i, e) in elems.iter().enumerate().skip(1) {
+         r = op2(Op::Or, r, op2(Op::Lsl64, e.clone(), c(i as u64 * es as u64)));
+@@ -499,13 +499,13 @@ fn pack(elems: &[Expr], es: u32) -> Expr {
+     r
+ }
+ 
+-fn write_elems(out: &mut Vec<Stmt>, d: u32, elems: &[Expr], es: u32, q: bool) {
++pub(crate) fn write_elems(out: &mut Vec<Stmt>, d: u32, elems: &[Expr], es: u32, q: bool) {
+     let per = (64 / es) as usize;
+     let hi = q.then(|| pack(&elems[per..], es));
+     write_halves(out, d, pack(&elems[..per], es), hi);
+ }
+ 
+-fn sext(e: Expr, es: u32) -> Expr {
++pub(crate) fn sext(e: Expr, es: u32) -> Expr {
+     match es {
+         8 => op1(Op::Sext8, e),
+         16 => op1(Op::Sext16, e),
+@@ -785,7 +785,7 @@ mod tests {
+     use crate::simd::Env;
+ 
+     #[derive(Clone, PartialEq, Debug)]
+-    struct State {
++    pub(crate) struct State {
+         x: [u64; 32],
+         v: [u128; 32],
+         nzcv: u64,
+diff --git a/crates/a64/src/lift_neon.rs b/crates/a64/src/lift_neon.rs
+new file mode 100644
+index 0000000..2a32e91
+--- /dev/null
++++ b/crates/a64/src/lift_neon.rs
+@@ -0,0 +1,788 @@
++//! More NEON instructions lifted to IR instead of being run by the vector interpreter
++//! (`Stmt::Simd`): the ones a profile of Cruis'n Blast showed hot. Bit counting (CNT,
++//! UADDLP, UADDLV, ADDV), lane and structure loads/stores (LD1/ST1 lanes, LD1R, LD1-4/ST1-4),
++//! integer compares, min/max (pairwise too), multiply-accumulate, shifts by immediate and by
++//! register, modified immediates, integer<->float conversions, FDIV/FABD, reciprocal (square
++//! root) estimates and steps, FADDP. Every form is checked against `simd::exec`.
++
++use crate::ir::*;
++use crate::lift_fp::{elem, fpcr, pack, write_elems, write_halves, write_scalar, LO32};
++use crate::ops::{fp_mode, Op};
++use crate::simd::fp::Round;
++
++fn bits(w: u32, lo: u32, n: u32) -> u32 {
++    (w >> lo) & ((1 << n) - 1)
++}
++
++fn half(n: u32, hi: bool) -> Expr {
++    if hi { vhi(n) } else { vlo(n) }
++}
++
++fn mask(es: u32) -> u64 {
++    if es == 64 { u64::MAX } else { (1u64 << es) - 1 }
++}
++
++fn and(a: Expr, m: u64) -> Expr {
++    if m == u64::MAX { a } else { op2(Op::And, a, c(m)) }
++}
++
++/// Sign-extend an `es`-bit value to 64 bits.
++fn sx(e: Expr, es: u32) -> Expr {
++    match es {
++        8 => op1(Op::Sext8, e),
++        16 => op1(Op::Sext16, e),
++        32 => op1(Op::Sext32, e),
++        _ => e,
++    }
++}
++
++/// 1 if a < b (64-bit values), signed or unsigned.
++fn lt64(a: Expr, b: Expr, signed: bool) -> Expr {
++    let d = op2(Op::Sub, a.clone(), b.clone());
++    let x = op2(Op::Xor, a.clone(), b.clone());
++    let r = if signed {
++        // overflow-corrected sign of a - b
++        op2(Op::Xor, d.clone(), op2(Op::And, x, op2(Op::Xor, d, a)))
++    } else {
++        // borrow out of a - b
++        op2(Op::Or, op2(Op::And, op1(Op::Not, a), b), op2(Op::And, op1(Op::Not, x), d))
++    };
++    op2(Op::Lsr64, r, c(63))
++}
++
++/// 1 if element a < element b (es-bit lanes, zero-extended inputs).
++fn lt(a: Expr, b: Expr, es: u32, signed: bool) -> Expr {
++    if es == 64 {
++        return lt64(a, b, signed);
++    }
++    let (a, b) = if signed { (sx(a, es), sx(b, es)) } else { (a, b) };
++    op2(Op::Lsr64, op2(Op::Sub, a, b), c(63))
++}
++
++fn lanes(q: bool, es: u32) -> u32 {
++    if q { 128 / es } else { 64 / es }
++}
++
++pub fn lift(w: u32) -> Option<Vec<Stmt>> {
++    let mut out = Vec::new();
++    if w & 0x9f3e_0c00 == 0x0e20_0800 {
++        two_reg_misc(&mut out, w)?;
++    } else if w & 0x9f3e_0c00 == 0x0e30_0800 {
++        across_lanes(&mut out, w)?;
++    } else if w & 0x9f20_0400 == 0x0e20_0400 {
++        three_same(&mut out, w)?;
++    } else if w & 0x9f80_0400 == 0x0f00_0400 && bits(w, 19, 4) != 0 {
++        shift_imm(&mut out, w)?;
++    } else if w & 0x9ff8_0400 == 0x0f00_0400 {
++        modified_imm(&mut out, w)?;
++    } else if w & 0xffbf_fc00 == 0x7e30_d800 {
++        faddp_scalar(&mut out, w);
++    } else if w & 0xbfbf_0000 == 0x0c00_0000 || w & 0xbfa0_0000 == 0x0c80_0000 {
++        ldst_multiple(&mut out, w)?;
++    } else if w & 0xbf9f_0000 == 0x0d00_0000 || w & 0xbf80_0000 == 0x0d80_0000 {
++        ldst_single(&mut out, w)?;
++    } else {
++        return None;
++    }
++    Some(out)
++}
++
++// ---- bit counting -------------------------------------------------------------------------
++
++/// Per-byte population count of a 64-bit value.
++fn popcount_bytes(x: Expr) -> Expr {
++    let x1 = op2(Op::Sub, x.clone(), op2(Op::And, op2(Op::Lsr64, x, c(1)), c(0x5555_5555_5555_5555)));
++    let x2 = op2(
++        Op::Add,
++        op2(Op::And, x1.clone(), c(0x3333_3333_3333_3333)),
++        op2(Op::And, op2(Op::Lsr64, x1, c(2)), c(0x3333_3333_3333_3333)),
++    );
++    op2(Op::And, op2(Op::Add, x2.clone(), op2(Op::Lsr64, x2, c(4))), c(0x0f0f_0f0f_0f0f_0f0f))
++}
++
++/// Unsigned pairwise add-long within a 64-bit value: es-bit lanes -> 2*es-bit lanes.
++fn addlp_u(x: Expr, es: u32) -> Expr {
++    let m = match es {
++        8 => 0x00ff_00ff_00ff_00ff,
++        16 => 0x0000_ffff_0000_ffff,
++        _ => LO32,
++    };
++    op2(Op::Add, op2(Op::And, x.clone(), c(m)), op2(Op::And, op2(Op::Lsr64, x, c(es as u64)), c(m)))
++}
++
++fn two_reg_misc(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, u) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let (size, opcode, rn, rd) = (bits(w, 22, 2), bits(w, 12, 5), bits(w, 5, 5), bits(w, 0, 5));
++    let h = |hi: bool| half(rn, hi);
++    match (u, opcode) {
++        // CNT / NOT
++        (_, 0b00101) if size == 0 => {
++            let f = |x: Expr| if u == 0 { popcount_bytes(x) } else { op1(Op::Not, x) };
++            write_halves(out, rd, f(h(false)), q.then(|| f(h(true))));
++        }
++        // UADDLP
++        (1, 0b00010) if size < 3 => {
++            let es = 8 << size;
++            write_halves(out, rd, addlp_u(h(false), es), q.then(|| addlp_u(h(true), es)));
++        }
++        // ABS / NEG
++        (_, 0b01011) => {
++            if size == 3 && !q {
++                return None;
++            }
++            let es = 8 << size;
++            let elems: Vec<Expr> = (0..lanes(q, es))
++                .map(|i| {
++                    let x = elem(rn, i, es);
++                    let neg = and(op2(Op::Sub, c(0), x.clone()), mask(es));
++                    if u == 1 { neg } else { op3(Op::Select, lt(x.clone(), c(0), es, true), neg, x) }
++                })
++                .collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        // SCVTF / UCVTF (vector, integer)
++        (_, 0b11101) if size >> 1 == 0 => {
++            let double = size & 1 == 1;
++            if double && !q {
++                return None;
++            }
++            let signed = u == 0;
++            let (es, o) = if double { (64, Op::FFromInt64) } else { (32, Op::FFromInt32) };
++            let mode = c(fp_mode(Round::Nearest, signed, es));
++            let elems: Vec<Expr> = (0..lanes(q, es)).map(|i| op3(o, elem(rn, i, es), mode.clone(), fpcr())).collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        // FCVTZS / FCVTZU (vector, integer)
++        (_, 0b11011) if size >> 1 == 1 => {
++            let double = size & 1 == 1;
++            if double && !q {
++                return None;
++            }
++            let signed = u == 0;
++            let (es, o) = if double { (64, Op::FToInt64) } else { (32, Op::FToInt32) };
++            let mode = c(fp_mode(Round::Zero, signed, es));
++            let elems: Vec<Expr> = (0..lanes(q, es)).map(|i| and(op3(o, elem(rn, i, es), mode.clone(), fpcr()), mask(es))).collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        // FRECPE / FRSQRTE (single)
++        (_, 0b11101) if size == 2 => {
++            let o = if u == 0 { Op::FRecpe32x2 } else { Op::FRsqrte32x2 };
++            let f = |hi: bool| op2(o, h(hi), fpcr());
++            write_halves(out, rd, f(false), q.then(|| f(true)));
++        }
++        // FSQRT (vector)
++        (1, 0b11111) if size >> 1 == 1 => {
++            let double = size & 1 == 1;
++            if double && !q {
++                return None;
++            }
++            let (es, o) = if double { (64, Op::FSqrt64) } else { (32, Op::FSqrt32) };
++            let elems: Vec<Expr> = (0..lanes(q, es)).map(|i| op2(o, elem(rn, i, es), fpcr())).collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        _ => return None,
++    }
++    Some(())
++}
++
++fn across_lanes(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, u) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let (size, opcode, rn, rd) = (bits(w, 22, 2), bits(w, 12, 5), bits(w, 5, 5), bits(w, 0, 5));
++    let es = 8u32 << size;
++    if size == 3 || (size == 2 && !q) {
++        return None;
++    }
++    let long = match (u, opcode) {
++        (1, 0b00011) => true,  // UADDLV
++        (0, 0b11011) => false, // ADDV
++        _ => return None,
++    };
++    let sum = if es == 8 {
++        // bytes -> 16-bit pair sums -> one multiply adds the four lanes (each sum < 2^16)
++        let s = |hi: bool| op2(Op::Lsr64, op2(Op::Mul, addlp_u(half(rn, hi), 8), c(0x0001_0001_0001_0001)), c(48));
++        if q { op2(Op::Add, s(false), s(true)) } else { s(false) }
++    } else {
++        let mut acc = elem(rn, 0, es);
++        for i in 1..lanes(q, es) {
++            acc = op2(Op::Add, acc, elem(rn, i, es));
++        }
++        acc
++    };
++    let width = if long { 2 * es } else { es };
++    write_scalar(out, rd, and(sum, mask(width)));
++    Some(())
++}
++
++// ---- three registers, same type -------------------------------------------------------
++
++fn three_same(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, u) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let (size, rm, opcode, rn, rd) = (bits(w, 22, 2), bits(w, 16, 5), bits(w, 11, 5), bits(w, 5, 5), bits(w, 0, 5));
++    if opcode >= 0b11000 {
++        return fp_three_same(out, w);
++    }
++    if size == 3 && !q {
++        return None;
++    }
++    let es = 8u32 << size;
++    let n = lanes(q, es);
++    let m = mask(es);
++    let signed = u == 0;
++    let sel = |cond: Expr| op3(Op::Select, cond, c(m), c(0));
++    let elems: Vec<Expr> = match opcode {
++        // SMAX/UMAX, SMIN/UMIN
++        0b01100 | 0b01101 if es < 64 => (0..n)
++            .map(|i| {
++                let (a, b) = (elem(rn, i, es), elem(rm, i, es));
++                let a_lt_b = lt(a.clone(), b.clone(), es, signed);
++                if opcode == 0b01100 { op3(Op::Select, a_lt_b, b, a) } else { op3(Op::Select, a_lt_b, a, b) }
++            })
++            .collect(),
++        // SMAXP/UMAXP, SMINP/UMINP
++        0b10100 | 0b10101 if es < 64 => (0..n)
++            .map(|k| {
++                let (src, j) = if k < n / 2 { (rn, 2 * k) } else { (rm, 2 * (k - n / 2)) };
++                let (a, b) = (elem(src, j, es), elem(src, j + 1, es));
++                let a_lt_b = lt(a.clone(), b.clone(), es, signed);
++                if opcode == 0b10100 { op3(Op::Select, a_lt_b, b, a) } else { op3(Op::Select, a_lt_b, a, b) }
++            })
++            .collect(),
++        // CMGT/CMHI, CMGE/CMHS
++        0b00110 | 0b00111 => (0..n)
++            .map(|i| {
++                let (a, b) = (elem(rn, i, es), elem(rm, i, es));
++                if opcode == 0b00110 {
++                    sel(lt(b, a, es, signed))
++                } else {
++                    sel(op2(Op::Xor, lt(a, b, es, signed), c(1)))
++                }
++            })
++            .collect(),
++        // CMTST / CMEQ
++        0b10001 => (0..n)
++            .map(|i| {
++                let (a, b) = (elem(rn, i, es), elem(rm, i, es));
++                if u == 0 { sel(op2(Op::Ne, op2(Op::And, a, b), c(0))) } else { sel(op2(Op::Eq, a, b)) }
++            })
++            .collect(),
++        // MLA / MLS
++        0b10010 if es < 64 => (0..n)
++            .map(|i| {
++                let p = op2(Op::Mul, elem(rn, i, es), elem(rm, i, es));
++                let d = elem(rd, i, es);
++                and(if u == 0 { op2(Op::Add, d, p) } else { op2(Op::Sub, d, p) }, m)
++            })
++            .collect(),
++        // MUL
++        0b10011 if u == 0 && es < 64 => (0..n).map(|i| and(op2(Op::Mul, elem(rn, i, es), elem(rm, i, es)), m)).collect(),
++        // SSHL / USHL
++        0b01000 => (0..n).map(|i| shift_by_reg(elem(rn, i, es), elem(rm, i, es), es, signed)).collect(),
++        _ => return None,
++    };
++    write_elems(out, rd, &elems, es, q);
++    Some(())
++}
++
++/// SSHL/USHL lane: shift by the signed low byte of `s`; negative shifts go right.
++fn shift_by_reg(x: Expr, s: Expr, es: u32, signed: bool) -> Expr {
++    let m = mask(es);
++    let s = op1(Op::Sext8, op2(Op::And, s, c(0xff)));
++    let negative = op2(Op::Lsr64, s.clone(), c(63));
++    let below = |v: Expr| op2(Op::Lsr64, op2(Op::Sub, v, c(es as u64)), c(63)); // v < es (v small, signed-safe)
++    let left = op3(Op::Select, below(s.clone()), and(op2(Op::Lsl64, x.clone(), s.clone()), m), c(0));
++    let r = op2(Op::Sub, c(0), s);
++    let right = if signed {
++        let amount = op3(Op::Select, below(r.clone()), r, c(63));
++        and(op2(Op::Asr64, sx(x, es), amount), m)
++    } else {
++        op3(Op::Select, below(r.clone()), op2(Op::Lsr64, x, r), c(0))
++    };
++    op3(Op::Select, negative, right, left)
++}
++
++fn fp_three_same(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, u) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let (size, rm, opcode, rn, rd) = (bits(w, 22, 2), bits(w, 16, 5), bits(w, 11, 5), bits(w, 5, 5), bits(w, 0, 5));
++    let (a_bit, double) = (size >> 1, size & 1 == 1);
++    if double && !q {
++        return None;
++    }
++    let es = if double { 64 } else { 32 };
++    let n = lanes(q, es);
++    let (div, sub) = if double { (Op::FDiv64, Op::FSub64) } else { (Op::FDiv32, Op::FSub32) };
++    match (u, a_bit, opcode) {
++        // FDIV
++        (1, 0, 0b11111) => {
++            let elems: Vec<Expr> = (0..n).map(|i| op3(div, elem(rn, i, es), elem(rm, i, es), fpcr())).collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        // FABD
++        (1, 1, 0b11010) => {
++            let abs = if double { !(1u64 << 63) } else { 0x7fff_ffff };
++            let elems: Vec<Expr> = (0..n).map(|i| and(op3(sub, elem(rn, i, es), elem(rm, i, es), fpcr()), abs)).collect();
++            write_elems(out, rd, &elems, es, q);
++        }
++        // FRECPS / FRSQRTS (single)
++        (0, _, 0b11111) if !double => {
++            let o = if a_bit == 0 { Op::FRecps32x2 } else { Op::FRsqrts32x2 };
++            let f = |hi: bool| op3(o, half(rn, hi), half(rm, hi), fpcr());
++            write_halves(out, rd, f(false), q.then(|| f(true)));
++        }
++        _ => return None,
++    }
++    Some(())
++}
++
++fn faddp_scalar(out: &mut Vec<Stmt>, w: u32) {
++    let (double, rn, rd) = (bits(w, 22, 1) == 1, bits(w, 5, 5), bits(w, 0, 5));
++    let r = if double {
++        op3(Op::FAdd64, vlo(rn), vhi(rn), fpcr())
++    } else {
++        op3(Op::FAdd32, elem(rn, 0, 32), elem(rn, 1, 32), fpcr())
++    };
++    write_scalar(out, rd, r);
++}
++
++// ---- immediates -------------------------------------------------------------------------
++
++fn shift_imm(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, u) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let (immh, immb, opcode, rn, rd) = (bits(w, 19, 4), bits(w, 16, 3), bits(w, 11, 5), bits(w, 5, 5), bits(w, 0, 5));
++    let es = 8u32 << (31 - immh.leading_zeros());
++    if es == 64 && !q {
++        return None;
++    }
++    let shift = 2 * es - (immh << 3 | immb);
++    let accumulate = match opcode {
++        0b00000 => false,
++        0b00010 => true,
++        _ => return None,
++    };
++    let m = mask(es);
++    let elems: Vec<Expr> = (0..lanes(q, es))
++        .map(|i| {
++            let x = elem(rn, i, es);
++            let r = if u == 0 {
++                and(op2(Op::Asr64, sx(x, es), c(shift.min(63) as u64)), m)
++            } else if shift >= es {
++                c(0)
++            } else {
++                op2(Op::Lsr64, x, c(shift as u64))
++            };
++            if accumulate { and(op2(Op::Add, elem(rd, i, es), r), m) } else { r }
++        })
++        .collect();
++    write_elems(out, rd, &elems, es, q);
++    Some(())
++}
++
++/// AdvSIMDExpandImm: the 64-bit pattern of a modified immediate.
++fn expand_imm(op: u32, cmode: u32, imm8: u64) -> Option<u64> {
++    let rep32 = |v: u64| v | v << 32;
++    let rep16 = |v: u64| v | v << 16 | v << 32 | v << 48;
++    Some(match cmode >> 1 {
++        0..=3 => rep32(imm8 << (8 * (cmode >> 1))),
++        4 => rep16(imm8),
++        5 => rep16(imm8 << 8),
++        6 => rep32(if cmode & 1 == 0 { imm8 << 8 | 0xff } else { imm8 << 16 | 0xffff }),
++        _ => match (cmode & 1, op) {
++            (0, 0) => imm8 * 0x0101_0101_0101_0101,
++            (0, _) => (0..8).map(|i| if imm8 >> i & 1 == 1 { 0xffu64 << (8 * i) } else { 0 }).sum(),
++            (_, 0) => {
++                let (a, b, rest) = (imm8 >> 7, imm8 >> 6 & 1, imm8 & 0x3f);
++                let v = a << 31 | (b ^ 1) << 30 | (if b == 1 { 0x1f } else { 0 }) << 25 | rest << 19;
++                rep32(v)
++            }
++            _ => {
++                let (a, b, rest) = (imm8 >> 7, imm8 >> 6 & 1, imm8 & 0x3f);
++                a << 63 | (b ^ 1) << 62 | (if b == 1 { 0xff } else { 0 }) << 54 | rest << 48
++            }
++        },
++    })
++}
++
++fn modified_imm(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let (q, op) = (bits(w, 30, 1) == 1, bits(w, 29, 1));
++    let cmode = bits(w, 12, 4);
++    if bits(w, 11, 1) != 0 {
++        return None;
++    }
++    let imm8 = (bits(w, 16, 3) << 5 | bits(w, 5, 5)) as u64;
++    let rd = bits(w, 0, 5);
++    if cmode == 0b1111 && op == 1 && !q {
++        return None;
++    }
++    let imm = expand_imm(op, cmode, imm8)?;
++    // ORR/BIC: cmode 0xx1 and 10x1; MVNI: op=1 for cmode 0xx0, 10x0, 110x.
++    let logic = cmode & 1 == 1 && cmode < 0b1100;
++    let invert = op == 1 && cmode < 0b1110;
++    let f = |hi: bool| -> Expr {
++        if logic {
++            if op == 0 { op2(Op::Or, half(rd, hi), c(imm)) } else { op2(Op::And, half(rd, hi), c(!imm)) }
++        } else if invert {
++            c(!imm)
++        } else {
++            c(imm)
++        }
++    };
++    write_halves(out, rd, f(false), q.then(|| f(true)));
++    Some(())
++}
++
++// ---- loads and stores -------------------------------------------------------------------
++
++const BASE: u8 = 7;
++
++fn base(rn: u32) -> Expr {
++    if rn == 31 { Expr::Sp } else { Expr::Reg(rn as u8) }
++}
++
++fn at(off: u64) -> Expr {
++    if off == 0 { t(BASE) } else { op2(Op::Add, t(BASE), c(off)) }
++}
++
++fn writeback(out: &mut Vec<Stmt>, w: u32, rn: u32, total: u64) {
++    if bits(w, 23, 1) == 0 {
++        return;
++    }
++    let rm = bits(w, 16, 5);
++    let step = if rm == 31 { c(total) } else { Expr::Reg(rm as u8) };
++    let v = op2(Op::Add, t(BASE), step);
++    out.push(if rn == 31 { Stmt::SetSp(v) } else { Stmt::SetReg(rn as u8, v) });
++}
++
++fn ldst_multiple(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let q = bits(w, 30, 1) == 1;
++    let load_op = bits(w, 22, 1) == 1;
++    let (opcode, size, rn, rt) = (bits(w, 12, 4), bits(w, 10, 2), bits(w, 5, 5), bits(w, 0, 5));
++    let (rpt, selem) = match opcode {
++        0b0000 => (1, 4),
++        0b0010 => (4, 1),
++        0b0100 => (1, 3),
++        0b0110 => (3, 1),
++        0b0111 => (1, 1),
++        0b1000 => (1, 2),
++        0b1010 => (2, 1),
++        _ => return None,
++    };
++    if size == 3 && !q && selem != 1 {
++        return None;
++    }
++    if bits(w, 23, 1) == 0 && bits(w, 16, 5) != 0 {
++        return None;
++    }
++    let regbytes: u64 = if q { 16 } else { 8 };
++    let es = 8u32 << size;
++    let eb = (es / 8) as u64;
++    out.push(Stmt::Let(BASE, base(rn)));
++    let reg = |k: u32| (rt + k) % 32;
++    if selem == 1 {
++        for r in 0..rpt {
++            let off = r as u64 * regbytes;
++            let v = reg(r);
++            if load_op {
++                out.push(Stmt::SetV { reg: v as u8, hi: false, value: load(8, at(off)) });
++                out.push(Stmt::SetV { reg: v as u8, hi: true, value: if q { load(8, at(off + 8)) } else { c(0) } });
++            } else {
++                out.push(Stmt::Store { size: 8, addr: at(off), value: vlo(v) });
++                if q {
++                    out.push(Stmt::Store { size: 8, addr: at(off + 8), value: vhi(v) });
++                }
++            }
++        }
++    } else {
++        let n = lanes(q, es);
++        let addr = |e: u32, s: u32| at((e as u64 * selem as u64 + s as u64) * eb);
++        for s in 0..selem {
++            let v = reg(s);
++            if load_op {
++                let elems: Vec<Expr> = (0..n).map(|e| load(eb as u8, addr(e, s))).collect();
++                let per = (64 / es) as usize;
++                out.push(Stmt::SetV { reg: v as u8, hi: false, value: pack(&elems[..per], es) });
++                out.push(Stmt::SetV { reg: v as u8, hi: true, value: if q { pack(&elems[per..], es) } else { c(0) } });
++            } else {
++                for e in 0..n {
++                    out.push(Stmt::Store { size: eb as u8, addr: addr(e, s), value: elem(v, e, es) });
++                }
++            }
++        }
++    }
++    writeback(out, w, rn, rpt as u64 * selem as u64 * regbytes);
++    Some(())
++}
++
++fn ldst_single(out: &mut Vec<Stmt>, w: u32) -> Option<()> {
++    let q = bits(w, 30, 1);
++    let load_op = bits(w, 22, 1) == 1;
++    let (r, opcode, s, size, rn, rt) = (bits(w, 21, 1), bits(w, 13, 3), bits(w, 12, 1), bits(w, 10, 2), bits(w, 5, 5), bits(w, 0, 5));
++    if r != 0 || opcode & 1 != 0 {
++        return None; // LD2-4 single structures
++    }
++    if bits(w, 23, 1) == 0 && bits(w, 16, 5) != 0 {
++        return None;
++    }
++    out.push(Stmt::Let(BASE, base(rn)));
++    if opcode == 0b110 {
++        // LD1R
++        if !load_op || s != 0 {
++            return None;
++        }
++        let es = 8u32 << size;
++        out.push(Stmt::Let(2, load((es / 8) as u8, t(BASE))));
++        let per = 64 / es;
++        let v = pack(&(0..per).map(|_| t(2)).collect::<Vec<_>>(), es);
++        write_halves(out, rt, v.clone(), (q == 1).then_some(v));
++        writeback(out, w, rn, (es / 8) as u64);
++        return Some(());
++    }
++    let (es, index) = match opcode {
++        0b000 => (8, q << 3 | s << 2 | size),
++        0b010 if size & 1 == 0 => (16, q << 2 | s << 1 | size >> 1),
++        0b100 if size == 0 => (32, q << 1 | s),
++        0b100 if size == 1 && s == 0 => (64, q),
++        _ => return None,
++    };
++    let eb = es / 8;
++    let bit = index * es;
++    let hi = bit >= 64;
++    let shift = (bit % 64) as u64;
++    if load_op {
++        let m = mask(es) << shift;
++        let value = load(eb as u8, t(BASE));
++        let placed = if shift == 0 { value } else { op2(Op::Lsl64, value, c(shift)) };
++        let merged = if es == 64 { placed } else { op2(Op::Or, op2(Op::And, half(rt, hi), c(!m)), placed) };
++        out.push(Stmt::SetV { reg: rt as u8, hi, value: merged });
++    } else {
++        out.push(Stmt::Store { size: eb as u8, addr: t(BASE), value: elem(rt, index, es) });
++    }
++    writeback(out, w, rn, eb as u64);
++    Some(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::simd::Env;
++    use std::collections::BTreeMap;
++
++    #[derive(Clone, PartialEq, Debug)]
++    struct State {
++        x: [u64; 32],
++        sp: u64,
++        v: [u128; 32],
++        fpcr: u64,
++        fpsr: u64,
++        mem: BTreeMap<u64, u8>,
++    }
++
++    impl State {
++        fn byte(&self, a: u64) -> u8 {
++            // Unwritten memory reads as a fixed pattern of its address.
++            *self.mem.get(&a).unwrap_or(&((a.wrapping_mul(0x9e37_79b9) >> 7) as u8))
++        }
++        fn ld(&self, a: u64, size: u8) -> u64 {
++            (0..size as u64).map(|i| (self.byte(a.wrapping_add(i)) as u64) << (8 * i)).sum()
++        }
++        fn st(&mut self, a: u64, size: u8, v: u64) {
++            for i in 0..size as u64 {
++                self.mem.insert(a.wrapping_add(i), (v >> (8 * i)) as u8);
++            }
++        }
++    }
++
++    impl Env for State {
++        fn x(&self, n: u32) -> u64 {
++            if n == 31 { 0 } else { self.x[n as usize] }
++        }
++        fn set_x(&mut self, n: u32, v: u64) {
++            if n != 31 {
++                self.x[n as usize] = v;
++            }
++        }
++        fn sp(&self) -> u64 {
++            self.sp
++        }
++        fn set_sp(&mut self, v: u64) {
++            self.sp = v;
++        }
++        fn v(&self, n: u32) -> u128 {
++            self.v[n as usize]
++        }
++        fn set_v(&mut self, n: u32, v: u128) {
++            self.v[n as usize] = v;
++        }
++        fn nzcv(&self) -> u64 {
++            0
++        }
++        fn set_nzcv(&mut self, _: u64) {}
++        fn fpcr(&self) -> u64 {
++            self.fpcr
++        }
++        fn fpsr(&self) -> u64 {
++            self.fpsr
++        }
++        fn set_fpsr(&mut self, v: u64) {
++            self.fpsr = v;
++        }
++        fn load(&mut self, a: u64, size: u8) -> u64 {
++            self.ld(a, size)
++        }
++        fn store(&mut self, a: u64, size: u8, v: u64) {
++            self.st(a, size, v)
++        }
++    }
++
++    fn eval(s: &State, e: &Expr, tmp: &[u64; 8]) -> u64 {
++        match e {
++            Expr::Const(v) => *v,
++            Expr::Reg(n) => s.x[*n as usize],
++            Expr::Sp => s.sp,
++            Expr::Tmp(n) => tmp[*n as usize],
++            Expr::Op(o, args) => o.eval(&args.iter().map(|a| eval(s, a, tmp)).collect::<Vec<_>>()),
++            Expr::SysReg(SysReg::Fpcr) => s.fpcr,
++            Expr::V { reg, hi } => (s.v[*reg as usize] >> if *hi { 64 } else { 0 }) as u64,
++            Expr::Load { size, addr } => s.ld(eval(s, addr, tmp), *size),
++            other => panic!("unexpected {other:?}"),
++        }
++    }
++
++    fn run(s: &mut State, stmts: &[Stmt]) {
++        let mut tmp = [0u64; 8];
++        for st in stmts {
++            match st {
++                Stmt::Let(n, e) => tmp[*n as usize] = eval(s, e, &tmp),
++                Stmt::SetReg(n, e) => s.x[*n as usize] = eval(s, e, &tmp),
++                Stmt::SetSp(e) => s.sp = eval(s, e, &tmp),
++                Stmt::SetV { reg, hi, value } => {
++                    let v = eval(s, value, &tmp) as u128;
++                    let r = &mut s.v[*reg as usize];
++                    *r = if *hi { (*r & u64::MAX as u128) | v << 64 } else { (*r & !(u64::MAX as u128)) | v };
++                }
++                Stmt::Store { size, addr, value } => {
++                    let (a, v) = (eval(s, addr, &tmp), eval(s, value, &tmp));
++                    s.st(a, *size, v);
++                }
++                other => panic!("unexpected {other:?}"),
++            }
++        }
++    }
++
++    struct Rng(u64);
++
++    impl Rng {
++        fn next(&mut self) -> u64 {
++            self.0 ^= self.0 >> 12;
++            self.0 ^= self.0 << 25;
++            self.0 ^= self.0 >> 27;
++            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
++        }
++
++        fn lane32(&mut self) -> u64 {
++            let r = self.next();
++            let special = [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001, 0x0000_0001, 0x3f80_0000, 0xffff_ffff, 0x7fff_ffff, 0x80, 0x7f];
++            match r % 4 {
++                0 => special[(r >> 8) as usize % special.len()],
++                1 => (r >> 16) & 0xffff_ffff,
++                2 => ((r >> 20) % 0x60 + 0x40) << 23 | (r >> 32) & 0x7f_ffff | (r >> 63) << 31,
++                _ => (r >> 40) % 300,
++            }
++        }
++
++        fn state(&mut self) -> State {
++            let mut s = State { x: [0; 32], sp: 0x1000_0000 + (self.next() % 64) * 16, v: [0; 32], fpcr: 0, fpsr: 0, mem: BTreeMap::new() };
++            for i in 0..32 {
++                // Addresses mostly, small shift amounts and offsets sometimes.
++                s.x[i] = match self.next() % 3 {
++                    0 => 0x2000_0000 + self.next() % 4096,
++                    1 => self.next() % 80,
++                    _ => self.next(),
++                };
++                let lanes: Vec<u64> = (0..4).map(|_| self.lane32()).collect();
++                s.v[i] = (lanes[0] | lanes[1] << 32) as u128 | ((lanes[2] | lanes[3] << 32) as u128) << 64;
++                if self.next().is_multiple_of(5) {
++                    s.v[i] = self.next() as u128 | (self.next() as u128) << 64;
++                }
++            }
++            s.fpcr = [0, 0, 0, 1 << 24, 1 << 25, 3 << 24, 1 << 22, 3 << 22][(self.next() % 8) as usize];
++            s
++        }
++    }
++
++    /// (fixed bits, randomized bits) of each lifted form.
++    const FORMS: &[(u32, u32)] = &[
++        (0x0e20_5800, 0x6000_03ff), // CNT/NOT
++        (0x2e20_2800, 0x40c0_03ff), // UADDLP
++        (0x0e20_b800, 0x60c0_03ff), // ABS/NEG
++        (0x0e21_d800, 0x6040_03ff), // SCVTF/UCVTF
++        (0x0ea1_b800, 0x6040_03ff), // FCVTZS/FCVTZU
++        (0x0ea1_d800, 0x6000_03ff), // FRECPE/FRSQRTE
++        (0x2ea1_f800, 0x4040_03ff), // FSQRT
++        (0x2e30_3800, 0x40c0_03ff), // UADDLV
++        (0x0e31_b800, 0x40c0_03ff), // ADDV
++        (0x0e20_6400, 0x60df_0bff), // SMAX/UMAX/SMIN/UMIN
++        (0x0e20_a400, 0x60df_0bff), // SMAXP/...
++        (0x0e20_3400, 0x60df_0bff), // CMGT/CMHI/CMGE/CMHS
++        (0x0e20_8c00, 0x60df_03ff), // CMTST/CMEQ
++        (0x0e20_9400, 0x60df_0bff), // MLA/MLS/MUL
++        (0x0e20_4400, 0x60df_03ff), // SSHL/USHL
++        (0x2e20_fc00, 0x40df_03ff), // FDIV
++        (0x2ea0_d400, 0x40df_03ff), // FABD
++        (0x0e20_fc00, 0x40df_03ff), // FRECPS/FRSQRTS
++        (0x0f00_0400, 0x607f_13ff), // SSHR/USHR/SSRA/USRA
++        (0x0f00_0400, 0x6007_f3ff), // modified immediates
++        (0x7e30_d800, 0x0040_03ff), // FADDP scalar
++        (0x0c00_0000, 0x40c0_f3ff), // LD/ST multiple
++        (0x0c80_0000, 0x40df_f3ff), // LD/ST multiple, post-index
++        (0x0d00_0000, 0x4060_fc1f), // LD/ST single, LD1R
++        (0x0d80_0000, 0x407f_fc1f), // LD/ST single, post-index
++    ];
++
++    #[test]
++    fn lifted_forms_match_simd_exec() {
++        let mut rng = Rng(0x5eed_0f_c0ffee);
++        for &(base, random) in FORMS {
++            let mut lifted = 0;
++            for _ in 0..6000 {
++                let mut w = base | (rng.next() as u32 & random);
++                // Keep base registers on addresses and away from SP-relative surprises.
++                if base & 0x0e00_0000 == 0x0c00_0000 {
++                    w = (w & !(0x1f << 5)) | ((rng.next() % 30) as u32) << 5;
++                }
++                let Some(stmts) = lift(w) else { continue };
++                if crate::lift_fp::lift(w).is_some() {
++                    continue; // handled by the earlier lifter, not this one
++                }
++                assert!(crate::simd::supported(w), "{w:08x} lifted but not supported by simd::exec");
++                lifted += 1;
++                for _ in 0..4 {
++                    let mut start = rng.state();
++                    let rn = bits(w, 5, 5);
++                    if base & 0x0e00_0000 == 0x0c00_0000 && rn != 31 {
++                        start.x[rn as usize] = 0x3000_0000 + rng.next() % 4096;
++                    }
++                    let mut want = start.clone();
++                    assert!(crate::simd::exec(&mut want, w), "{w:08x}");
++                    let mut got = start.clone();
++                    run(&mut got, &stmts);
++                    assert_eq!(got, want, "{w:08x}: {stmts:?}");
++                }
++            }
++            assert!(lifted >= 60, "{base:08x}/{random:08x}: only {lifted} words lifted");
++        }
++    }
++
++    /// Words from a profile of the game, hottest first: all must be lifted now.
++    #[test]
++    fn hot_words_are_lifted() {
++        for w in [
++            0x6e60_28c6u32, 0x4eb1_b8c6, 0x6ea0_28c6, 0x0d40_9201, 0x0d40_9084, 0x4d40_9084, 0x4d40_8084, 0x4f2c_0423, 0x2e30_3a31,
++            0x4e20_5a31, 0x6e20_2a06, 0x2e23_fc41, 0x0d40_c9a3, 0x4c9f_a820, 0x4cdf_a800, 0x4c40_a802, 0x4c00_a822, 0x4d00_8246,
++            0x4eb1_fe52, 0x6ea1_d8f0, 0x6e20_5a72, 0x4ea4_34e7, 0x4d40_c900, 0x6e21_d800, 0x0ea0_a400, 0x4f21_0463, 0x6f3f_0606,
++            0x4e61_4401, 0x0ea7_acc6, 0x0c00_8803, 0x0c9f_8801, 0x4f03_f600, 0x4cdf_7823, 0x4e21_d800, 0x4f03_d7ea, 0x4ea1_b800,
++            0x0ddf_8466, 0x4ddf_8464, 0x4c89_7880, 0x4c40_28f0, 0x6e30_fce7, 0x6f18_1486, 0x4e66_9627, 0x7e30_d844, 0x6e23_fc00,
++            0x0ea1_ac21, 0x4d00_8121,
++        ] {
++            assert!(crate::lift::lift(0, w).stmts.iter().all(|s| !matches!(s, Stmt::Simd(_))), "{w:08x} still interpreted");
++        }
++    }
++}
+diff --git a/crates/a64/src/ops.rs b/crates/a64/src/ops.rs
+index 3b096fe..ae48dfb 100644
+--- a/crates/a64/src/ops.rs
++++ b/crates/a64/src/ops.rs
+@@ -124,6 +124,10 @@ define_ops! {
+     FSqrt64 => fsqrt64(a, fpcr);
+     FCvtSD => fcvtsd(a, fpcr);
+     FCvtDS => fcvtds(a, fpcr);
++    FRecpe32x2 => frecpe32x2(a, fpcr);
++    FRsqrte32x2 => frsqrte32x2(a, fpcr);
++    FRecps32x2 => frecps32x2(a, b, fpcr);
++    FRsqrts32x2 => frsqrts32x2(a, b, fpcr);
+ }
+ 
+ #[inline(always)]
+@@ -582,3 +586,16 @@ mod tests {
+         assert_eq!(extr64(1, 0, 1), 1 << 63);
+     }
+ }
++
++pub fn frecpe32x2(a: u64, fpcr: u64) -> u64 {
++    lanes2(a, 0, |x, _| f32b::recip_estimate(x as u32, Fpcr::from_bits(fpcr)) as u64)
++}
++pub fn frsqrte32x2(a: u64, fpcr: u64) -> u64 {
++    lanes2(a, 0, |x, _| f32b::rsqrt_estimate(x as u32, Fpcr::from_bits(fpcr)) as u64)
++}
++pub fn frecps32x2(a: u64, b: u64, fpcr: u64) -> u64 {
++    lanes2(a, b, |x, y| f32b::recip_step(x as u32, y as u32, Fpcr::from_bits(fpcr)) as u64)
++}
++pub fn frsqrts32x2(a: u64, b: u64, fpcr: u64) -> u64 {
++    lanes2(a, b, |x, y| f32b::rsqrt_step(x as u32, y as u32, Fpcr::from_bits(fpcr)) as u64)
++}
+diff --git a/crates/recomp/tests/clif_neon.rs b/crates/recomp/tests/clif_neon.rs
+new file mode 100644
+index 0000000..c40f0d8
+--- /dev/null
++++ b/crates/recomp/tests/clif_neon.rs
+@@ -0,0 +1,179 @@
++//! Vector instructions lifted to IR (lift_fp, lift_neon) compiled with Cranelift must give the
++//! same registers as the vector interpreter.
++
++use std::collections::BTreeSet;
++
++use cranelift_jit::{JITBuilder, JITModule};
++use kirikae_a64::simd::Env;
++use kirikae_a64::{Insn, Stmt};
++use kirikae_recomp::clif::{host_isa, Compiler};
++use kirikae_recomp::{Block, Function};
++use kirikae_rt::abi;
++
++#[derive(Clone, Debug, PartialEq)]
++struct State {
++    x: [u64; 32],
++    v: [u128; 32],
++    fpcr: u64,
++    fpsr: u64,
++}
++
++impl Env for State {
++    fn x(&self, n: u32) -> u64 {
++        if n == 31 { 0 } else { self.x[n as usize] }
++    }
++    fn set_x(&mut self, n: u32, v: u64) {
++        if n != 31 {
++            self.x[n as usize] = v;
++        }
++    }
++    fn sp(&self) -> u64 {
++        0
++    }
++    fn set_sp(&mut self, _: u64) {}
++    fn v(&self, n: u32) -> u128 {
++        self.v[n as usize]
++    }
++    fn set_v(&mut self, n: u32, v: u128) {
++        self.v[n as usize] = v;
++    }
++    fn nzcv(&self) -> u64 {
++        0
++    }
++    fn set_nzcv(&mut self, _: u64) {}
++    fn fpcr(&self) -> u64 {
++        self.fpcr
++    }
++    fn fpsr(&self) -> u64 {
++        self.fpsr
++    }
++    fn set_fpsr(&mut self, v: u64) {
++        self.fpsr = v;
++    }
++    fn load(&mut self, _: u64, _: u8) -> u64 {
++        unreachable!()
++    }
++    fn store(&mut self, _: u64, _: u8, _: u64) {
++        unreachable!()
++    }
++}
++
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 >> 12;
++        self.0 ^= self.0 << 25;
++        self.0 ^= self.0 >> 27;
++        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
++    }
++    fn lane(&mut self) -> u64 {
++        let r = self.next();
++        let special = [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001, 1, 0x3f80_0000, 0xffff_ffff, 0x7fff_ffff, 0x80, 5];
++        match r % 4 {
++            0 => special[(r >> 8) as usize % special.len()],
++            1 => (r >> 16) & 0xffff_ffff,
++            2 => ((r >> 20) % 0x60 + 0x40) << 23 | (r >> 32) & 0x7f_ffff | (r >> 63) << 31,
++            _ => (r >> 40) % 300,
++        }
++    }
++    fn state(&mut self) -> State {
++        let mut s = State { x: [0; 32], v: [0; 32], fpcr: [0, 0, 1 << 24, 3 << 22][(self.next() % 4) as usize], fpsr: 0 };
++        for i in 0..32 {
++            s.x[i] = self.next();
++            let l: Vec<u64> = (0..4).map(|_| self.lane()).collect();
++            s.v[i] = (l[0] | l[1] << 32) as u128 | ((l[2] | l[3] << 32) as u128) << 64;
++        }
++        s
++    }
++}
++
++/// Register-only forms from the game's hot list plus random words of each lifted form.
++const HOT: &[u32] = &[
++    0x6e60_28c6, 0x4eb1_b8c6, 0x6ea0_28c6, 0x4f2c_0423, 0x2e30_3a31, 0x4e20_5a31, 0x6e20_2a06, 0x2e23_fc41, 0x4eb1_fe52, 0x6ea1_d8f0,
++    0x6e20_5a72, 0x4ea4_34e7, 0x6e21_d800, 0x0ea0_a400, 0x4f21_0463, 0x6f3f_0606, 0x4e61_4401, 0x0ea7_acc6, 0x4f03_f600, 0x4e21_d800,
++    0x4f03_d7ea, 0x4ea1_b800, 0x6e30_fce7, 0x6f18_1486, 0x4e66_9627, 0x7e30_d844, 0x6e23_fc00, 0x0ea1_ac21, 0x0e20_5800, 0x2e30_3800,
++];
++const FORMS: &[(u32, u32)] = &[
++    (0x0e20_5800, 0x6000_03ff),
++    (0x2e20_2800, 0x40c0_03ff),
++    (0x0e20_b800, 0x60c0_03ff),
++    (0x0e21_d800, 0x6040_03ff),
++    (0x0ea1_b800, 0x6040_03ff),
++    (0x0ea1_d800, 0x6000_03ff),
++    (0x2e30_3800, 0x40c0_03ff),
++    (0x0e31_b800, 0x40c0_03ff),
++    (0x0e20_6400, 0x60df_0bff),
++    (0x0e20_a400, 0x60df_0bff),
++    (0x0e20_3400, 0x60df_0bff),
++    (0x0e20_8c00, 0x60df_03ff),
++    (0x0e20_9400, 0x60df_0bff),
++    (0x0e20_4400, 0x60df_03ff),
++    (0x2e20_fc00, 0x40df_03ff),
++    (0x2ea0_d400, 0x40df_03ff),
++    (0x0e20_fc00, 0x40df_03ff),
++    (0x0f00_0400, 0x607f_13ff),
++    (0x0f00_0400, 0x6007_f3ff),
++    (0x7e30_d800, 0x0040_03ff),
++];
++
++fn compile(words: &[u32]) -> Vec<extern "C" fn(*mut u64)> {
++    let mut b = JITBuilder::with_isa(host_isa().unwrap(), cranelift_module::default_libcall_names());
++    for (name, ptr) in abi::helpers() {
++        b.symbol(name, ptr);
++    }
++    let mut c = Compiler::new(JITModule::new(b)).unwrap();
++    let entries: BTreeSet<u64> = (0..words.len() as u64).map(|i| 0x1000 + 8 * i).collect();
++    let mut ids = Vec::new();
++    for (i, &w) in words.iter().enumerate() {
++        let addr = 0x1000 + 8 * i as u64;
++        let mut stmts = kirikae_a64::lift(addr, w).stmts;
++        assert!(!stmts.iter().any(|s| matches!(s, Stmt::Simd(_) | Stmt::Undefined(_))), "{w:08x} is not lifted");
++        stmts.push(Stmt::Return(kirikae_a64::Expr::Const(0)));
++        let f = Function { entry: addr, blocks: vec![Block { start: addr, insns: vec![Insn { addr, word: w, stmts }], next: addr + 4 }] };
++        ids.push(c.compile(&f, &entries).unwrap());
++    }
++    c.module.finalize_definitions().unwrap();
++    let fns = ids.into_iter().map(|id| unsafe { std::mem::transmute::<*const u8, extern "C" fn(*mut u64)>(c.module.get_finalized_function(id)) }).collect();
++    std::mem::forget(c);
++    fns
++}
++
++#[test]
++fn compiled_vector_instructions_match_the_interpreter() {
++    let mut rng = Rng(0xc1f_0e0e_5eed);
++    let mut words: Vec<u32> = HOT.to_vec();
++    for &(base, random) in FORMS {
++        let mut n = 0;
++        while n < 60 {
++            let w = base | (rng.next() as u32 & random);
++            let insn = kirikae_a64::lift(0, w);
++            if kirikae_a64::simd::supported(w) && !insn.stmts.iter().any(|s| matches!(s, Stmt::Simd(_) | Stmt::Undefined(_))) {
++                words.push(w);
++                n += 1;
++            }
++        }
++    }
++    let fns = compile(&words);
++    let mut cpu = vec![0u64; 2048];
++    for (&w, f) in words.iter().zip(&fns) {
++        for _ in 0..8 {
++            let start = rng.state();
++            let mut want = start.clone();
++            assert!(kirikae_a64::simd::exec(&mut want, w), "{w:08x}");
++            for k in 0..31 {
++                cpu[abi::OFF_X / 8 + k] = start.x[k];
++            }
++            for k in 0..32 {
++                cpu[abi::OFF_V / 8 + 2 * k] = start.v[k] as u64;
++                cpu[abi::OFF_V / 8 + 2 * k + 1] = (start.v[k] >> 64) as u64;
++            }
++            cpu[abi::OFF_FPCR / 8] = start.fpcr;
++            f(cpu.as_mut_ptr());
++            for k in 0..32 {
++                let got = cpu[abi::OFF_V / 8 + 2 * k] as u128 | (cpu[abi::OFF_V / 8 + 2 * k + 1] as u128) << 64;
++                assert_eq!(got, want.v[k], "{w:08x}: v{k} (fpcr {:x}) from {:x}", start.fpcr, start.v[k]);
++            }
++        }
++    }
++}

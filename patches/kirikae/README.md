@@ -326,3 +326,27 @@ version, and opens `game\romfs.bin` (any valid RomFS image: the game mounts the 
 Problems before the window opens are shown in a message box. When the process has no
 stderr (GUI subsystem, started from Explorer), stdout and stderr go to `<exe>.log`, and a
 panic shows a message box naming the log. Development builds are unchanged.
+
+## 0024 - lift the hot vector instructions
+
+On a Steam Deck the build was unplayable while Ryujinx runs the game smoothly. The cause is
+CPU time in the runtime: the main thread ran about 7 million NEON instructions a second
+through the vector interpreter (`Stmt::Simd` -> `kirikae_simd`), each one decoded and executed
+through a `dyn Env`, and each one also flushing the recompiler's cached registers. A histogram
+of one race (`KIRIKAE_SIMD_HIST`, 1.38 billion calls in 190 s) put 37% in bit counting (CNT,
+UADDLP, UADDLV, ADDV), then lane and structure loads/stores, reciprocal square root
+estimate/step, integer<->float conversions, vector divide, pairwise min/max, shifts.
+
+`a64/src/lift_neon.rs` lifts those to IR the Cranelift backend compiles inline: CNT, NOT,
+UADDLP, ABS/NEG, SCVTF/UCVTF, FCVTZS/FCVTZU, FRECPE/FRSQRTE, FSQRT (vector), UADDLV, ADDV,
+S/U MAX/MIN (and pairwise), CMGT/CMHI/CMGE/CMHS/CMTST/CMEQ, MLA/MLS/MUL, SSHL/USHL, FDIV,
+FABD, FRECPS/FRSQRTS, SSHR/USHR/SSRA/USRA, all modified immediates (MOVI/MVNI/ORR/BIC/FMOV),
+FADDP (scalar), LD1-4/ST1-4 (multiple structures), LD1/ST1 (single lane) and LD1R, with
+post-index writeback. The estimate and step instructions use four new ops that call the same
+functions as the interpreter. That covers 99.3% of the recorded calls.
+
+Tests: every form is compared with `simd::exec` on random registers, memory and FPCR values
+(a64 `lift_neon` tests; four deliberate bugs were each caught), and
+`recomp/tests/clif_neon.rs` compiles the lifted code with Cranelift and compares the result
+with the interpreter. `cargo run --example simd_coverage <hist>` (a64) reports how much of a
+histogram is still interpreted.
