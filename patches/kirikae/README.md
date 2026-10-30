@@ -350,3 +350,22 @@ Tests: every form is compared with `simd::exec` on random registers, memory and 
 `recomp/tests/clif_neon.rs` compiles the lifted code with Cranelift and compares the result
 with the interpreter. `cargo run --example simd_coverage <hist>` (a64) reports how much of a
 histogram is still interpreted.
+
+## 0025 - compares compile to native compare-and-branch
+
+Every AArch64 flag-setting instruction (CMP, CMN, ADDS, SUBS, ANDS/TST, ADCS...) computed all
+four flags, packed them into NZCV and stored it, and every `b.cond`/`csel` unpacked the one bit
+it needed again: about 25 x86 instructions for a compare and branch. `recomp/src/flags.rs`
+finds the flag-setting statements whose flags are only read as conditions (`Cond`) or the
+carry inside their own block and are dead when the block ends (a function-wide liveness pass;
+flags are dead after calls and at returns, as the AArch64 procedure call standard allows,
+and stay live across indirect jumps and jumps out of the function). For those the code
+generator keeps the operands instead of NZCV and emits one native comparison per condition
+(the inverse comparison for negated conditions). 10% less code for the whole game (609 ->
+549 MB); the hottest function shrinks by 28%.
+
+Tests: `recomp/tests/flag_fusion.rs` compiles 600 random compare-heavy functions (32- and
+64-bit compares, ADDS, ADCS, ANDS, conditions read in later blocks, calls, back edges, raw NZCV
+reads) with fusion on and off and runs each 6 times from random state: registers, SP, vector
+registers and memory must match. Deliberately broken conditions, carry, liveness, 32-bit
+handling and inversion were each caught. `KIRIKAE_NO_FLAG_FUSION=1` at build time turns it off.

@@ -1,0 +1,878 @@
+diff --git a/crates/recomp/src/clif.rs b/crates/recomp/src/clif.rs
+index 75d28d6..5cf2d07 100644
+--- a/crates/recomp/src/clif.rs
++++ b/crates/recomp/src/clif.rs
+@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Mutex;
+ 
+-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
++use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
+ use cranelift_codegen::ir::{self, types, AbiParam, BlockArg, InstBuilder, MemFlagsData, Signature, UserFuncName, Value};
+ use cranelift_codegen::isa::OwnedTargetIsa;
+ use cranelift_codegen::settings::{self, Configurable};
+@@ -95,6 +95,7 @@ pub struct Compiler<M: Module> {
+     ctx: Context,
+     fctx: FunctionBuilderContext,
+     fast_regs: bool,
++    fuse_flags: bool,
+ }
+ 
+ impl<M: Module> Compiler<M> {
+@@ -124,7 +125,13 @@ impl<M: Module> Compiler<M> {
+         };
+         let guest_sig = sig(&module, &[ptr], None);
+         let ctx = module.make_context();
+-        Ok(Compiler { module, helpers, guest_sig, funcs: HashMap::new(), ctx, fctx: FunctionBuilderContext::new(), fast_regs: false })
++        Ok(Compiler { module, helpers, guest_sig, funcs: HashMap::new(), ctx, fctx: FunctionBuilderContext::new(), fast_regs: false, fuse_flags: std::env::var_os("KIRIKAE_NO_FLAG_FUSION").is_none() })
++    }
++
++    /// Compares whose flags are only used by conditions compile to direct comparisons
++    /// (on by default; `KIRIKAE_NO_FLAG_FUSION=1` turns it off at build time).
++    pub fn set_fuse_flags(&mut self, on: bool) {
++        self.fuse_flags = on;
+     }
+ 
+     pub fn set_fast_regs(&mut self, on: bool) {
+@@ -177,7 +184,7 @@ impl<M: Module> Compiler<M> {
+                 store_exclusive: m.declare_func_in_func(h.store_exclusive, b.func),
+             };
+             let callees: HashMap<u64, ir::FuncRef> = callee_ids.iter().map(|(a, id)| (*a, m.declare_func_in_func(*id, b.func))).collect();
+-            Lower::function(&mut b, f, entries, helpers, callees, self.fast_regs);
++            Lower::function(&mut b, f, entries, helpers, callees, self.fast_regs, self.fuse_flags);
+             b.seal_all_blocks();
+             b.finalize(self.module.target_config());
+         }
+@@ -198,6 +205,20 @@ struct Lower<'a, 'b> {
+     dispatch: Option<ir::Block>,
+     block_start: u64,
+     cache: Option<Cache>,
++    /// SetNzcv statements whose flags are never materialized (see `flags`).
++    fusable: std::collections::HashSet<(u64, usize)>,
++    /// The operands of the last such compare in this block.
++    pending: Option<Pending>,
++}
++
++#[derive(Clone, Copy)]
++enum Pending {
++    /// a - x (CMP/SUBS/NEGS form: FlagsAdd(a, !x, 1)).
++    Sub { a: Value, x: Value, narrow: bool },
++    /// a + b + carry-in (ADDS/ADCS/SBCS forms).
++    Add { a: Value, b: Value, cin: Value, narrow: bool },
++    /// Result of a logical op (ANDS/TST/BICS): C = V = 0.
++    Logic { r: Value, narrow: bool },
+ }
+ 
+ type Temps = [Option<Value>; 8];
+@@ -475,7 +496,7 @@ struct Cache {
+ }
+ 
+ impl Lower<'_, '_> {
+-    fn function(b: &mut FunctionBuilder, f: &Function, entries: &BTreeSet<u64>, h: HelperRefs, callees: HashMap<u64, ir::FuncRef>, fast_regs: bool) {
++    fn function(b: &mut FunctionBuilder, f: &Function, entries: &BTreeSet<u64>, h: HelperRefs, callees: HashMap<u64, ir::FuncRef>, fast_regs: bool, fuse_flags: bool) {
+         let entry = b.create_block();
+         b.append_block_params_for_function_params(entry);
+         b.switch_to_block(entry);
+@@ -494,13 +515,15 @@ impl Lower<'_, '_> {
+             state: RegState::default(),
+             entry: plan_registers(f),
+         });
+-        let mut l = Lower { b, cpu, mem, h, blocks, callees, ret, dispatch, block_start: f.entry, cache };
++        let fusable = if fuse_flags { crate::flags::fusable(f) } else { Default::default() };
++        let mut l = Lower { b, cpu, mem, h, blocks, callees, ret, dispatch, block_start: f.entry, cache, fusable, pending: None };
+         l.edge(f.entry);
+         l.b.ins().jump(l.blocks[&f.entry], &[]);
+         let _ = entries;
+ 
+         for g in &f.blocks {
+             l.block_start = g.start;
++            l.pending = None;
+             l.b.switch_to_block(l.blocks[&g.start]);
+             if let Some(c) = &mut l.cache {
+                 c.state = c.entry[&g.start];
+@@ -688,6 +711,10 @@ impl Lower<'_, '_> {
+             Some(Expr::Const(v)) => Some(*v),
+             _ => None,
+         };
++        if let (Some(p), Op::Cond | Op::Carry, Some(Expr::Nzcv)) = (self.pending, op, args.first()) {
++            let cc = if op == Op::Carry { None } else { Some(k(1).expect("condition codes are constants")) };
++            return self.fused_condition(p, cc);
++        }
+         match op {
+             Op::Ubfm64 | Op::Ubfm32 | Op::Sbfm64 | Op::Sbfm32 | Op::Bfm64 | Op::Bfm32 | Op::Extr64 | Op::Extr32 | Op::Cond => {
+                 if let Some(v) = self.op_with_immediates(op, args, t, &k) {
+@@ -974,6 +1001,164 @@ impl Lower<'_, '_> {
+         })
+     }
+ 
++    /// Operands of a fusable flag computation.
++    fn pend(&mut self, e: &Expr, t: &Temps) -> Option<Pending> {
++        let Expr::Op(op, args) = e else { return None };
++        match (op, args.as_slice()) {
++            (Op::FlagsAdd64 | Op::FlagsAdd32, [a, b, cin]) => {
++                let narrow = *op == Op::FlagsAdd32;
++                if let (Expr::Op(Op::Not, x), Expr::Const(1)) = (b, cin) {
++                    let (a, x) = (self.expr(a, t), self.expr(&x[0], t));
++                    return Some(Pending::Sub { a, x, narrow });
++                }
++                let (a, b, cin) = (self.expr(a, t), self.expr(b, t), self.expr(cin, t));
++                Some(Pending::Add { a, b, cin, narrow })
++            }
++            (Op::FlagsLogic64 | Op::FlagsLogic32, [r]) => {
++                let r = self.expr(r, t);
++                Some(Pending::Logic { r, narrow: *op == Op::FlagsLogic32 })
++            }
++            _ => None,
++        }
++    }
++
++    /// `Cond(Nzcv, cc)` (cc = Some) or `Carry(Nzcv)` (cc = None) straight from the compare's
++    /// operands: 0 or 1.
++    fn fused_condition(&mut self, p: Pending, cc: Option<u64>) -> Value {
++        let narrow = match p {
++            Pending::Sub { narrow, .. } | Pending::Add { narrow, .. } | Pending::Logic { narrow, .. } => narrow,
++        };
++        let w = |l: &mut Self, v: Value| if narrow { l.r32(v) } else { v };
++        // Individual flags as I8 booleans, computed on demand.
++        enum F {
++            N,
++            Z,
++            C,
++            V,
++        }
++        let flag = |l: &mut Self, f: F| -> Value {
++            match p {
++                Pending::Sub { a, x, .. } => {
++                    let (a, x) = (w(l, a), w(l, x));
++                    match f {
++                        F::Z => l.b.ins().icmp(IntCC::Equal, a, x),
++                        F::C => l.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, a, x),
++                        F::N => {
++                            let d = l.b.ins().isub(a, x);
++                            l.b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0)
++                        }
++                        F::V => {
++                            let d = l.b.ins().isub(a, x);
++                            let ax = l.b.ins().bxor(a, x);
++                            let ad = l.b.ins().bxor(a, d);
++                            let o = l.b.ins().band(ax, ad);
++                            l.b.ins().icmp_imm_s(IntCC::SignedLessThan, o, 0)
++                        }
++                    }
++                }
++                Pending::Add { a, b, cin, .. } => {
++                    let (a, b, cin) = (w(l, a), w(l, b), w(l, cin));
++                    let cin = l.b.ins().band_imm_u(cin, 1);
++                    let r1 = l.b.ins().iadd(a, b);
++                    let r = l.b.ins().iadd(r1, cin);
++                    match f {
++                        F::Z => l.b.ins().icmp_imm_s(IntCC::Equal, r, 0),
++                        F::N => l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0),
++                        F::C => {
++                            let c1 = l.b.ins().icmp(IntCC::UnsignedLessThan, r1, a);
++                            let c2 = l.b.ins().icmp(IntCC::UnsignedLessThan, r, r1);
++                            l.b.ins().bor(c1, c2)
++                        }
++                        F::V => {
++                            let ar = l.b.ins().bxor(a, r);
++                            let br = l.b.ins().bxor(b, r);
++                            let o = l.b.ins().band(ar, br);
++                            l.b.ins().icmp_imm_s(IntCC::SignedLessThan, o, 0)
++                        }
++                    }
++                }
++                Pending::Logic { r, .. } => {
++                    let r = w(l, r);
++                    match f {
++                        F::Z => l.b.ins().icmp_imm_s(IntCC::Equal, r, 0),
++                        F::N => l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0),
++                        F::C | F::V => l.b.ins().iconst(types::I8, 0),
++                    }
++                }
++            }
++        };
++        let Some(cc) = cc else {
++            let c = flag(self, F::C);
++            return self.bool64(c);
++        };
++        let base = (cc >> 1) & 7;
++        let invert = cc & 1 == 1 && cc != 15;
++        // One comparison for the common compare forms, inverted through its inverse condition.
++        let pick = |c: IntCC| if invert { c.complement() } else { c };
++        let direct = match (p, base) {
++            (_, 7) => None,
++            (Pending::Sub { a, x, .. }, 0 | 1 | 4 | 5 | 6) => {
++                let (a, x) = (w(self, a), w(self, x));
++                let c = match base {
++                    0 => IntCC::Equal,
++                    1 => IntCC::UnsignedGreaterThanOrEqual,
++                    4 => IntCC::UnsignedGreaterThan,
++                    5 => IntCC::SignedGreaterThanOrEqual,
++                    _ => IntCC::SignedGreaterThan,
++                };
++                Some(self.b.ins().icmp(pick(c), a, x))
++            }
++            (Pending::Logic { .. }, 0 | 2 | 5 | 6) | (Pending::Add { .. }, 0 | 2) => {
++                let r = match p {
++                    Pending::Logic { r, .. } => w(self, r),
++                    Pending::Add { a, b, cin, .. } => {
++                        let (a, b, cin) = (w(self, a), w(self, b), w(self, cin));
++                        let cin = self.b.ins().band_imm_u(cin, 1);
++                        let r1 = self.b.ins().iadd(a, b);
++                        self.b.ins().iadd(r1, cin)
++                    }
++                    Pending::Sub { .. } => unreachable!(),
++                };
++                let c = match base {
++                    0 => IntCC::Equal,
++                    2 => IntCC::SignedLessThan,
++                    5 => IntCC::SignedGreaterThanOrEqual,
++                    _ => IntCC::SignedGreaterThan,
++                };
++                Some(self.b.ins().icmp_imm_s(pick(c), r, 0))
++            }
++            _ => None,
++        };
++        if let Some(v) = direct {
++            return self.bool64(v);
++        }
++        let value = match base {
++                0 => flag(self, F::Z),
++                1 => flag(self, F::C),
++                2 => flag(self, F::N),
++                3 => flag(self, F::V),
++                4 => {
++                    let c = flag(self, F::C);
++                    let z = flag(self, F::Z);
++                    self.b.ins().band_not(c, z)
++                }
++                5 | 6 => {
++                    let n = flag(self, F::N);
++                    let v = flag(self, F::V);
++                    let ge = self.b.ins().icmp(IntCC::Equal, n, v);
++                    if base == 5 {
++                        ge
++                    } else {
++                        let z = flag(self, F::Z);
++                        self.b.ins().band_not(ge, z)
++                    }
++                }
++                _ => self.b.ins().iconst(types::I8, 1),
++        };
++        let value = if invert { self.b.ins().bxor_imm_u(value, 1) } else { value };
++        self.bool64(value)
++    }
++
+     fn flags_add(&mut self, a: Value, b: Value, carry: Value, narrow: bool) -> Value {
+         let (a, b, cin) = if narrow {
+             (self.r32(a), self.r32(b), self.r32(carry))
+@@ -1198,8 +1383,16 @@ impl Lower<'_, '_> {
+ 
+     fn insn(&mut self, insn: &Insn) -> bool {
+         let mut t: Temps = [None; 8];
+-        for s in &insn.stmts {
++        for (k, s) in insn.stmts.iter().enumerate() {
+             match s {
++                Stmt::SetNzcv(e) if self.fusable.contains(&(insn.addr, k)) => {
++                    let p = self.pend(e, &t);
++                    self.pending = p;
++                    if p.is_none() {
++                        let v = self.expr(e, &t);
++                        self.write(NZCV_SLOT, v);
++                    }
++                }
+                 Stmt::Let(n, e) => t[*n as usize] = Some(self.expr(e, &t)),
+                 Stmt::SetReg(n, e) => {
+                     let v = self.expr(e, &t);
+@@ -1212,6 +1405,7 @@ impl Lower<'_, '_> {
+                 Stmt::SetNzcv(e) => {
+                     let v = self.expr(e, &t);
+                     self.write(NZCV_SLOT, v);
++                    self.pending = None;
+                 }
+                 Stmt::SetV { reg, hi, value } => {
+                     let v = self.expr(value, &t);
+diff --git a/crates/recomp/src/flags.rs b/crates/recomp/src/flags.rs
+new file mode 100644
+index 0000000..e90f8b6
+--- /dev/null
++++ b/crates/recomp/src/flags.rs
+@@ -0,0 +1,245 @@
++//! Which flag-setting statements can skip materializing NZCV.
++//!
++//! A compare (`SetNzcv(FlagsAdd*/FlagsLogic*)`) whose flags are only used by conditions
++//! (`Cond(Nzcv, cc)`) and the carry (`Carry(Nzcv)`) inside its own block, and are dead when the
++//! block ends, is compiled to direct comparisons on its operands: the packed NZCV value is
++//! never built or stored. Flags are dead across calls and returns (the AArch64 procedure call
++//! standard does not preserve them); leaving the function any other way keeps them live.
++
++use std::collections::{HashMap, HashSet};
++
++use kirikae_a64::{Expr, Op, Stmt};
++
++use crate::Function;
++
++/// Statements (instruction address, statement index) whose flags never need to exist.
++pub fn fusable(f: &Function) -> HashSet<(u64, usize)> {
++    let index: HashMap<u64, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
++    let n = f.blocks.len();
++
++    // Per block: successors inside the function, whether leaving keeps flags live, whether the
++    // block reads flags before writing them, and whether it writes them at all.
++    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
++    let mut exit_live = vec![false; n];
++    let mut reads_first = vec![false; n];
++    let mut writes = vec![false; n];
++    for (i, b) in f.blocks.iter().enumerate() {
++        let target = |t: u64, succ: &mut Vec<usize>, exit: &mut bool| match index.get(&t) {
++            Some(&j) => succ.push(j),
++            None => *exit = true,
++        };
++        let mut written = false;
++        let mut ends = false;
++        'scan: for insn in &b.insns {
++            for s in &insn.stmts {
++                let reads = stmt_reads(s);
++                if reads && !written {
++                    reads_first[i] = true;
++                }
++                match s {
++                    Stmt::SetNzcv(_) | Stmt::Simd(_) => written = true,
++                    Stmt::Call(_) | Stmt::CallIndirect(_) | Stmt::Return(_) => {
++                        // Flags are dead after a call (the callee's) and at a return.
++                        written = true;
++                        ends = true;
++                        break 'scan;
++                    }
++                    Stmt::Jump(t) => {
++                        target(*t, &mut succ[i], &mut exit_live[i]);
++                        ends = true;
++                        break 'scan;
++                    }
++                    Stmt::JumpIf(_, t) => {
++                        target(*t, &mut succ[i], &mut exit_live[i]);
++                        target(insn.next(), &mut succ[i], &mut exit_live[i]);
++                        ends = true;
++                        break 'scan;
++                    }
++                    Stmt::JumpIndirect(_) | Stmt::Undefined(_) => {
++                        exit_live[i] = true;
++                        ends = true;
++                        break 'scan;
++                    }
++                    _ => {}
++                }
++            }
++        }
++        if !ends {
++            target(b.next, &mut succ[i], &mut exit_live[i]);
++        }
++        writes[i] = written;
++    }
++
++    // live_in[b] = reads_first || (!writes && live_out); live_out = exit_live || any succ live_in.
++    let mut live_in = reads_first.clone();
++    loop {
++        let mut changed = false;
++        for i in (0..n).rev() {
++            let out = exit_live[i] || succ[i].iter().any(|&j| live_in[j]);
++            let v = reads_first[i] || (!writes[i] && out);
++            if v != live_in[i] {
++                live_in[i] = v;
++                changed = true;
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    let live_out = |i: usize| exit_live[i] || succ[i].iter().any(|&j| live_in[j]);
++
++    let mut out = HashSet::new();
++    for (bi, b) in f.blocks.iter().enumerate() {
++        let stmts: Vec<(u64, usize, &Stmt)> =
++            b.insns.iter().flat_map(|insn| insn.stmts.iter().enumerate().map(move |(k, s)| (insn.addr, k, s))).collect();
++        for (pos, &(addr, k, s)) in stmts.iter().enumerate() {
++            let Stmt::SetNzcv(e) = s else { continue };
++            if !fusable_form(e) {
++                continue;
++            }
++            if window_ok(&stmts[pos + 1..], || live_out(bi)) {
++                out.insert((addr, k));
++            }
++        }
++    }
++    out
++}
++
++/// A flag computation the code generator can turn into direct comparisons.
++pub fn fusable_form(e: &Expr) -> bool {
++    matches!(e, Expr::Op(Op::FlagsAdd64 | Op::FlagsAdd32 | Op::FlagsLogic64 | Op::FlagsLogic32, _))
++}
++
++/// After a fusable SetNzcv: every use until the flags die is a condition or the carry.
++fn window_ok(rest: &[(u64, usize, &Stmt)], live_out: impl Fn() -> bool) -> bool {
++    for &(_, _, s) in rest {
++        if !only_condition_reads(s) {
++            return false;
++        }
++        match s {
++            Stmt::SetNzcv(_) | Stmt::Call(_) | Stmt::CallIndirect(_) | Stmt::Return(_) => return true,
++            Stmt::Simd(_) | Stmt::Svc(_) | Stmt::Undefined(_) | Stmt::JumpIndirect(_) => return false,
++            Stmt::Jump(_) | Stmt::JumpIf(..) => return !live_out(),
++            _ => {}
++        }
++    }
++    !live_out()
++}
++
++fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
++    match s {
++        Stmt::Let(_, e) | Stmt::SetReg(_, e) | Stmt::SetSp(e) | Stmt::SetNzcv(e) | Stmt::SetSysReg(_, e) => vec![e],
++        Stmt::SetV { value, .. } => vec![value],
++        Stmt::Store { addr, value, .. } => vec![addr, value],
++        Stmt::Monitor { addr, lo, hi } | Stmt::StoreExclusive { addr, lo, hi, .. } => vec![addr, lo, hi],
++        Stmt::JumpIf(e, _) | Stmt::JumpIndirect(e) | Stmt::CallIndirect(e) | Stmt::Return(e) => vec![e],
++        _ => vec![],
++    }
++}
++
++/// Does the statement read NZCV (in any form)? Svc and Simd count as reads.
++fn stmt_reads(s: &Stmt) -> bool {
++    matches!(s, Stmt::Svc(_) | Stmt::Simd(_) | Stmt::Undefined(_)) || stmt_exprs(s).iter().any(|e| reads_nzcv(e))
++}
++
++fn reads_nzcv(e: &Expr) -> bool {
++    match e {
++        Expr::Nzcv => true,
++        Expr::Op(_, args) => args.iter().any(reads_nzcv),
++        Expr::Load { addr, .. } => reads_nzcv(addr),
++        _ => false,
++    }
++}
++
++/// Every NZCV read in the statement is `Cond(Nzcv, const)` or `Carry(Nzcv)`.
++fn only_condition_reads(s: &Stmt) -> bool {
++    stmt_exprs(s).iter().all(|e| condition_reads(e))
++}
++
++fn condition_reads(e: &Expr) -> bool {
++    match e {
++        Expr::Nzcv => false,
++        Expr::Op(Op::Cond, args) if matches!(args.as_slice(), [Expr::Nzcv, Expr::Const(_)]) => true,
++        Expr::Op(Op::Carry, args) if matches!(args.as_slice(), [Expr::Nzcv]) => true,
++        Expr::Op(_, args) => args.iter().all(condition_reads),
++        Expr::Load { addr, .. } => condition_reads(addr),
++        _ => true,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Block;
++    use kirikae_a64::Insn;
++
++    fn cmp() -> Stmt {
++        Stmt::SetNzcv(Expr::Op(Op::FlagsAdd64, vec![Expr::Reg(0), Expr::Op(Op::Not, vec![Expr::Reg(1)]), Expr::Const(1)]))
++    }
++    fn cond(cc: u64) -> Expr {
++        Expr::Op(Op::Cond, vec![Expr::Nzcv, Expr::Const(cc)])
++    }
++    fn insn(addr: u64, stmts: Vec<Stmt>) -> Insn {
++        Insn { addr, word: 0, stmts }
++    }
++    fn block(start: u64, insns: Vec<Insn>) -> Block {
++        let next = insns.last().unwrap().addr + 4;
++        Block { start, insns, next }
++    }
++
++    #[test]
++    fn compare_and_branch_is_fused() {
++        let f = Function {
++            entry: 0x100,
++            blocks: vec![
++                block(0x100, vec![insn(0x100, vec![cmp()]), insn(0x104, vec![Stmt::JumpIf(cond(0), 0x10c)])]),
++                block(0x108, vec![insn(0x108, vec![Stmt::Return(Expr::Reg(30))])]),
++                block(0x10c, vec![insn(0x10c, vec![Stmt::Return(Expr::Reg(30))])]),
++            ],
++        };
++        assert_eq!(fusable(&f), HashSet::from([(0x100, 0)]));
++    }
++
++    #[test]
++    fn flags_read_in_a_successor_stay_fused_only_if_by_condition_there_too() {
++        // cmp; b.eq A; (next block) b.lt B  -> the second block reads the flags: not fusable.
++        let f = Function {
++            entry: 0x100,
++            blocks: vec![
++                block(0x100, vec![insn(0x100, vec![cmp()]), insn(0x104, vec![Stmt::JumpIf(cond(0), 0x110)])]),
++                block(0x108, vec![insn(0x108, vec![Stmt::JumpIf(cond(11), 0x110)])]),
++                block(0x10c, vec![insn(0x10c, vec![Stmt::Return(Expr::Reg(30))])]),
++                block(0x110, vec![insn(0x110, vec![Stmt::Return(Expr::Reg(30))])]),
++            ],
++        };
++        assert!(fusable(&f).is_empty());
++    }
++
++    #[test]
++    fn raw_flag_reads_and_indirect_exits_keep_flags() {
++        let raw = Function {
++            entry: 0x100,
++            blocks: vec![block(0x100, vec![insn(0x100, vec![cmp(), Stmt::SetReg(2, Expr::Nzcv)]), insn(0x104, vec![Stmt::Return(Expr::Reg(30))])])],
++        };
++        assert!(fusable(&raw).is_empty());
++        let indirect = Function {
++            entry: 0x100,
++            blocks: vec![block(0x100, vec![insn(0x100, vec![cmp()]), insn(0x104, vec![Stmt::JumpIndirect(Expr::Reg(3))])])],
++        };
++        assert!(fusable(&indirect).is_empty());
++        let outside = Function { entry: 0x100, blocks: vec![block(0x100, vec![insn(0x100, vec![cmp()]), insn(0x104, vec![Stmt::Jump(0x9000)])])] };
++        assert!(fusable(&outside).is_empty());
++    }
++
++    #[test]
++    fn a_call_or_a_new_compare_ends_the_flags() {
++        let f = Function {
++            entry: 0x100,
++            blocks: vec![
++                block(0x100, vec![insn(0x100, vec![cmp()]), insn(0x104, vec![Stmt::SetReg(1, cond(1))]), insn(0x108, vec![Stmt::Call(0x500)])]),
++                block(0x10c, vec![insn(0x10c, vec![cmp()]), insn(0x110, vec![Stmt::Return(Expr::Reg(30))])]),
++            ],
++        };
++        assert_eq!(fusable(&f), HashSet::from([(0x100, 0), (0x10c, 0)]));
++    }
++}
+diff --git a/crates/recomp/src/lib.rs b/crates/recomp/src/lib.rs
+index 062a93e..3430374 100644
+--- a/crates/recomp/src/lib.rs
++++ b/crates/recomp/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod clif;
+ pub mod discover;
++pub mod flags;
+ pub mod project;
+ pub mod rust_backend;
+ 
+diff --git a/crates/recomp/tests/flag_fusion.rs b/crates/recomp/tests/flag_fusion.rs
+new file mode 100644
+index 0000000..3384ed7
+--- /dev/null
++++ b/crates/recomp/tests/flag_fusion.rs
+@@ -0,0 +1,316 @@
++use std::collections::BTreeSet;
++
++use cranelift_jit::{JITBuilder, JITModule};
++use cranelift_module::FuncId;
++use kirikae_a64::{Expr, Insn, Op, Stmt};
++use kirikae_recomp::clif::{Compiler, host_isa};
++use kirikae_recomp::{Block, Function};
++use kirikae_rt::abi;
++
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 >> 12;
++        self.0 ^= self.0 << 25;
++        self.0 ^= self.0 >> 27;
++        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++const COUNTER: u8 = 28;
++const REGS: u64 = 8;
++const CALLEE: u64 = 0x1000_0000;
++const OUTSIDE: u64 = 0x2000_0000;
++const MEM_BYTES: usize = 4096;
++
++fn c(v: u64) -> Expr {
++    Expr::Const(v)
++}
++
++fn op(o: Op, args: Vec<Expr>) -> Expr {
++    Expr::Op(o, args)
++}
++
++fn reg(r: &mut Rng) -> Expr {
++    Expr::Reg(r.below(REGS) as u8)
++}
++
++/// Operands that hit signed, unsigned and overflow edges.
++fn operand(r: &mut Rng) -> Expr {
++    match r.below(6) {
++        0 => c([
++            0,
++            1,
++            u64::MAX,
++            1 << 63,
++            (1 << 63) - 1,
++            0x7fff_ffff,
++            0x8000_0000,
++            0xffff_ffff,
++            0x1_0000_0000,
++        ][r.below(9) as usize]),
++        1 => c(r.below(8)),
++        _ => reg(r),
++    }
++}
++
++fn flags(r: &mut Rng) -> Stmt {
++    let (a, b) = (operand(r), operand(r));
++    let narrow = r.below(2) == 0;
++    let add = if narrow {
++        Op::FlagsAdd32
++    } else {
++        Op::FlagsAdd64
++    };
++    let logic = if narrow {
++        Op::FlagsLogic32
++    } else {
++        Op::FlagsLogic64
++    };
++    Stmt::SetNzcv(match r.below(5) {
++        0 | 1 => op(add, vec![a, op(Op::Not, vec![b]), c(1)]),
++        2 => op(add, vec![a, b, c(0)]),
++        3 => op(add, vec![a, b, op(Op::Carry, vec![Expr::Nzcv])]),
++        _ => op(logic, vec![op(Op::And, vec![a, b])]),
++    })
++}
++
++fn cond(r: &mut Rng) -> Expr {
++    op(Op::Cond, vec![Expr::Nzcv, c(r.below(16))])
++}
++
++fn body(r: &mut Rng) -> Vec<Stmt> {
++    let mut out = Vec::new();
++    for _ in 0..1 + r.below(3) {
++        out.push(match r.below(10) {
++            0..=3 => flags(r),
++            4 | 5 => Stmt::SetReg(
++                r.below(REGS) as u8,
++                op(Op::Select, vec![cond(r), operand(r), operand(r)]),
++            ),
++            6 => Stmt::SetReg(
++                r.below(REGS) as u8,
++                op(Op::Add, vec![reg(r), op(Op::Carry, vec![Expr::Nzcv])]),
++            ),
++            7 if r.below(3) == 0 => Stmt::SetReg(r.below(REGS) as u8, Expr::Nzcv),
++            8 => Stmt::SetNzcv(op(
++                Op::Select,
++                vec![
++                    cond(r),
++                    c(0x6000_0000),
++                    op(Op::FlagsAdd64, vec![reg(r), reg(r), c(0)]),
++                ],
++            )),
++            _ => Stmt::SetReg(r.below(REGS) as u8, op(Op::Add, vec![reg(r), operand(r)])),
++        });
++    }
++    out
++}
++
++fn random_function(r: &mut Rng, entry: u64) -> Function {
++    let n = 2 + r.below(7) as usize;
++    let lens: Vec<u64> = (0..n).map(|_| 1 + r.below(5)).collect();
++    let mut starts = vec![entry];
++    for len in &lens {
++        starts.push(starts.last().unwrap() + 4 * len + 4);
++    }
++    let mut blocks = Vec::new();
++    for i in 0..n {
++        let start = starts[i];
++        let alive = op(Op::Ne, vec![Expr::Reg(COUNTER), c(0)]);
++        let decrement = Stmt::SetReg(COUNTER, op(Op::Sub, vec![Expr::Reg(COUNTER), alive]));
++        let mut insns = vec![Insn {
++            addr: start,
++            word: 0,
++            stmts: vec![decrement],
++        }];
++        for k in 0..lens[i] {
++            insns.push(Insn {
++                addr: start + 4 + 4 * k,
++                word: 0,
++                stmts: body(r),
++            });
++        }
++        let last = insns.last_mut().unwrap();
++        let next = last.addr + 4;
++        let any = r.below(n as u64) as usize;
++        let forward = starts[(i + 1 + r.below((n - i) as u64) as usize).min(n - 1)];
++        if i == n - 1 {
++            last.stmts.push(Stmt::Return(Expr::Reg(30)));
++        } else {
++            match r.below(8) {
++                0..=3 => {
++                    let alive = op(Op::Ne, vec![Expr::Reg(COUNTER), c(0)]);
++                    let cc = cond(r);
++                    let cc = if starts[any] <= start {
++                        op(Op::And, vec![cc, alive])
++                    } else {
++                        cc
++                    };
++                    last.stmts.push(Stmt::JumpIf(cc, starts[any]));
++                }
++                4 => last.stmts.push(Stmt::Jump(forward)),
++                5 if r.below(3) == 0 => last.stmts.push(Stmt::JumpIf(cond(r), OUTSIDE)),
++                6 => {
++                    last.stmts.push(Stmt::SetReg(30, c(next)));
++                    last.stmts.push(Stmt::Call(CALLEE));
++                }
++                _ => {}
++            }
++        }
++        blocks.push(Block {
++            start,
++            insns,
++            next: starts[i + 1],
++        });
++    }
++    Function { entry, blocks }
++}
++
++fn callee() -> Function {
++    let stmts = vec![
++        Stmt::SetReg(
++            0,
++            op(
++                Op::Add,
++                vec![op(Op::Mul, vec![Expr::Reg(0), c(3)]), Expr::Reg(1)],
++            ),
++        ),
++        Stmt::SetReg(2, op(Op::Xor, vec![Expr::Reg(2), Expr::Sp])),
++        Stmt::SetV {
++            reg: 1,
++            hi: true,
++            value: op(Op::Add, vec![Expr::V { reg: 1, hi: false }, c(5)]),
++        },
++        Stmt::SetNzcv(c(0x6000_0000)),
++        Stmt::SetSp(op(Op::Sub, vec![Expr::Sp, c(16)])),
++        Stmt::Return(Expr::Reg(30)),
++    ];
++    Function {
++        entry: CALLEE,
++        blocks: vec![Block {
++            start: CALLEE,
++            insns: vec![Insn {
++                addr: CALLEE,
++                word: 0,
++                stmts,
++            }],
++            next: CALLEE + 4,
++        }],
++    }
++}
++
++fn jit(fast_regs: bool) -> Compiler<JITModule> {
++    let mut b = JITBuilder::with_isa(
++        host_isa().unwrap(),
++        cranelift_module::default_libcall_names(),
++    );
++    for (name, ptr) in abi::helpers() {
++        b.symbol(name, ptr);
++    }
++    let mut c = Compiler::new(JITModule::new(b)).unwrap();
++    c.set_fast_regs(fast_regs);
++    c
++}
++
++struct State {
++    cpu: Vec<u64>,
++    mem: Vec<u8>,
++}
++
++impl State {
++    fn new(r: &mut Rng) -> State {
++        let mut cpu = vec![0u64; 512];
++        for v in &mut cpu[abi::OFF_X / 8..abi::OFF_NZCV / 8 + 1] {
++            *v = r.next();
++        }
++        cpu[abi::OFF_NZCV / 8] &= 0xf000_0000;
++        cpu[abi::OFF_X / 8 + COUNTER as usize] = 12;
++        cpu[abi::OFF_X / 8 + 30] = 0xdead_0000;
++        let mem = (0..MEM_BYTES).map(|_| r.next() as u8).collect();
++        State { cpu, mem }
++    }
++
++    fn run(&mut self, f: extern "C" fn(*mut u64)) {
++        let base = self.cpu.as_mut_ptr() as *mut u8;
++        // SAFETY: the offsets are inside the 4 KiB buffer.
++        unsafe {
++            (base.add(abi::OFF_MEM) as *mut *mut u8).write_unaligned(self.mem.as_mut_ptr());
++            (base.add(abi::OFF_BUDGET) as *mut u32).write_unaligned(1 << 30);
++            base.add(abi::OFF_HALTED).write(0);
++        }
++        f(self.cpu.as_mut_ptr());
++    }
++
++    fn observed(&self) -> (Vec<u64>, Vec<u8>) {
++        (
++            self.cpu[abi::OFF_X / 8..abi::OFF_NZCV / 8 + 2].to_vec(),
++            self.mem.clone(),
++        )
++    }
++}
++
++fn jit_fused(fuse: bool) -> Compiler<JITModule> {
++    let mut c = jit(true);
++    c.set_fuse_flags(fuse);
++    c
++}
++
++#[test]
++fn fused_flags_match_materialized_flags() {
++    let mut r = Rng(0xf1a6_5eed_0042);
++    let funcs: Vec<Function> = (0..600)
++        .map(|i| random_function(&mut r, 0x1000 + 0x1000 * i))
++        .collect();
++    let mut entries: BTreeSet<u64> = funcs.iter().map(|f| f.entry).collect();
++    entries.insert(CALLEE);
++    let fused_count: usize = funcs
++        .iter()
++        .map(|f| kirikae_recomp::flags::fusable(f).len())
++        .sum();
++    assert!(fused_count > 500, "only {fused_count} compares fused");
++
++    let compile = |fuse| {
++        let mut c = jit_fused(fuse);
++        c.compile(&callee(), &entries).unwrap();
++        let ids: Vec<FuncId> = funcs
++            .iter()
++            .map(|f| c.compile(f, &entries).unwrap())
++            .collect();
++        c.module.finalize_definitions().unwrap();
++        let ptrs: Vec<extern "C" fn(*mut u64)> = ids
++            .iter()
++            .map(|id| unsafe { std::mem::transmute(c.module.get_finalized_function(*id)) })
++            .collect();
++        (c, ptrs)
++    };
++    let (_plain_module, plain) = compile(false);
++    let (_fused_module, fused) = compile(true);
++
++    for (i, f) in funcs.iter().enumerate() {
++        for run in 0..6 {
++            let mut a = State::new(&mut r);
++            let mut b = State {
++                cpu: a.cpu.clone(),
++                mem: a.mem.clone(),
++            };
++            a.run(plain[i]);
++            b.run(fused[i]);
++            // Everything but NZCV itself, which fused code leaves stale once the flags are dead.
++            let (mut x, ma) = a.observed();
++            let (mut y, mb) = b.observed();
++            let nz = (abi::OFF_NZCV - abi::OFF_X) / 8;
++            x[nz] = 0;
++            y[nz] = 0;
++            assert!(
++                x == y && ma == mb,
++                "function {i} run {run} differs:\n{f:#x?}"
++            );
++        }
++    }
++}
