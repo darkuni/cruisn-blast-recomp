@@ -1,0 +1,316 @@
+diff --git a/crates/recomp/src/clif.rs b/crates/recomp/src/clif.rs
+index 5cf2d07..83ec79e 100644
+--- a/crates/recomp/src/clif.rs
++++ b/crates/recomp/src/clif.rs
+@@ -257,8 +257,15 @@ enum Event {
+     Write(u32),
+     Sync,
+     Simd(Regs),
++    /// A guest function call: memory is synced before it; afterwards the registers the
++    /// AArch64 procedure call standard makes callee-saved (x19-x29, SP) still hold their
++    /// values, so cached copies of them stay valid.
++    Call,
+ }
+ 
++/// x19-x29 and SP.
++const PRESERVED: Regs = (((1u128 << 11) - 1) << 19) | (1u128 << SP_SLOT);
++
+ struct WriteRecorder {
+     seed: u64,
+     writes: Regs,
+@@ -375,19 +382,28 @@ fn insn_events(insn: &Insn, out: &mut Vec<Event>) {
+             Stmt::Fence => {}
+             Stmt::Simd(w) => out.push(Event::Simd(simd_writes(*w))),
+             Stmt::Svc(_) => out.push(Event::Sync),
+-            Stmt::Undefined(_) | Stmt::Call(_) => {
++            Stmt::Undefined(_) => {
+                 out.push(Event::Sync);
+                 return;
+             }
++            Stmt::Call(_) => {
++                out.push(Event::Call);
++                return;
++            }
+             Stmt::Return(e) | Stmt::JumpIf(e, _) => {
+                 expr_events(e, out);
+                 return;
+             }
+-            Stmt::JumpIndirect(e) | Stmt::CallIndirect(e) => {
++            Stmt::JumpIndirect(e) => {
+                 expr_events(e, out);
+                 out.push(Event::Sync);
+                 return;
+             }
++            Stmt::CallIndirect(e) => {
++                expr_events(e, out);
++                out.push(Event::Call);
++                return;
++            }
+             Stmt::Jump(_) => return,
+         }
+     }
+@@ -402,6 +418,7 @@ fn apply(mut st: RegState, ev: Event) -> RegState {
+         }
+         Event::Sync => st = RegState::default(),
+         Event::Simd(w) => st = RegState { valid: st.valid & !w, dirty: 0 },
++        Event::Call => st = RegState { valid: st.valid & PRESERVED, dirty: 0 },
+     }
+     st
+ }
+@@ -452,6 +469,7 @@ fn plan_registers(f: &Function) -> HashMap<u64, RegState> {
+                     Event::Write(s) => l &= !(1 << s),
+                     Event::Sync => l = 0,
+                     Event::Simd(w) => l &= !w,
++                    Event::Call => l &= PRESERVED,
+                 }
+             }
+             if l != live[i] {
+@@ -969,6 +987,7 @@ impl Lower<'_, '_> {
+ 
+     fn fp_or_call(&mut self, op: Op, v: &[Value], fast: Value, ok: Value) -> Value {
+         let slow = self.b.create_block();
++        self.b.set_cold_block(slow);
+         let done = self.b.create_block();
+         self.b.append_block_param(done, I64);
+         self.b.ins().brif(ok, done, &[BlockArg::Value(fast)], slow, &[]);
+@@ -1025,6 +1044,12 @@ impl Lower<'_, '_> {
+     /// `Cond(Nzcv, cc)` (cc = Some) or `Carry(Nzcv)` (cc = None) straight from the compare's
+     /// operands: 0 or 1.
+     fn fused_condition(&mut self, p: Pending, cc: Option<u64>) -> Value {
++        let v = self.fused_condition_bool(p, cc);
++        self.bool64(v)
++    }
++
++    /// As `fused_condition`, as an I8 0/1 a branch can use directly (cmp + jcc).
++    fn fused_condition_bool(&mut self, p: Pending, cc: Option<u64>) -> Value {
+         let narrow = match p {
+             Pending::Sub { narrow, .. } | Pending::Add { narrow, .. } | Pending::Logic { narrow, .. } => narrow,
+         };
+@@ -1088,8 +1113,7 @@ impl Lower<'_, '_> {
+             }
+         };
+         let Some(cc) = cc else {
+-            let c = flag(self, F::C);
+-            return self.bool64(c);
++            return flag(self, F::C);
+         };
+         let base = (cc >> 1) & 7;
+         let invert = cc & 1 == 1 && cc != 15;
+@@ -1130,7 +1154,7 @@ impl Lower<'_, '_> {
+             _ => None,
+         };
+         if let Some(v) = direct {
+-            return self.bool64(v);
++            return v;
+         }
+         let value = match base {
+                 0 => flag(self, F::Z),
+@@ -1155,8 +1179,7 @@ impl Lower<'_, '_> {
+                 }
+                 _ => self.b.ins().iconst(types::I8, 1),
+         };
+-        let value = if invert { self.b.ins().bxor_imm_u(value, 1) } else { value };
+-        self.bool64(value)
++        if invert { self.b.ins().bxor_imm_u(value, 1) } else { value }
+     }
+ 
+     fn flags_add(&mut self, a: Value, b: Value, carry: Value, narrow: bool) -> Value {
+@@ -1332,6 +1355,7 @@ impl Lower<'_, '_> {
+         let left = self.b.ins().iadd_imm_s(budget, -1);
+         self.b.ins().store(cpu_flags(), left, self.cpu, abi::OFF_BUDGET as i32);
+         let slow = self.b.create_block();
++        self.b.set_cold_block(slow);
+         self.b.ins().brif(left, dest, args, slow, &[]);
+         self.b.switch_to_block(slow);
+         let dirty = self.cache.as_ref().map(|c| c.state.dirty);
+@@ -1365,10 +1389,11 @@ impl Lower<'_, '_> {
+         }
+     }
+ 
+-    fn after_call(&mut self, ret_addr: u64) {
++    fn after_call(&mut self, ret_addr: u64, keep: Regs) {
+         let pc = self.load_cpu(abi::OFF_PC);
+         let wrong = self.b.ins().icmp_imm_u(IntCC::NotEqual, pc, ret_addr as i64);
+         let (resume, cont) = (self.b.create_block(), self.b.create_block());
++        self.b.set_cold_block(resume);
+         self.b.ins().brif(wrong, resume, &[], cont, &[]);
+         self.b.switch_to_block(resume);
+         self.sync();
+@@ -1378,9 +1403,18 @@ impl Lower<'_, '_> {
+         let still_wrong = self.b.ins().icmp_imm_u(IntCC::NotEqual, pc, ret_addr as i64);
+         self.b.ins().brif(still_wrong, self.ret, &[], cont, &[]);
+         self.b.switch_to_block(cont);
++        if let Some(c) = &mut self.cache {
++            // The callee kept x19-x29 and SP: the copies cached before the call still hold.
++            c.state = RegState { valid: keep & PRESERVED, dirty: 0 };
++        }
+         self.goto(ret_addr);
+     }
+ 
++    /// Cached registers a call leaves valid (see `Event::Call`).
++    fn kept_over_call(&self) -> Regs {
++        self.cache.as_ref().map_or(0, |c| c.state.valid & PRESERVED)
++    }
++
+     fn insn(&mut self, insn: &Insn) -> bool {
+         let mut t: Temps = [None; 8];
+         for (k, s) in insn.stmts.iter().enumerate() {
+@@ -1486,7 +1520,13 @@ impl Lower<'_, '_> {
+                     return true;
+                 }
+                 Stmt::JumpIf(cond, target) => {
+-                    let c = self.expr(cond, &t);
++                    let c = match (self.pending, cond) {
++                        (Some(p), Expr::Op(Op::Cond, a)) if matches!(a.as_slice(), [Expr::Nzcv, Expr::Const(_)]) => {
++                            let Expr::Const(cc) = a[1] else { unreachable!() };
++                            self.fused_condition_bool(p, Some(cc))
++                        }
++                        _ => self.expr(cond, &t),
++                    };
+                     let (taken, not) = (self.b.create_block(), self.b.create_block());
+                     self.b.ins().brif(c, taken, &[], not, &[]);
+                     self.b.switch_to_block(taken);
+@@ -1504,6 +1544,7 @@ impl Lower<'_, '_> {
+                 }
+                 Stmt::Call(target) => {
+                     self.set_pc_const(*target);
++                    let keep = self.kept_over_call();
+                     self.sync();
+                     match self.callees.get(target) {
+                         Some(&f) => {
+@@ -1514,16 +1555,17 @@ impl Lower<'_, '_> {
+                             self.b.ins().call(self.h.call_indirect, &[self.cpu, ret]);
+                         }
+                     }
+-                    self.after_call(insn.next());
++                    self.after_call(insn.next(), keep);
+                     return true;
+                 }
+                 Stmt::CallIndirect(e) => {
+                     let v = self.expr(e, &t);
+                     self.set_pc(v);
++                    let keep = self.kept_over_call();
+                     self.sync();
+                     let ret = self.iconst(insn.next());
+                     self.b.ins().call(self.h.call_indirect, &[self.cpu, ret]);
+-                    self.after_call(insn.next());
++                    self.after_call(insn.next(), keep);
+                     return true;
+                 }
+             }
+diff --git a/crates/recomp/tests/fast_regs.rs b/crates/recomp/tests/fast_regs.rs
+index 221ef11..9cac423 100644
+--- a/crates/recomp/tests/fast_regs.rs
++++ b/crates/recomp/tests/fast_regs.rs
+@@ -39,6 +39,12 @@ const SIMD: &[u32] = &[
+     0x9e78_0026,
+ ];
+ 
++/// x0-x7 (caller-saved) and x19-x26 (callee-saved, kept across calls).
++fn pick_reg(r: &mut Rng) -> u8 {
++    let n = r.below(2 * REGS) as u8;
++    if n < REGS as u8 { n } else { 19 + n - REGS as u8 }
++}
++
+ fn c(v: u64) -> Expr {
+     Expr::Const(v)
+ }
+@@ -60,7 +66,7 @@ fn leaf(r: &mut Rng, tmps: u8) -> Expr {
+         4 => Expr::V { reg: r.below(4) as u8, hi: r.below(2) == 1 },
+         5 if tmps > 0 => Expr::Tmp(r.below(tmps as u64) as u8),
+         6 => Expr::SysReg(SysReg::TpidrEl0),
+-        _ => Expr::Reg(r.below(REGS) as u8),
++        _ => Expr::Reg(pick_reg(r)),
+     }
+ }
+ 
+@@ -100,7 +106,7 @@ fn body(r: &mut Rng) -> Vec<Stmt> {
+             4 => Stmt::Store { size: [1, 2, 4, 8][r.below(4) as usize], addr: addr(r, tmps), value: e },
+             5 if r.below(4) == 0 => Stmt::SetSysReg(SysReg::TpidrEl0, e),
+             6 => Stmt::Simd(SIMD[r.below(SIMD.len() as u64) as usize]),
+-            _ => Stmt::SetReg(r.below(REGS) as u8, e),
++            _ => Stmt::SetReg(pick_reg(r), e),
+         });
+     }
+     out
+@@ -162,7 +168,13 @@ fn callee() -> Function {
+         Stmt::SetReg(2, op(Op::Xor, vec![Expr::Reg(2), Expr::Sp])),
+         Stmt::SetV { reg: 1, hi: true, value: op(Op::Add, vec![Expr::V { reg: 1, hi: false }, c(5)]) },
+         Stmt::SetNzcv(c(0x6000_0000)),
++        // Callee-saved registers and SP come back as they were (AArch64 procedure call standard).
+         Stmt::SetSp(op(Op::Sub, vec![Expr::Sp, c(16)])),
++        Stmt::Store { size: 8, addr: c(0x400), value: Expr::Reg(19) },
++        Stmt::SetReg(19, op(Op::Xor, vec![Expr::Reg(19), c(0x1234)])),
++        Stmt::SetReg(9, op(Op::Add, vec![Expr::Reg(19), c(1)])),
++        Stmt::SetReg(19, Expr::Load { size: 8, addr: Box::new(c(0x400)) }),
++        Stmt::SetSp(op(Op::Add, vec![Expr::Sp, c(16)])),
+         Stmt::Return(Expr::Reg(30)),
+     ];
+     Function { entry: CALLEE, blocks: vec![Block { start: CALLEE, insns: vec![Insn { addr: CALLEE, word: 0, stmts }], next: CALLEE + 4 }] }
+diff --git a/crates/recomp/tests/flag_fusion.rs b/crates/recomp/tests/flag_fusion.rs
+index 3384ed7..b47616a 100644
+--- a/crates/recomp/tests/flag_fusion.rs
++++ b/crates/recomp/tests/flag_fusion.rs
+@@ -28,6 +28,12 @@ const CALLEE: u64 = 0x1000_0000;
+ const OUTSIDE: u64 = 0x2000_0000;
+ const MEM_BYTES: usize = 4096;
+ 
++/// x0-x7 (caller-saved) and x19-x26 (callee-saved, kept across calls).
++fn pick_reg(r: &mut Rng) -> u8 {
++    let n = r.below(2 * REGS) as u8;
++    if n < REGS as u8 { n } else { 19 + n - REGS as u8 }
++}
++
+ fn c(v: u64) -> Expr {
+     Expr::Const(v)
+ }
+@@ -37,7 +43,7 @@ fn op(o: Op, args: Vec<Expr>) -> Expr {
+ }
+ 
+ fn reg(r: &mut Rng) -> Expr {
+-    Expr::Reg(r.below(REGS) as u8)
++    Expr::Reg(pick_reg(r))
+ }
+ 
+ /// Operands that hit signed, unsigned and overflow edges.
+@@ -90,14 +96,14 @@ fn body(r: &mut Rng) -> Vec<Stmt> {
+         out.push(match r.below(10) {
+             0..=3 => flags(r),
+             4 | 5 => Stmt::SetReg(
+-                r.below(REGS) as u8,
++                pick_reg(r),
+                 op(Op::Select, vec![cond(r), operand(r), operand(r)]),
+             ),
+             6 => Stmt::SetReg(
+-                r.below(REGS) as u8,
++                pick_reg(r),
+                 op(Op::Add, vec![reg(r), op(Op::Carry, vec![Expr::Nzcv])]),
+             ),
+-            7 if r.below(3) == 0 => Stmt::SetReg(r.below(REGS) as u8, Expr::Nzcv),
++            7 if r.below(3) == 0 => Stmt::SetReg(pick_reg(r), Expr::Nzcv),
+             8 => Stmt::SetNzcv(op(
+                 Op::Select,
+                 vec![
+@@ -106,7 +112,7 @@ fn body(r: &mut Rng) -> Vec<Stmt> {
+                     op(Op::FlagsAdd64, vec![reg(r), reg(r), c(0)]),
+                 ],
+             )),
+-            _ => Stmt::SetReg(r.below(REGS) as u8, op(Op::Add, vec![reg(r), operand(r)])),
++            _ => Stmt::SetReg(pick_reg(r), op(Op::Add, vec![reg(r), operand(r)])),
+         });
+     }
+     out
+@@ -188,7 +194,13 @@ fn callee() -> Function {
+             value: op(Op::Add, vec![Expr::V { reg: 1, hi: false }, c(5)]),
+         },
+         Stmt::SetNzcv(c(0x6000_0000)),
++        // Callee-saved registers and SP come back as they were (AArch64 procedure call standard).
+         Stmt::SetSp(op(Op::Sub, vec![Expr::Sp, c(16)])),
++        Stmt::Store { size: 8, addr: c(0x400), value: Expr::Reg(19) },
++        Stmt::SetReg(19, op(Op::Xor, vec![Expr::Reg(19), c(0x1234)])),
++        Stmt::SetReg(9, op(Op::Add, vec![Expr::Reg(19), c(1)])),
++        Stmt::SetReg(19, Expr::Load { size: 8, addr: Box::new(c(0x400)) }),
++        Stmt::SetSp(op(Op::Add, vec![Expr::Sp, c(16)])),
+         Stmt::Return(Expr::Reg(30)),
+     ];
+     Function {

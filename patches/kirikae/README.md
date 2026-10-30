@@ -369,3 +369,20 @@ Tests: `recomp/tests/flag_fusion.rs` compiles 600 random compare-heavy functions
 reads) with fusion on and off and runs each 6 times from random state: registers, SP, vector
 registers and memory must match. Deliberately broken conditions, carry, liveness, 32-bit
 handling and inversion were each caught. `KIRIKAE_NO_FLAG_FUSION=1` at build time turns it off.
+
+## 0026 - tighter calls and branches
+
+- A conditional branch on a fused compare (0025) branches on the comparison itself, so the
+  x86 code is `cmp` + `jcc` instead of `setcc`, `test`, `jcc`.
+- Rarely taken paths are marked cold and moved to the end of each function: the after-call
+  fix-up (when a call does not come back to its return address), the scheduler poll on loop
+  back edges and the slow path of floating-point operations. The hot code is denser.
+- With fast registers, x19-x29 and SP stay cached across calls instead of being reloaded from
+  memory afterwards: the AArch64 procedure call standard makes them callee-saved, so the copies
+  cached before a call (stored to memory before it, as before) still hold when it returns. A
+  return to somewhere else goes through the existing resume path, which does not use them.
+
+Tests: the fast-register and flag-fusion test callees now follow the calling convention
+(restore SP, save and restore x19 through memory, clobber scratch registers) and the random
+callers use x19-x26 across calls. A callee that does not restore x19, and treating caller-saved
+registers as preserved, were each caught.
