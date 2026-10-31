@@ -150,7 +150,8 @@ jobs:
           STEP: Package
         run: |
           trap { Write-Output "::error title=$env:STEP::$($_.Exception.Message) $($_.InvocationInfo.PositionMessage -replace "`r?`n", '%0A')"; exit 1 }
-          $zigdir = python -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))"
+          $zigdir = Join-Path (python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") 'ziglang'
+          if (-not (Test-Path "$zigdir\zig.exe")) { throw "zig.exe not in $zigdir" }
           $p = 'dist\CruisnBlast'; $rec = "$p\recompiler"
           New-Item -ItemType Directory -Force "$rec\zig" | Out-Null
           Copy-Item tools\setup\target\release\setup.exe $p\
