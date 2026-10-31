@@ -400,3 +400,13 @@ registers as preserved, were each caught.
   file, `[player] name = ...`, instead of the fixed `kirikae`. Up to 10 printable ASCII
   characters (no `;`); empty means `kirikae`. A settings file without the `[player]` section is
   written back with it on the next launch, so existing players get the line to edit.
+
+## 0029 - GPU diagnostics on a lost device
+
+- When the driver loses the device (VK_ERROR_DEVICE_LOST) the log gets the driver's fault
+  report (VK_EXT_device_fault, when the driver has it: description and faulting GPU
+  addresses) and the game closes with a message box instead of a panic.
+- `KIRIKAE_GPU_DIAG=1` (cruisn-blast-gpu-diagnostics.bat) puts an NVIDIA checkpoint
+  (VK_NV_device_diagnostic_checkpoints) before every draw, dispatch and render pass; on a loss
+  the log lists the last checkpoints the GPU reached and the draws around them (vertex and
+  fragment shader addresses, counts). The shader addresses work with `KIRIKAE_SKIP_SHADER`.

@@ -98,6 +98,9 @@ Send these from this folder, plus what you were doing when it happened:
 Also say which GPU and driver version you have.
 
 If the game crashes, a message box says so; the details are in cruisn-blast.log.
+If the message says the graphics driver stopped responding, start the game once more with
+cruisn-blast-gpu-diagnostics.bat (Linux: KIRIKAE_GPU_DIAG=1 ./cruisn-blast-linux.sh), make it
+crash again and send that cruisn-blast.log: it then says what the GPU was drawing.
 
 Unofficial fan project, not affiliated with Raw Thrills, GameMill or Nintendo. cruisn-blast.exe
 is made on your computer from your own dump; none of the game's code or data is in this

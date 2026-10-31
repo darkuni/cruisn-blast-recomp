@@ -173,6 +173,7 @@ jobs:
           New-Item -ItemType Directory -Force "$rec\zig" | Out-Null
           Copy-Item tools\setup\target\release\setup.exe $p\
           Copy-Item tools\cruisn-blast.shaders-used $p\
+          Copy-Item tools\cruisn-blast-gpu-diagnostics.bat $p\
           Copy-Item tools\README-testers.txt $p\README.txt
           Copy-Item THIRD_PARTY_NOTICES.md $p\THIRD_PARTY_NOTICES.txt
           Copy-Item kirikae\target\release\kirikae.exe $rec\

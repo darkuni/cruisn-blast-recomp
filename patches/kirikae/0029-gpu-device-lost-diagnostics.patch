@@ -1,0 +1,274 @@
+From d4563694ab08d89a9433dd5ea2e5087089b94111 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 16:46:55 -0700
+Subject: [PATCH] GPU diagnostics on a lost device: driver fault report,
+ KIRIKAE_GPU_DIAG draw checkpoints, message instead of a panic
+
+---
+ crates/rt/src/gpu/vulkan/diag.rs   | 122 +++++++++++++++++++++++++++++
+ crates/rt/src/gpu/vulkan/draw.rs   |   9 +++
+ crates/rt/src/gpu/vulkan/mod.rs    |  29 +++++++
+ crates/rt/src/gpu/vulkan/submit.rs |   8 +-
+ 4 files changed, 166 insertions(+), 2 deletions(-)
+ create mode 100644 crates/rt/src/gpu/vulkan/diag.rs
+
+diff --git a/crates/rt/src/gpu/vulkan/diag.rs b/crates/rt/src/gpu/vulkan/diag.rs
+new file mode 100644
+index 0000000..4ca32b6
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/diag.rs
+@@ -0,0 +1,122 @@
++//! What the GPU was doing when the driver gives up (VK_ERROR_DEVICE_LOST).
++//!
++//! - VK_EXT_device_fault (when the driver has it): the driver's own description of the fault and
++//!   the GPU addresses involved. Free until something goes wrong, so always enabled.
++//! - VK_NV_device_diagnostic_checkpoints with KIRIKAE_GPU_DIAG=1: a marker before every draw,
++//!   dispatch and render pass, and on a loss the last markers the GPU reached, with what each one
++//!   was (shader addresses, counts). Costs a little per draw, so only on request.
++//!
++//! On a loss the report goes to the log and the game closes with a message instead of a panic.
++
++use std::collections::VecDeque;
++use std::ffi::{CStr, c_void};
++use std::sync::Mutex;
++
++use ash::vk;
++
++use super::Renderer;
++
++/// Markers kept for the report: enough to cover the batches in flight.
++const KEPT: usize = 1 << 16;
++
++pub(super) struct Diag {
++    pub(super) fault: Option<ash::ext::device_fault::Device>,
++    pub(super) checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
++}
++
++struct Marks {
++    next: u64,
++    texts: VecDeque<(u64, String)>,
++}
++
++static MARKS: Mutex<Marks> = Mutex::new(Marks { next: 1, texts: VecDeque::new() });
++
++pub(super) fn wanted_checkpoints() -> bool {
++    crate::env_var!("KIRIKAE_GPU_DIAG").is_some_and(|v| v != "0")
++}
++
++impl Renderer {
++    /// A checkpoint before the next command: `what` is only built when checkpoints are on.
++    pub(super) fn mark(&self, what: impl FnOnce() -> String) {
++        let Some(cp) = self.diag.checkpoints.as_ref() else { return };
++        let id = {
++            let mut m = MARKS.lock().unwrap();
++            let id = m.next;
++            m.next += 1;
++            if m.texts.len() == KEPT {
++                m.texts.pop_front();
++            }
++            m.texts.push_back((id, what()));
++            id
++        };
++        unsafe { cp.cmd_set_checkpoint(self.cmd, id as usize as *const c_void) };
++    }
++
++    /// Report a lost device and close the game. `during`: what the renderer was doing.
++    pub(super) fn device_lost(&self, during: &str, err: vk::Result) -> ! {
++        eprintln!("kirikae: GPU: {err:?} during {during}: the graphics driver stopped the GPU");
++        self.report_fault();
++        self.report_checkpoints();
++        let _ = std::io::Write::flush(&mut std::io::stderr());
++        crate::launch::fail(
++            "The graphics driver stopped responding (Vulkan device lost) and the game has to close.\n\n\
++             The details are in the .log file next to the game: please send it in.",
++        )
++    }
++
++    fn report_fault(&self) {
++        let Some(f) = self.diag.fault.as_ref() else {
++            eprintln!("kirikae: GPU: this driver has no fault report (VK_EXT_device_fault)");
++            return;
++        };
++        let get = f.fp().get_device_fault_info_ext;
++        let mut counts = vk::DeviceFaultCountsEXT::default();
++        let r = unsafe { get(self.device.handle(), &mut counts, std::ptr::null_mut()) };
++        if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
++            eprintln!("kirikae: GPU: no fault report ({r:?})");
++            return;
++        }
++        let mut addresses = vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
++        let mut vendor = vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
++        counts.vendor_binary_size = 0;
++        let mut info = vk::DeviceFaultInfoEXT::default();
++        info.p_address_infos = addresses.as_mut_ptr();
++        info.p_vendor_infos = vendor.as_mut_ptr();
++        let r = unsafe { get(self.device.handle(), &mut counts, &mut info) };
++        let text = |c: &[std::ffi::c_char]| unsafe { CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
++        eprintln!("kirikae: GPU fault ({r:?}): {}", text(&info.description));
++        for a in addresses.iter().take(counts.address_info_count as usize) {
++            let (lo, hi) = (a.reported_address & !(a.address_precision.max(1) - 1), a.reported_address | (a.address_precision.max(1) - 1));
++            eprintln!("kirikae: GPU fault address: {:?} at {:#x} (somewhere in {lo:#x}..={hi:#x})", a.address_type, a.reported_address);
++        }
++        for v in vendor.iter().take(counts.vendor_info_count as usize) {
++            eprintln!("kirikae: GPU fault vendor info: {} (code {:#x}, data {:#x})", text(&v.description), v.vendor_fault_code, v.vendor_fault_data);
++        }
++    }
++
++    fn report_checkpoints(&self) {
++        let Some(cp) = self.diag.checkpoints.as_ref() else {
++            eprintln!("kirikae: GPU: to see which draw the GPU was on, run the game again with KIRIKAE_GPU_DIAG=1");
++            return;
++        };
++        let n = unsafe { cp.get_queue_checkpoint_data_len(self.queue) };
++        let mut data = vec![vk::CheckpointDataNV::default(); n];
++        unsafe { cp.get_queue_checkpoint_data(self.queue, &mut data) };
++        let m = MARKS.lock().unwrap();
++        let first = m.texts.front().map_or(0, |t| t.0);
++        let text = |id: u64| if id >= first { m.texts.get((id - first) as usize).map(|t| t.1.as_str()) } else { None };
++        // Earliest marker still running per stage: the GPU had reached it but not finished the work after it.
++        let mut ids: Vec<(u64, vk::PipelineStageFlags)> = data.iter().map(|d| (d.p_checkpoint_marker as usize as u64, d.stage)).collect();
++        ids.sort_by_key(|&(id, _)| id);
++        eprintln!("kirikae: GPU checkpoints reached ({} recorded, markers up to {}):", ids.len(), m.next - 1);
++        for (id, stage) in &ids {
++            eprintln!("kirikae: GPU   #{id} {stage:?}: {}", text(*id).unwrap_or("(older than the markers kept)"));
++        }
++        if let Some(&(last, _)) = ids.iter().max_by_key(|(id, _)| *id) {
++            eprintln!("kirikae: GPU: the work right after the last marker reached:");
++            for id in last.saturating_sub(3)..=(last + 6).min(m.next - 1) {
++                eprintln!("kirikae: GPU   {}#{id}: {}", if id == last { "> " } else { "  " }, text(id).unwrap_or("?"));
++            }
++        }
++    }
++}
+diff --git a/crates/rt/src/gpu/vulkan/draw.rs b/crates/rt/src/gpu/vulkan/draw.rs
+index 1417bf7..2fdee7a 100644
+--- a/crates/rt/src/gpu/vulkan/draw.rs
++++ b/crates/rt/src/gpu/vulkan/draw.rs
+@@ -137,6 +137,7 @@ impl Renderer {
+         self.bind_descriptors(vk::PipelineBindPoint::COMPUTE, set_layout, layout, &descriptors, &mut scratch);
+         self.scratch = scratch;
+         let [x, y, z] = qmd.grid.map(|n| n.max(1));
++        self.mark(|| format!("dispatch: compute shader {:#x}, grid {x}x{y}x{z}", cs.va));
+         unsafe { self.device.cmd_dispatch(self.cmd, x, y, z) };
+         self.barrier();
+         if let (Some((offset, size)), Some(dir)) = (probe, crate::env_var!("KIRIKAE_PROBE_DUMP")) {
+@@ -491,6 +492,7 @@ impl Renderer {
+                     info = info.stencil_attachment(d);
+                 }
+             }
++            self.mark(|| format!("render pass {}x{}", info.render_area.extent.width, info.render_area.extent.height));
+             unsafe { self.device.cmd_begin_rendering(self.cmd, &info) };
+             self.rendering = Some(rt);
+         }
+@@ -627,6 +629,13 @@ impl Renderer {
+             Some(sets) => self.bind_descriptor_sets(layout, sets, &descriptors, &mut scratch),
+             None => self.bind_descriptors(vk::PipelineBindPoint::GRAPHICS, set_layout, layout, &descriptors, &mut scratch),
+         }
++        self.mark(|| {
++            let what = match index {
++                Some((_, _, _, n)) => format!("{n} indices"),
++                None => format!("{} vertices", draw.count),
++            };
++            format!("draw: vertex shader {:#x}, fragment shader {}, {what}", vs.va, fs.as_ref().map_or("none".into(), |f| format!("{:#x}", f.va)))
++        });
+         unsafe {
+             let d = &self.device;
+             match index {
+diff --git a/crates/rt/src/gpu/vulkan/mod.rs b/crates/rt/src/gpu/vulkan/mod.rs
+index 027b2cc..003553a 100644
+--- a/crates/rt/src/gpu/vulkan/mod.rs
++++ b/crates/rt/src/gpu/vulkan/mod.rs
+@@ -11,6 +11,7 @@ use super::tic;
+ 
+ mod buffers;
+ mod descriptors;
++mod diag;
+ mod draw;
+ mod guest_writes;
+ mod images;
+@@ -40,6 +41,8 @@ use volumes::Volume;
+ use lines::{Line, LineKey};
+ 
+ pub struct Renderer {
++    /// Reports for a lost device (diag.rs).
++    diag: diag::Diag,
+     entry: ash::Entry,
+     instance: ash::Instance,
+     device: ash::Device,
+@@ -501,6 +504,23 @@ impl Renderer {
+             "kirikae: shader compilation: {}",
+             if use_gpl { if use_eds3_clamp { "pipeline libraries (ahead of time)" } else { "pipeline libraries, no dynamic depth clamp" } } else { "whole pipelines (no pipeline library support)" }
+         );
++        // The driver's fault report on a lost device, and (KIRIKAE_GPU_DIAG=1) draw checkpoints.
++        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
++        if has(ash::ext::device_fault::NAME) {
++            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_features);
++            unsafe { instance.get_physical_device_features2(physical, &mut f2) };
++        }
++        let use_fault = fault_features.device_fault == vk::TRUE;
++        if use_fault {
++            extensions.push(ash::ext::device_fault::NAME.as_ptr());
++        }
++        let use_checkpoints = diag::wanted_checkpoints() && has(ash::nv::device_diagnostic_checkpoints::NAME);
++        if use_checkpoints {
++            extensions.push(ash::nv::device_diagnostic_checkpoints::NAME.as_ptr());
++            eprintln!("kirikae: GPU diagnostics: a checkpoint before every draw (KIRIKAE_GPU_DIAG)");
++        } else if diag::wanted_checkpoints() {
++            eprintln!("kirikae: GPU diagnostics: this driver has no checkpoints (VK_NV_device_diagnostic_checkpoints)");
++        }
+         let swapchains = surfaces && has(ash::khr::swapchain::NAME);
+         if swapchains {
+             extensions.push(ash::khr::swapchain::NAME.as_ptr());
+@@ -528,6 +548,10 @@ impl Renderer {
+         if use_eds3_clamp {
+             info = info.push_next(&mut eds3_enable);
+         }
++        let mut fault_enable = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
++        if use_fault {
++            info = info.push_next(&mut fault_enable);
++        }
+         let device = unsafe { instance.create_device(physical, &info, None)? };
+         let queue = unsafe { device.get_device_queue(family, 0) };
+         let push = push_supported.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+@@ -589,7 +613,12 @@ impl Renderer {
+         let compiler = PipelineCompiler::new(&device, pipeline_cache);
+         let gpl = use_gpl.then(|| gpl::Gpl::new(&device, pipeline_cache, use_eds3_clamp.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device))));
+ 
++        let diag = diag::Diag {
++            fault: use_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
++            checkpoints: use_checkpoints.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
++        };
+         let mut renderer = Renderer {
++            diag,
+             entry,
+             instance,
+             device,
+diff --git a/crates/rt/src/gpu/vulkan/submit.rs b/crates/rt/src/gpu/vulkan/submit.rs
+index b9a7870..3e47956 100644
+--- a/crates/rt/src/gpu/vulkan/submit.rs
++++ b/crates/rt/src/gpu/vulkan/submit.rs
+@@ -137,7 +137,9 @@ impl Renderer {
+             let stages = vec![vk::PipelineStageFlags::TRANSFER; waits.len()];
+             let signals: Vec<vk::Semaphore> = self.submit_signal.take().into_iter().collect();
+             let submit = [vk::SubmitInfo::default().command_buffers(&cmds).wait_semaphores(&waits).wait_dst_stage_mask(&stages).signal_semaphores(&signals)];
+-            self.device.queue_submit(self.queue, &submit, fence).unwrap();
++            if let Err(e) = self.device.queue_submit(self.queue, &submit, fence) {
++                self.device_lost("queue submit", e);
++            }
+         }
+         self.recording = false;
+         self.in_flight.push_back(self.current);
+@@ -179,7 +181,9 @@ impl Renderer {
+         unsafe {
+             if self.device.get_fence_status(fence) != Ok(true) {
+                 let start = std::time::Instant::now();
+-                self.device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
++                if let Err(e) = self.device.wait_for_fences(&[fence], true, u64::MAX) {
++                    self.device_lost("waiting for the GPU", e);
++                }
+                 self.stats.flush_time += start.elapsed();
+                 self.stats.waits += 1;
+             }
+-- 
+2.43.0
+
