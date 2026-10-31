@@ -54,6 +54,15 @@ jobs:
               | grep -o 'native-static-libs: .*' | tail -1 | cut -d' ' -f2- > ${t%%.*}.libs
             echo "$t: $(cat ${t%%.*}.libs)"
           done
+          # The Windows runtime links import libraries that ship inside the windows-targets
+          # crates; the player's linker gets them in recompiler/lib.
+          mkdir -p windows-lib
+          for l in $(tr ' ' '\n' < x86_64-pc-windows-gnu.libs | sed -n 's/^-l\(windows\..*\)/lib\1.a/p'); do
+            f=$(find ~/.cargo/registry/src -path '*windows_x86_64_gnu-*' -name "$l" | head -1)
+            [ -n "$f" ] || { echo "::error::$l not found"; exit 1; }
+            cp "$f" windows-lib/
+          done
+          ls -la windows-lib
       - name: Setup
         run: cd tools/setup && CRUISN_BUILD_ID=$BUILD_ID cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
       - name: Package
@@ -91,6 +100,7 @@ jobs:
           path: |
             runtime/target/x86_64-pc-windows-gnu/release/libcruisn_blast_runtime.a
             runtime/x86_64-pc-windows-gnu.libs
+            runtime/windows-lib/
 
   windows:
     needs: linux
@@ -169,6 +179,7 @@ jobs:
           Copy-Item tools\cruisn-blast.profile $rec\
           Copy-Item runtime-windows\target\x86_64-pc-windows-gnu\release\libcruisn_blast_runtime.a $rec\
           Copy-Item runtime-windows\x86_64-pc-windows-gnu.libs $rec\runtime.libs
+          Copy-Item -Recurse runtime-windows\windows-lib "$rec\lib"
           Copy-Item "$zigdir\zig.exe", "$zigdir\LICENSE" "$rec\zig\"
           Copy-Item -Recurse "$zigdir\lib" "$rec\zig\lib"
       - name: Self-test (recompile and link a test program like the game)

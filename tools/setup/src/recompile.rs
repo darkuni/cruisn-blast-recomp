@@ -166,7 +166,11 @@ fn make(tools: &Path, input: &Path, name: &str, profile: Option<&Path>, external
         rsp.extend(libs.split_whitespace().filter(|l| *l != "-lasound" && *l != "-ludev").map(String::from));
     }
     #[cfg(windows)]
-    rsp.extend(libs.split_whitespace().map(String::from));
+    {
+        // Import libraries of the `windows` crates (lib/, from the runtime's build).
+        rsp.push(format!("-L{}", quoted(&tools.join("lib"))));
+        rsp.extend(libs.split_whitespace().map(String::from));
+    }
     let rsp_path = work.join("link.rsp");
     std::fs::write(&rsp_path, rsp.join("\n")).map_err(|e| e.to_string())?;
 
