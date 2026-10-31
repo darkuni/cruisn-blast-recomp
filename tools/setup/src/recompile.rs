@@ -169,7 +169,10 @@ fn make(tools: &Path, input: &Path, name: &str, profile: Option<&Path>, external
     {
         // Import libraries of the `windows` crates (lib/, from the runtime's build).
         rsp.push(format!("-L{}", quoted(&tools.join("lib"))));
-        rsp.extend(libs.split_whitespace().map(String::from));
+        // Rust's std for this target unwinds with libgcc's unwinder; Zig has LLVM's libunwind,
+        // which provides the same functions (_Unwind_*, _GCC_specific_handler).
+        rsp.extend(libs.split_whitespace().filter(|l| !l.starts_with("-lgcc")).map(String::from));
+        rsp.push("-lunwind".into());
     }
     let rsp_path = work.join("link.rsp");
     std::fs::write(&rsp_path, rsp.join("\n")).map_err(|e| e.to_string())?;
