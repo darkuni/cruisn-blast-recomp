@@ -393,3 +393,10 @@ registers as preserved, were each caught.
   `src/package.bin` are written and listed in `objects.txt`, but cargo is not run. The player's
   setup links them with the prebuilt runtime library (`runtime/`) and a bundled linker, so the
   player needs neither Rust nor a C toolchain, and no download contains translated game code.
+
+## 0028 - player name
+
+- The Switch account nickname the game asks for (its player name) comes from the settings
+  file, `[player] name = ...`, instead of the fixed `kirikae`. Up to 10 printable ASCII
+  characters (no `;`); empty means `kirikae`. A settings file without the `[player]` section is
+  written back with it on the next launch, so existing players get the line to edit.

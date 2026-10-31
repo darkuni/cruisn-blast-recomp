@@ -1,0 +1,178 @@
+From 1199a2389d59a17f8db5056195c63e17a25c0e80 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 14:19:33 -0700
+Subject: [PATCH] Player name setting: [player] name in the settings file is
+ the account nickname
+
+---
+ crates/rt/src/services/acc.rs |  8 +++--
+ crates/rt/src/settings.rs     | 63 +++++++++++++++++++++++++++++++----
+ 2 files changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/crates/rt/src/services/acc.rs b/crates/rt/src/services/acc.rs
+index 9763714..511a7d7 100644
+--- a/crates/rt/src/services/acc.rs
++++ b/crates/rt/src/services/acc.rs
+@@ -5,13 +5,15 @@ use crate::services::stub::unimplemented;
+ use crate::services::{Reply, Request, Service};
+ 
+ pub const USER_ID: [u8; 16] = [0x01, 0, 0, 0, 0, 0, 0, 0, 0x64, 0x6e, 0x73, 0x70, 0, 0, 0, 0];
+-pub const NICKNAME: &str = "kirikae";
+-
+ fn profile_base() -> Vec<u8> {
+     let mut v = USER_ID.to_vec();
+     v.extend_from_slice(&0u64.to_le_bytes());
++    // The player's name from the settings file (clean_name keeps it short and ASCII, so it
++    // always fits with the terminating zero).
++    let nickname = crate::settings::player_name();
+     let mut name = [0u8; 0x20];
+-    name[..NICKNAME.len()].copy_from_slice(NICKNAME.as_bytes());
++    let n = nickname.len().min(0x1f);
++    name[..n].copy_from_slice(&nickname.as_bytes()[..n]);
+     v.extend_from_slice(&name);
+     v
+ }
+diff --git a/crates/rt/src/settings.rs b/crates/rt/src/settings.rs
+index fe59fd8..685b5e1 100644
+--- a/crates/rt/src/settings.rs
++++ b/crates/rt/src/settings.rs
+@@ -59,15 +59,35 @@ impl Default for Settings {
+ }
+ 
+ /// Settings plus the key and controller bindings (control id -> input names).
+-#[derive(Clone, Debug, Default, PartialEq)]
++#[derive(Clone, Debug, PartialEq)]
+ pub struct File {
+     pub settings: Settings,
++    /// The Switch account nickname the game sees (its player name).
++    pub player_name: String,
+     pub keys: BTreeMap<String, String>,
+     pub pad: BTreeMap<String, String>,
+     /// Environment variables the game's libraries see (getenv).
+     pub env: BTreeMap<String, String>,
+ }
+ 
++impl Default for File {
++    fn default() -> Self {
++        File { settings: Settings::default(), player_name: DEFAULT_NAME.into(), keys: BTreeMap::new(), pad: BTreeMap::new(), env: BTreeMap::new() }
++    }
++}
++
++pub const DEFAULT_NAME: &str = "kirikae";
++/// A Switch nickname is at most 10 characters.
++pub const NAME_MAX: usize = 10;
++
++/// A name the game can show and this file can hold: printable ASCII (the menu font), no `;`
++/// (starts a comment here), at most NAME_MAX characters. Empty means the default.
++pub fn clean_name(name: &str) -> String {
++    let n: String = name.chars().filter(|c| (' '..='~').contains(c) && *c != ';').take(NAME_MAX).collect();
++    let n = n.trim().to_string();
++    if n.is_empty() { DEFAULT_NAME.into() } else { n }
++}
++
+ pub fn path() -> Option<PathBuf> {
+     if let Some(p) = crate::env_var!("KIRIKAE_SETTINGS") {
+         return Some(p.into());
+@@ -83,21 +103,25 @@ static SAVE: Mutex<()> = Mutex::new(());
+ 
+ fn load() -> File {
+     let Some(path) = path() else { return File::default() };
+-    let (file, exists) = match std::fs::read_to_string(&path) {
++    // `complete`: the file exists and has every section, so it is left as the player wrote it.
++    let (file, complete) = match std::fs::read_to_string(&path) {
+         Ok(text) => {
+             let (f, problems) = parse(&text);
+             for p in problems {
+                 eprintln!("kirikae: settings: {}: {p}", path.display());
+             }
+-            (f, true)
++            // A file from before the player name existed: write it back with the [player]
++            // section so the setting is there to edit (everything else is kept).
++            let has_player = text.lines().any(|l| l.trim().eq_ignore_ascii_case("[player]"));
++            (f, has_player)
+         }
+         Err(_) => (File::default(), false),
+     };
+-    if !exists {
++    if !complete {
+         write(&file);
+-        eprintln!("kirikae: settings: wrote defaults to {}", path.display());
++        eprintln!("kirikae: settings: wrote {}", path.display());
+     }
+-    eprintln!("kirikae: settings: {:?}", file.settings);
++    eprintln!("kirikae: settings: {:?}, player name {:?}", file.settings, file.player_name);
+     file
+ }
+ 
+@@ -122,6 +146,10 @@ pub fn boot() -> Settings {
+     *BOOT.get().unwrap()
+ }
+ 
++pub fn player_name() -> String {
++    with(|f| f.player_name.clone())
++}
++
+ pub fn keys() -> BTreeMap<String, String> {
+     with(|f| f.keys.clone())
+ }
+@@ -169,6 +197,11 @@ pub fn render(f: &File) -> String {
+ ; Settings for the native PC build. Change them in the game with F1 (or Start+Back on a
+ ; controller), or edit this file while the game is closed. Delete it to get the defaults back.
+ 
++[player]
++; Your name in the game (the Switch account name): up to 10 letters, digits, spaces or symbols.
++; Also in the settings menu. Applies after a restart.
++name = {}
++
+ [display]
+ ; Window size in pixels.
+ window_width = {}
+@@ -202,6 +235,7 @@ vibration_strength = {}
+ ; Controller face buttons by position (Nintendo layout) instead of by label.
+ swap_ab_xy = {}
+ ",
++        f.player_name,
+         s.window_width,
+         s.window_height,
+         on_off(s.fullscreen),
+@@ -259,6 +293,10 @@ pub fn parse(text: &str) -> (File, Vec<String>) {
+             f.pad.insert(key, raw_value.to_ascii_lowercase());
+             continue;
+         }
++        if section == "player" && key == "name" {
++            f.player_name = clean_name(raw_value);
++            continue;
++        }
+         if section == "game_environment" {
+             let name = line.split_once('=').map(|(k, _)| k.trim().to_string()).unwrap_or_default();
+             f.env.insert(name, raw_value.to_string());
+@@ -313,6 +351,7 @@ mod tests {
+         f.settings.anisotropy = 4;
+         f.settings.scale_filter = Filter::Nearest;
+         f.settings.swap_ab_xy = true;
++        f.player_name = "Shane B".into();
+         f.keys.insert("a".into(), "Z Space".into());
+         f.pad.insert("zr".into(), "righttrigger".into());
+         f.env.insert("GC_FREE_SPACE_DIVISOR".into(), "1".into());
+@@ -324,6 +363,18 @@ mod tests {
+         assert_eq!(d, File::default());
+     }
+ 
++    #[test]
++    fn player_names() {
++        assert_eq!(clean_name("  Shane  "), "Shane");
++        assert_eq!(clean_name("ABCDEFGHIJKLMNOP"), "ABCDEFGHIJ");
++        assert_eq!(clean_name(""), DEFAULT_NAME);
++        assert_eq!(clean_name("Zoë"), "Zo");
++        let (f, problems) = parse("[player]\nname = Darkuni ; me\n");
++        assert!(problems.is_empty());
++        assert_eq!(f.player_name, "Darkuni");
++        assert_eq!(parse("vsync = on").0.player_name, DEFAULT_NAME);
++    }
++
+     #[test]
+     fn values_and_problems() {
+         let (f, problems) = parse("fullscreen = yes ; comment\nanisotropy=8\nframe_rate = 5\nscale_filter = Nearest\nbogus = 1\nnope");
+-- 
+2.43.0
+

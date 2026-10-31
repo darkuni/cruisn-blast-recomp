@@ -77,6 +77,10 @@ vibration and its strength, A/B and X/Y swap, frame rate display, keyboard keys,
 controller buttons. Changes are saved to cruisn-blast.ini in this folder. Delete that file
 to get the defaults back.
 
+Your player name (kirikae unless you change it) is the "name =" line under [player] in
+cruisn-blast.ini: up to 10 letters, digits, spaces or symbols. Edit it while the game is
+closed. The file is made on the first launch.
+
 
 KNOWN ISSUES
 ------------
