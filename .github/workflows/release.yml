@@ -117,18 +117,34 @@ jobs:
           git clone -q -c core.autocrlf=false https://github.com/Cor3Duo/kirikae kirikae
           cd kirikae
           git checkout -q (Get-Content ..\patches\kirikae\BASE_COMMIT)
-          foreach ($p in Get-ChildItem ..\patches\kirikae\*.patch) { git apply --whitespace=nowarn $p.FullName; if ($LASTEXITCODE) { exit 1 } }
+          function Run-Step([string]$what, [scriptblock]$cmd) {
+            $log = "$env:RUNNER_TEMP\step.log"
+            & $cmd 2>&1 | Tee-Object -FilePath $log | Out-Host
+            if ($LASTEXITCODE) {
+              $tail = (Get-Content $log -Tail 40) -join '%0A'
+              Write-Output "::error title=$what::$tail"
+              exit 1
+            }
+          }
+          foreach ($p in Get-ChildItem ..\patches\kirikae\*.patch) { Run-Step "git apply $($p.Name)" { git apply --whitespace=nowarn $p.FullName } }
           # No Visual C++ runtime needed on the player's PC.
           $env:RUSTFLAGS = '-C target-feature=+crt-static'
-          cargo build --release -p kirikae
-          if ($LASTEXITCODE) { exit 1 }
+          Run-Step 'kirikae build' { cargo build --release -p kirikae }
       - name: Setup
         run: |
           cd tools\setup
           $env:RUSTFLAGS = '-C target-feature=+crt-static'
           $env:CRUISN_BUILD_ID = $env:BUILD_ID
-          cargo build --release
-          if ($LASTEXITCODE) { exit 1 }
+          function Run-Step([string]$what, [scriptblock]$cmd) {
+            $log = "$env:RUNNER_TEMP\step.log"
+            & $cmd 2>&1 | Tee-Object -FilePath $log | Out-Host
+            if ($LASTEXITCODE) {
+              $tail = (Get-Content $log -Tail 40) -join '%0A'
+              Write-Output "::error title=$what::$tail"
+              exit 1
+            }
+          }
+          Run-Step 'setup build' { cargo build --release }
       - name: Package
         run: |
           $zigdir = python -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))"
@@ -149,12 +165,24 @@ jobs:
           $k = 'dist\CruisnBlast\recompiler\kirikae.exe'
           & $k testgen "$env:RUNNER_TEMP\hello.nro"
           $env:SETUP_NO_PAUSE = '1'
-          & dist\CruisnBlast\setup.exe --selftest "$env:RUNNER_TEMP\hello.nro" "$env:RUNNER_TEMP\selftest.exe"
-          if ($LASTEXITCODE) { exit 1 }
+          function Run-Step([string]$what, [scriptblock]$cmd) {
+            $log = "$env:RUNNER_TEMP\step.log"
+            & $cmd 2>&1 | Tee-Object -FilePath $log | Out-Host
+            if ($LASTEXITCODE) {
+              $tail = (Get-Content $log -Tail 40) -join '%0A'
+              Write-Output "::error title=$what::$tail"
+              exit 1
+            }
+          }
+          Run-Step 'selftest' { & dist\CruisnBlast\setup.exe --selftest "$env:RUNNER_TEMP\hello.nro" "$env:RUNNER_TEMP\selftest.exe" }
           $out = "$env:RUNNER_TEMP\selftest.out"
           $proc = Start-Process "$env:RUNNER_TEMP\selftest.exe" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
           Get-Content $out, "$out.err"
-          if (-not (Select-String -Quiet 'Hello from kirikae' $out, "$out.err")) { exit 1 }
+          if (-not (Select-String -Quiet 'Hello from kirikae' $out, "$out.err")) {
+            $t = ((Get-Content $out, "$out.err" -Tail 30) -join '%0A')
+            Write-Output "::error title=selftest run (exit $($proc.ExitCode))::$t"
+            exit 1
+          }
       - name: Archive
         run: |
           cd dist
