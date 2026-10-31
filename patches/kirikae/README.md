@@ -386,3 +386,10 @@ Tests: the fast-register and flag-fusion test callees now follow the calling con
 (restore SP, save and restore x19 through memory, clobber scratch registers) and the random
 callers use x19-x26 across calls. A callee that does not restore x19, and treating caller-saved
 registers as preserved, were each caught.
+
+## 0027 - objects only
+
+- `kirikae build --objects-only` stops after code generation: the object files and
+  `src/package.bin` are written and listed in `objects.txt`, but cargo is not run. The player's
+  setup links them with the prebuilt runtime library (`runtime/`) and a bundled linker, so the
+  player needs neither Rust nor a C toolchain, and no download contains translated game code.

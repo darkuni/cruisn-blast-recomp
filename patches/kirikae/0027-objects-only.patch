@@ -1,0 +1,74 @@
+From 2d25e601ce1016a84515001c5f9645f81649a779 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 19:04:20 -0700
+Subject: [PATCH] kirikae build --objects-only: stop after code generation
+
+---
+ crates/kirikae/src/main.rs   | 4 +++-
+ crates/recomp/src/project.rs | 7 +++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/crates/kirikae/src/main.rs b/crates/kirikae/src/main.rs
+index 0f1b0d3..05284f6 100644
+--- a/crates/kirikae/src/main.rs
++++ b/crates/kirikae/src/main.rs
+@@ -14,6 +14,7 @@ usage:
+   kirikae build <file> [-o <dir>] [--name <name>]       recompile into a native executable
+         [--backend cranelift|rust] [-j <jobs>]
+         [--fast-regs]                                keep guest registers in variables
++        [--objects-only]                             stop after code generation (objects.txt lists them)
+                                                      (experimental; or KIRIKAE_FAST_REGS=1)
+         [--plugin <crate dir>]                       link a crate whose install() runs first
+         [--profile <file>]                           also compile the addresses a run had to
+@@ -60,7 +61,7 @@ fn main() -> ExitCode {
+     }
+ }
+ 
+-const SWITCHES: &[&str] = &["--fast-regs", "--no-profile"];
++const SWITCHES: &[&str] = &["--fast-regs", "--no-profile", "--objects-only"];
+ 
+ struct Args {
+     positional: Vec<String>,
+@@ -121,6 +122,7 @@ fn cmd_build(args: &[String]) -> Result<ExitCode, String> {
+     }
+     (opts.profile, opts.no_profile) = profile_options(&a)?;
+     opts.plugins = a.options.iter().filter(|(k, _)| k == "--plugin").map(|(_, v)| PathBuf::from(v)).collect();
++    opts.objects_only = a.option(&["--objects-only"]).is_some();
+     opts.fast_regs = a.option(&["--fast-regs"]).is_some() || std::env::var("KIRIKAE_FAST_REGS").is_ok_and(|v| v == "1");
+     if opts.fast_regs && opts.backend != Backend::Cranelift {
+         return Err("--fast-regs needs the Cranelift backend".into());
+diff --git a/crates/recomp/src/project.rs b/crates/recomp/src/project.rs
+index 1a521d1..2033400 100644
+--- a/crates/recomp/src/project.rs
++++ b/crates/recomp/src/project.rs
+@@ -26,6 +26,9 @@ pub struct BuildOptions {
+     pub profile: Option<PathBuf>,
+     pub no_profile: bool,
+     pub plugins: Vec<PathBuf>,
++    /// Stop after code generation: the object files are listed in `<out>/objects.txt` and
++    /// linked by someone else (a prebuilt runtime and a bundled linker).
++    pub objects_only: bool,
+ }
+ 
+ impl BuildOptions {
+@@ -40,6 +43,7 @@ impl BuildOptions {
+             profile: None,
+             no_profile: false,
+             plugins: Vec::new(),
++            objects_only: false,
+         }
+     }
+ }
+@@ -334,6 +338,9 @@ pub fn build(source: &Source, opts: &BuildOptions) -> Result<BuildReport, String
+             eprintln!("kirikae: generated {} instructions in {:.1}s", rep.instructions, t1.elapsed().as_secs_f64());
+             let list: String = rep.objects.iter().map(|o| format!("{}\n", o.display())).collect();
+             write(project.join("objects.txt"), list.as_bytes())?;
++            if opts.objects_only {
++                return Ok(BuildReport { executable: project.join("objects.txt"), functions: rep.functions, instructions: rep.instructions, reachable, total: space.words() });
++            }
+             write(project.join("build.rs"), CLIF_BUILD_RS.as_bytes())?;
+             write(project.join("Cargo.toml"), manifest(&name, true, &plugins).as_bytes())?;
+             let installs: String = plugins.iter().map(|(n, _)| format!("    {}::install();\n", n.replace('-', "_"))).collect();
+-- 
+2.43.0
+

@@ -1,0 +1,181 @@
+# Builds the player downloads and attaches them to a release.
+#
+# The downloads hold no game code: setup, the Kirikae recompiler (with patches/kirikae applied),
+# the prebuilt runtime library, Zig as the linker and the profile (code addresses). The player's
+# setup translates their own copy of the game into cruisn-blast(.exe) on their own computer.
+#
+# Runs when a release is published, or by hand (Actions > release > Run workflow) for a tag.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the downloads to (empty = build only)
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+  RUST_MIN_STACK: 268435456
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libasound2-dev libudev-dev
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+          pip install ziglang==$ZIG_VERSION
+          cargo install cargo-zigbuild --locked
+          echo "BUILD_ID=$(git rev-parse --short=12 HEAD)" >> $GITHUB_ENV
+      - name: Kirikae with patches
+        run: |
+          git clone -q https://github.com/Cor3Duo/kirikae runtime/kirikae
+          cd runtime/kirikae
+          git checkout -q "$(cat ../../patches/kirikae/BASE_COMMIT)"
+          for p in ../../patches/kirikae/*.patch; do git apply --whitespace=nowarn "$p"; done
+          # Runs on SteamOS and older desktop Linux: glibc 2.31.
+          RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined" cargo zigbuild --release -p kirikae --target x86_64-unknown-linux-gnu.2.31
+      - name: Runtime libraries
+        run: |
+          cd runtime
+          for t in x86_64-unknown-linux-gnu.2.31 x86_64-pc-windows-gnu; do
+            cargo zigbuild --release --target $t
+            cargo-zigbuild rustc --release --target $t --lib -- --print native-static-libs 2>&1 \
+              | grep -o 'native-static-libs: .*' | tail -1 | cut -d' ' -f2- > ${t%%.*}.libs
+            echo "$t: $(cat ${t%%.*}.libs)"
+          done
+      - name: Setup
+        run: cd tools/setup && CRUISN_BUILD_ID=$BUILD_ID cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+      - name: Package
+        run: |
+          zigdir=$(python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))")
+          p=dist/CruisnBlast; rec=$p/recompiler
+          mkdir -p $rec/zig
+          cp tools/setup/target/x86_64-unknown-linux-gnu/release/setup $p/
+          cp tools/cruisn-blast-linux.sh tools/cruisn-blast.shaders-used $p/
+          cp tools/README-testers.txt $p/README.txt
+          cp THIRD_PARTY_NOTICES.md $p/THIRD_PARTY_NOTICES.txt
+          cp runtime/kirikae/target/x86_64-unknown-linux-gnu/release/kirikae $rec/
+          cp tools/cruisn-blast.profile $rec/
+          cp runtime/target/x86_64-unknown-linux-gnu/release/libcruisn_blast_runtime.a $rec/
+          cp runtime/x86_64-unknown-linux-gnu.libs $rec/runtime.libs
+          cp -r "$zigdir/zig" "$zigdir/lib" "$zigdir/LICENSE" $rec/zig/
+          sh tools/make_stubs.sh $rec/libcruisn_blast_runtime.a $rec/zig/zig $rec/stubs
+      - name: Self-test (recompile and link a test program like the game)
+        run: |
+          k=dist/CruisnBlast/recompiler/kirikae
+          $k testgen /tmp/hello.nro
+          SETUP_NO_PAUSE=1 dist/CruisnBlast/setup --selftest /tmp/hello.nro /tmp/selftest
+          /tmp/selftest | tee /tmp/selftest.out
+          grep -q "Hello from kirikae" /tmp/selftest.out
+      - name: Archive
+        run: |
+          rm -rf /tmp/zc; cd dist && tar -cJf CruisnBlast-linux.tar.xz CruisnBlast && ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CruisnBlast-linux
+          path: dist/CruisnBlast-linux.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-windows
+          path: |
+            runtime/target/x86_64-pc-windows-gnu/release/libcruisn_blast_runtime.a
+            runtime/x86_64-pc-windows-gnu.libs
+
+  windows:
+    needs: linux
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-windows
+          path: runtime-windows
+      - name: Tools
+        run: |
+          rustup toolchain install stable --profile minimal
+          pip install ziglang==$env:ZIG_VERSION
+          "BUILD_ID=$(git rev-parse --short=12 HEAD)" | Out-File -Append $env:GITHUB_ENV
+      - name: Kirikae with patches
+        run: |
+          git clone -q -c core.autocrlf=false https://github.com/Cor3Duo/kirikae kirikae
+          cd kirikae
+          git checkout -q (Get-Content ..\patches\kirikae\BASE_COMMIT)
+          foreach ($p in Get-ChildItem ..\patches\kirikae\*.patch) { git apply --whitespace=nowarn $p.FullName; if ($LASTEXITCODE) { exit 1 } }
+          # No Visual C++ runtime needed on the player's PC.
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build --release -p kirikae
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Setup
+        run: |
+          cd tools\setup
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          $env:CRUISN_BUILD_ID = $env:BUILD_ID
+          cargo build --release
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Package
+        run: |
+          $zigdir = python -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))"
+          $p = 'dist\CruisnBlast'; $rec = "$p\recompiler"
+          New-Item -ItemType Directory -Force "$rec\zig" | Out-Null
+          Copy-Item tools\setup\target\release\setup.exe $p\
+          Copy-Item tools\cruisn-blast.shaders-used $p\
+          Copy-Item tools\README-testers.txt $p\README.txt
+          Copy-Item THIRD_PARTY_NOTICES.md $p\THIRD_PARTY_NOTICES.txt
+          Copy-Item kirikae\target\release\kirikae.exe $rec\
+          Copy-Item tools\cruisn-blast.profile $rec\
+          Copy-Item runtime-windows\target\x86_64-pc-windows-gnu\release\libcruisn_blast_runtime.a $rec\
+          Copy-Item runtime-windows\x86_64-pc-windows-gnu.libs $rec\runtime.libs
+          Copy-Item "$zigdir\zig.exe", "$zigdir\LICENSE" "$rec\zig\"
+          Copy-Item -Recurse "$zigdir\lib" "$rec\zig\lib"
+      - name: Self-test (recompile and link a test program like the game)
+        run: |
+          $k = 'dist\CruisnBlast\recompiler\kirikae.exe'
+          & $k testgen "$env:RUNNER_TEMP\hello.nro"
+          $env:SETUP_NO_PAUSE = '1'
+          & dist\CruisnBlast\setup.exe --selftest "$env:RUNNER_TEMP\hello.nro" "$env:RUNNER_TEMP\selftest.exe"
+          if ($LASTEXITCODE) { exit 1 }
+          $out = "$env:RUNNER_TEMP\selftest.out"
+          $proc = Start-Process "$env:RUNNER_TEMP\selftest.exe" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+          Get-Content $out, "$out.err"
+          if (-not (Select-String -Quiet 'Hello from kirikae' $out, "$out.err")) { exit 1 }
+      - name: Archive
+        run: |
+          cd dist
+          Compress-Archive -Path CruisnBlast -DestinationPath CruisnBlast-windows.zip
+          Get-Item CruisnBlast-windows.zip | Format-List Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CruisnBlast-windows
+          path: dist/CruisnBlast-windows.zip
+
+  attach:
+    needs: [linux, windows]
+    if: github.event_name == 'release' || inputs.tag != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: CruisnBlast-*
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" CruisnBlast-windows.zip CruisnBlast-linux.tar.xz --clobber -R "$GITHUB_REPOSITORY"

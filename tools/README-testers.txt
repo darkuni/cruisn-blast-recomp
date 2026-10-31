@@ -5,7 +5,9 @@ A native Windows version of Cruis'n Blast (Nintendo Switch, v2.0.0), made by sta
 recompilation. Not an emulator.
 https://github.com/darkuni/cruisn-blast-recomp
 
-This package contains no game files. You need your own copy of the game, dumped from your
+This package contains no game files and no game code. setup makes the game on your own
+computer from your own copy: it translates the game's program into PC code there. You need
+your own copy of the game, dumped from your
 own Switch:
   - the base game NSP          (title ID 0100B41013C82000)
   - the v2.0.0 update NSP      (title ID 0100B41013C82800, version 131072)
@@ -16,7 +18,8 @@ WHAT YOU NEED
 -------------
 - Windows 10 or 11, 64-bit
 - A GPU with Vulkan 1.3 support and current drivers
-- About 4 GB of free disk space for the game data, plus this folder
+- About 6 GB of free disk space: 4 GB for the game data, 0.6 GB for the game, and up to
+  1.5 GB more while setup runs
 
 
 SETUP (ONCE)
@@ -25,10 +28,22 @@ SETUP (ONCE)
 2. Drag the two NSPs and prod.keys onto setup.exe.
    (Or copy them into this folder and double-click setup.exe. It also finds prod.keys in
    %USERPROFILE%\.switch\.)
-3. Wait for "Done". It takes a minute or two: it copies the game data with the update
-   applied into game\ and pulls out the game's shaders. The NSPs are only read, never changed.
-   Nothing is downloaded and nothing leaves your PC.
+3. Wait for "Done". It takes about five minutes:
+   - it copies the game data with the update applied into game\ and pulls out the game's
+     shaders
+   - it translates the game's program into cruisn-blast.exe, using the recompiler and linker
+     in the recompiler\ folder (this part uses every CPU core for a few minutes)
+   The NSPs are only read, never changed. Nothing is downloaded and nothing leaves your PC.
 4. Start cruisn-blast.exe.
+
+After unpacking a newer release over this folder, run setup.exe again: it keeps the game data
+and only makes cruisn-blast.exe again. Do not delete the recompiler\ folder.
+
+STEAM DECK AND LINUX
+--------------------
+Use the Linux download. In a terminal in its folder: ./setup <base.nsp> <update.nsp> <prod.keys>
+(or put them in the folder and run ./setup). It makes the cruisn-blast program. Add
+cruisn-blast-linux.sh to Steam as a non-Steam game. Needs a Vulkan driver (SteamOS has one).
 
 The first launch shows "PREPARING SHADERS" for a few seconds. That is the game's shaders
 being compiled for your GPU so races don't stutter. Later launches are faster.
@@ -81,4 +96,5 @@ Also say which GPU and driver version you have.
 If the game crashes, a message box says so; the details are in cruisn-blast.log.
 
 Unofficial fan project, not affiliated with Raw Thrills, GameMill or Nintendo. cruisn-blast.exe
-contains code machine-translated from the game's executable; game data comes from your own dump.
+is made on your computer from your own dump; none of the game's code or data is in this
+download.

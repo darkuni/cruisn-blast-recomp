@@ -5,9 +5,11 @@
 //!   game\exefs\...          the game's program files (checked against v2.0.0)
 //!   game\romfs.bin          the game's data with the update applied (about 3.6 GB)
 //!   cruisn-blast.shaders    the game's shader programs, compiled on the first launch
+//!   cruisn-blast.exe        the game, recompiled here from the program files (recompile.rs)
 //! Nothing is downloaded and nothing leaves the PC. The NSPs are only read.
 
 mod nsp;
+mod recompile;
 mod unity;
 
 use std::io::Write;
@@ -42,7 +44,7 @@ fn candidates(folder: &Path, ext: &str) -> Vec<PathBuf> {
         let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         if p.is_file() && name.ends_with(ext) {
             out.push(p);
-        } else if p.is_dir() && !["game", "build", "kirikae", "target"].contains(&name.as_str()) {
+        } else if p.is_dir() && !["game", "build", "kirikae", "target", "recompiler", "recompile-work"].contains(&name.as_str()) {
             if let Ok(sub) = std::fs::read_dir(&p) {
                 let mut s: Vec<PathBuf> = sub.flatten().map(|e| e.path()).filter(|q| q.is_file() && q.to_string_lossy().to_lowercase().ends_with(ext)).collect();
                 s.sort();
@@ -249,13 +251,32 @@ fn run(folder: &Path, places: &[PathBuf]) -> Result<(), String> {
     let romfs = write_romfs(&update_nca, &base_nca, &game)?;
     println!("Shader programs");
     write_shaders(&romfs, &folder.join("cruisn-blast.shaders"))?;
-    println!("\nDone in {:.0} s. Start cruisn-blast.exe.", t0.elapsed().as_secs_f64());
+    println!("The game executable");
+    if recompile::up_to_date(folder) {
+        println!("  already made by this release");
+    } else {
+        recompile::build(&here(), folder)?;
+    }
+    println!("\nDone in {:.0} s. Start {}.", t0.elapsed().as_secs_f64(), recompile::exe_name());
     println!("The game no longer needs the NSPs or prod.keys; keep them somewhere safe.");
     Ok(())
 }
 
 fn main() {
-    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let mut args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    // `setup --selftest <program.nro> <out>`: the release check (CI) on a small test program.
+    if args.len() == 3 && args[0].as_os_str() == "--selftest" {
+        if let Err(e) = recompile::selftest(&here(), &args[1], &args[2]) {
+            println!("STOP: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // `setup --recompile [...]` only remakes the executable from game/exefs (already set up).
+    let recompile_only = args.first().is_some_and(|a| a.as_os_str() == "--recompile");
+    if recompile_only {
+        args.remove(0);
+    }
     // `setup --out <folder> [inputs...]` writes somewhere other than the exe's folder.
     let (folder, inputs) = match args.first().map(|a| a.as_os_str() == "--out") {
         Some(true) if args.len() >= 2 => (std::path::absolute(&args[1]).unwrap_or(args[1].clone()), args[2..].to_vec()),
@@ -263,7 +284,17 @@ fn main() {
     };
     let mut places: Vec<PathBuf> = inputs.iter().map(|a| std::path::absolute(a).unwrap_or(a.clone())).collect();
     places.push(folder.clone());
-    let code = match run(&folder, &places) {
+    let result = if recompile_only {
+        if folder.join("game").join("exefs").join("main").is_file() {
+            println!("Cruis'n Blast PC - remaking the game executable");
+            recompile::build(&here(), &folder)
+        } else {
+            Err("game/exefs is not there yet: run setup normally first.".into())
+        }
+    } else {
+        run(&folder, &places)
+    };
+    let code = match result {
         Ok(()) => 0,
         Err(e) => {
             println!("\nSTOP: {e}");

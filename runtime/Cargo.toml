@@ -1,0 +1,24 @@
+[package]
+name = "cruisn-blast-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Prebuilt runtime for the player-side build: Kirikae's runtime plus main(); the player's setup links it with the game code it recompiles from their own dump."
+
+[lib]
+name = "cruisn_blast_runtime"
+crate-type = ["staticlib"]
+
+[dependencies]
+# The patched Kirikae checkout (tools/build_release.sh puts it here). Without the H.264
+# decoder: the game plays no H.264 video, and it is C++ the player's linker would have to build.
+kirikae-rt = { path = "kirikae/crates/rt", default-features = false }
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+
+# Not part of any enclosing workspace; the Kirikae checkout has its own.
+[workspace]
+exclude = ["kirikae"]

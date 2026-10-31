@@ -19,3 +19,6 @@ game/
 *.shaders
 romfs.bin
 tools/setup/target/
+
+# The shipped profile: guest code addresses only (no game code), read by kirikae build.
+!tools/cruisn-blast.profile
