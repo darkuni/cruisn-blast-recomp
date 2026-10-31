@@ -223,6 +223,7 @@ jobs:
     if: github.event_name == 'release' || inputs.tag != ''
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: CruisnBlast-*
@@ -231,4 +232,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" CruisnBlast-windows.zip CruisnBlast-linux.tar.xz --clobber -R "$GITHUB_REPOSITORY"
+        run: |
+          # A tag with no release yet (run by hand): make the release from release-notes/<tag>.md.
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            notes=release-notes/$TAG.md
+            [ -f "$notes" ] || { echo "::error::no release $TAG and no $notes"; exit 1; }
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "Cruis'n Blast $TAG" --notes-file "$notes" --latest -R "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "$TAG" CruisnBlast-windows.zip CruisnBlast-linux.tar.xz --clobber -R "$GITHUB_REPOSITORY"
