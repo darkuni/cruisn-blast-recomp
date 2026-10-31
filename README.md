@@ -3,7 +3,18 @@
 Static recompilation of **Cruis'n Blast** (Nintendo Switch, Raw Thrills 2021) to a native Windows x64 build.
 Delisted from the Switch eShop on June 30, 2026.
 
-Tools and runtime only. Bring your own dump and your own console keys. Nothing from the game is stored in this repo.
+Tools and runtime only. Bring your own dump and your own console keys. No game files are stored in this repo or its
+releases; the release exe contains code machine-translated from the game's executable.
+
+## Download
+
+Windows: get the latest `CruisnBlast-<version>.zip` from [Releases](https://github.com/darkuni/cruisn-blast-recomp/releases),
+unzip it, drag your base NSP, the v2.0.0 update NSP and your `prod.keys` onto `setup.exe` (it makes the `game` folder and
+the shader file - nothing to install), then run `cruisn-blast.exe`. Needs a Vulkan 1.3 GPU. The zip's `README.txt` has the
+controls. Steam Deck / Linux: the `CruisnBlast-linux-<version>.tar.xz` build where a release has one.
+
+Releases are built on the development PC (the build needs the game's own code to recompile), so they are attached by hand
+rather than by CI.
 
 ## Target
 

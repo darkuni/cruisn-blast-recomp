@@ -1,8 +1,9 @@
-CRUIS'N BLAST - NATIVE PC BUILD (TEST BUILD)
-============================================
+CRUIS'N BLAST - NATIVE PC BUILD
+===============================
 
 A native Windows version of Cruis'n Blast (Nintendo Switch, v2.0.0), made by static
-recompilation. Not an emulator. Please don't share this build outside the test group yet.
+recompilation. Not an emulator.
+https://github.com/darkuni/cruisn-blast-recomp
 
 This package contains no game files. You need your own copy of the game, dumped from your
 own Switch:
@@ -78,3 +79,6 @@ Send these from this folder, plus what you were doing when it happened:
 Also say which GPU and driver version you have.
 
 If the game crashes, a message box says so; the details are in cruisn-blast.log.
+
+Unofficial fan project, not affiliated with Raw Thrills, GameMill or Nintendo. cruisn-blast.exe
+contains code machine-translated from the game's executable; game data comes from your own dump.
