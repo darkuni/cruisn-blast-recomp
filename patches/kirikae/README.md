@@ -410,3 +410,13 @@ registers as preserved, were each caught.
   (VK_NV_device_diagnostic_checkpoints) before every draw, dispatch and render pass; on a loss
   the log lists the last checkpoints the GPU reached and the draws around them (vertex and
   fragment shader addresses, counts). The shader addresses work with `KIRIKAE_SKIP_SHADER`.
+
+## 0030 - F2I of NaN is 0
+
+- Maxwell's F2I turns NaN into 0. The translation clamped and converted it as is, which
+  Vulkan leaves undefined: NVIDIA clamps a NaN to the low end, so a signed F2I gave
+  0x80000000. Cruis'n Blast's wet-road shader bounds a loop by an F2I result and compares
+  unsigned, so a NaN made it loop about 2^31 times and the driver reset the GPU
+  (VK_ERROR_DEVICE_LOST in the second race, the rainy one). F2I now selects 0 for NaN.
+- The device-lost report (0029) now marks the oldest unfinished draw: the one right after
+  the oldest checkpoint the GPU reached.

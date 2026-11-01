@@ -1,0 +1,52 @@
+From bfc28810faf1446339190dfd53b41f9c428cbb52 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 08:52:24 -0700
+Subject: [PATCH] F2I: NaN converts to 0 like Maxwell; device-lost report
+ centres on the oldest unfinished draw
+
+---
+ crates/maxwell/src/translate.rs  |  6 ++++++
+ crates/rt/src/gpu/vulkan/diag.rs | 10 ++++++----
+ 2 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index b049311..c676ee5 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -2025,6 +2025,12 @@ impl<'a> Translator<'a> {
+         };
+         let (l, h) = (self.f(lo), self.f(hi));
+         let clamped = self.ext(self.t.f32, glsl::FCLAMP, &[rounded, l, h])?;
++        // Maxwell converts NaN to 0. Vulkan leaves NaN through clamp and conversion undefined
++        // (NVIDIA clamps it to the low end, so a signed NaN became 0x80000000): a loop bounded by
++        // F2I of a NaN then ran ~2^31 times and the driver reset the GPU (Cruis'n Blast's wet road).
++        let nan = self.b.is_nan(self.t.bool, None, rounded)?;
++        let zero = self.f(0.0);
++        let clamped = self.b.select(self.t.f32, None, nan, zero, clamped)?;
+         let v = if signed {
+             let r = self.b.convert_f_to_s(self.t.i32, None, clamped)?;
+             self.cast_u(r)?
+diff --git a/crates/rt/src/gpu/vulkan/diag.rs b/crates/rt/src/gpu/vulkan/diag.rs
+index 4ca32b6..290180c 100644
+--- a/crates/rt/src/gpu/vulkan/diag.rs
++++ b/crates/rt/src/gpu/vulkan/diag.rs
+@@ -112,10 +112,12 @@ impl Renderer {
+         for (id, stage) in &ids {
+             eprintln!("kirikae: GPU   #{id} {stage:?}: {}", text(*id).unwrap_or("(older than the markers kept)"));
+         }
+-        if let Some(&(last, _)) = ids.iter().max_by_key(|(id, _)| *id) {
+-            eprintln!("kirikae: GPU: the work right after the last marker reached:");
+-            for id in last.saturating_sub(3)..=(last + 6).min(m.next - 1) {
+-                eprintln!("kirikae: GPU   {}#{id}: {}", if id == last { "> " } else { "  " }, text(id).unwrap_or("?"));
++        // The oldest marker reached (normally BOTTOM_OF_PIPE) is the last one the GPU got all the
++        // way past: the command right after it is the oldest that never finished.
++        if let Some(&(first_reached, _)) = ids.first() {
++            eprintln!("kirikae: GPU: the oldest unfinished work is right after #{first_reached} (marked >):");
++            for id in first_reached.saturating_sub(2)..=(first_reached + 6).min(m.next - 1) {
++                eprintln!("kirikae: GPU   {}#{id}: {}", if id == first_reached { "> " } else { "  " }, text(id).unwrap_or("?"));
+             }
+         }
+     }
+-- 
+2.43.0
+
