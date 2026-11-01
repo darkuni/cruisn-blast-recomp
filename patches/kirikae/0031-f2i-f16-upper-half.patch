@@ -1,0 +1,29 @@
+From b5d1ef80b1b601d5f04afa9a9cb00447113576f4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 09:18:29 -0700
+Subject: [PATCH] F2I.F16: bit 41 selects the upper half
+
+---
+ crates/maxwell/src/translate.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/crates/maxwell/src/translate.rs b/crates/maxwell/src/translate.rs
+index c676ee5..a340478 100644
+--- a/crates/maxwell/src/translate.rs
++++ b/crates/maxwell/src/translate.rs
+@@ -1998,8 +1998,11 @@ impl<'a> Translator<'a> {
+         let b = self.src_bf(i)?;
+         let src = match i.bits(10, 2) {
+             1 => {
++                // Bit 41 selects the upper half (F2I.F16.H1), as for F2F. Reading the lower half
++                // instead gave Cruis'n Blast's wet-road shader a loop count from the wrong 16
++                // bits, sometimes billions of iterations, and the driver reset the GPU.
+                 let raw = self.src_b(i)?;
+-                self.unpack_half(raw, false)?
++                self.unpack_half(raw, i.bit(41))?
+             }
+             2 => b,
+             _ => {
+-- 
+2.43.0
+

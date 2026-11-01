@@ -416,7 +416,15 @@ registers as preserved, were each caught.
 - Maxwell's F2I turns NaN into 0. The translation clamped and converted it as is, which
   Vulkan leaves undefined: NVIDIA clamps a NaN to the low end, so a signed F2I gave
   0x80000000. Cruis'n Blast's wet-road shader bounds a loop by an F2I result and compares
-  unsigned, so a NaN made it loop about 2^31 times and the driver reset the GPU
-  (VK_ERROR_DEVICE_LOST in the second race, the rainy one). F2I now selects 0 for NaN.
+  unsigned, so a NaN would make it loop about 2^31 times. F2I now selects 0 for NaN. (Not the
+  cause of the rainy-race crash after all: see 0031.)
 - The device-lost report (0029) now marks the oldest unfinished draw: the one right after
   the oldest checkpoint the GPU reached.
+
+## 0031 - F2I from the upper half of a register
+
+- F2I with a 16-bit float source (F2I.F16) has a half selector in bit 41, like F2F; the
+  translation always read the lower half. Cruis'n Blast's wet-road shader converts its loop
+  count from the upper half (F2I.F16.H1), so the count came from the neighbouring 16 bits,
+  sometimes billions of iterations, and the driver reset the GPU (VK_ERROR_DEVICE_LOST in the
+  second race, the rainy one).
