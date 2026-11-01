@@ -436,3 +436,12 @@ registers as preserved, were each caught.
   the `audit` feature, every instruction bit the game sets that the translation never reads
   (how the F2I half selector of 0031 would have been found). The feature is off in normal
   builds, so the runtime is unchanged.
+
+## 0033 - shader bisect hotkeys
+
+- With `KIRIKAE_GPU_DIAG=1` (cruisn-blast-gpu-diagnostics.bat), F6 / F7 skip the next /
+  previous fragment shader among those used by quad-sized draws (6 vertices or fewer:
+  full-screen effects such as bloom, colour grading and tonemapping, and on-screen banners),
+  and F8 stops skipping. The window title and the log name the shader being skipped, so the one
+  that draws something wrong is found by looking at the problem and pressing keys until it
+  goes away. Without the variable the keys do nothing.

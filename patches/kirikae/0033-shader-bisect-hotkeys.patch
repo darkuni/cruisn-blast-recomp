@@ -1,0 +1,142 @@
+From c7169934b81a88159e0e045df4b1044d21998191 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 11:36:16 -0700
+Subject: [PATCH] Shader bisect hotkeys (F6/F7/F8 with KIRIKAE_GPU_DIAG)
+
+---
+ crates/rt/src/display.rs           | 16 ++++++++++
+ crates/rt/src/gpu/vulkan/bisect.rs | 51 ++++++++++++++++++++++++++++++
+ crates/rt/src/gpu/vulkan/draw.rs   |  7 ++++
+ crates/rt/src/gpu/vulkan/mod.rs    |  1 +
+ 4 files changed, 75 insertions(+)
+ create mode 100644 crates/rt/src/gpu/vulkan/bisect.rs
+
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index bee8560..a9994cf 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -321,6 +321,19 @@ impl ApplicationHandler<Shown> for App {
+                         }
+                         return;
+                     }
++                    // Shader bisect (gpu/vulkan/bisect.rs): F6 next, F7 previous, F8 off.
++                    if matches!(code, KeyCode::F6 | KeyCode::F7 | KeyCode::F8) {
++                        if fresh {
++                            crate::gpu::vulkan::bisect::step(match code {
++                                KeyCode::F6 => 1,
++                                KeyCode::F7 => -1,
++                                _ => 0,
++                            });
++                            self.since = Instant::now() - std::time::Duration::from_secs(2);
++                            self.update_title();
++                        }
++                        return;
++                    }
+                     if code == KeyCode::F11 || (self.alt && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)) {
+                         if fresh {
+                             self.toggle_fullscreen();
+@@ -431,6 +444,9 @@ impl App {
+             if gaps > 0 {
+                 title += &format!(" - {gaps} new coverage {}", if gaps == 1 { "item" } else { "items" });
+             }
++            if let Some(b) = crate::gpu::vulkan::bisect::status() {
++                title += &format!(" - {b}");
++            }
+             window.set_title(&title);
+             self.shown = 0;
+             self.since = Instant::now();
+diff --git a/crates/rt/src/gpu/vulkan/bisect.rs b/crates/rt/src/gpu/vulkan/bisect.rs
+new file mode 100644
+index 0000000..d2262f1
+--- /dev/null
++++ b/crates/rt/src/gpu/vulkan/bisect.rs
+@@ -0,0 +1,51 @@
++//! Shader bisect hotkeys, for finding which shader draws something wrong while looking at it.
++//!
++//! Every fragment shader used by a quad-sized draw (6 vertices or fewer: full-screen effects
++//! such as bloom, colour grading and tonemapping, and on-screen banners) is listed in the order it
++//! was first seen. F6 / F7 skip the next / previous one in that list, F8 stops skipping. The
++//! window title and the log show which shader is being skipped, so the one that makes the
++//! problem disappear can be reported by its address. The keys only work with KIRIKAE_GPU_DIAG.
++
++use std::sync::Mutex;
++
++struct State {
++    seen: Vec<u64>,
++    /// Index into `seen` of the shader being skipped.
++    skipping: Option<usize>,
++}
++
++static STATE: Mutex<State> = Mutex::new(State { seen: Vec::new(), skipping: None });
++
++/// Called for each draw: records quad-sized draws' fragment shaders and says whether to skip it.
++pub fn skip(fragment: u64, vertices: u32) -> bool {
++    let mut s = STATE.lock().unwrap();
++    if vertices <= 6 && !s.seen.contains(&fragment) {
++        s.seen.push(fragment);
++    }
++    s.skipping.is_some_and(|i| s.seen.get(i) == Some(&fragment))
++}
++
++/// F6 (+1), F7 (-1), F8 (0 = stop). Only with KIRIKAE_GPU_DIAG (cruisn-blast-gpu-diagnostics.bat),
++/// so a stray key press in normal play changes nothing.
++pub fn step(dir: i32) {
++    if !super::diag::wanted_checkpoints() {
++        return;
++    }
++    let mut s = STATE.lock().unwrap();
++    let n = s.seen.len();
++    s.skipping = match (dir, s.skipping) {
++        _ if n == 0 || dir == 0 => None,
++        (d, None) => Some(if d > 0 { 0 } else { n - 1 }),
++        (d, Some(i)) => Some((i as i64 + d as i64).rem_euclid(n as i64) as usize),
++    };
++    match s.skipping {
++        Some(i) => eprintln!("kirikae: bisect: skipping fragment shader {:#x} ({}/{n})", s.seen[i], i + 1),
++        None => eprintln!("kirikae: bisect: not skipping"),
++    }
++}
++
++/// For the window title.
++pub fn status() -> Option<String> {
++    let s = STATE.lock().unwrap();
++    s.skipping.map(|i| format!("skipping {:#x} ({}/{})", s.seen[i], i + 1, s.seen.len()))
++}
+diff --git a/crates/rt/src/gpu/vulkan/draw.rs b/crates/rt/src/gpu/vulkan/draw.rs
+index 2fdee7a..c8e32f7 100644
+--- a/crates/rt/src/gpu/vulkan/draw.rs
++++ b/crates/rt/src/gpu/vulkan/draw.rs
+@@ -1,4 +1,6 @@
+ use ash::vk;
++
++use super::bisect;
+ use kirikae_maxwell::{Kind, Stage};
+ 
+ use crate::gpu::formats::ColorFormat;
+@@ -275,6 +277,11 @@ impl Renderer {
+         let shader_va = |stage: usize| program + regs[reg::PIPELINE + 16 * stage + 1] as u64;
+         let vs = self.shader(gpu, mem, regs, shader_va(1), Stage::Vertex, cbufs[0], attribute_types, output_types, None)?;
+         let fs = if regs[reg::PIPELINE + 16 * 5] & 1 == 1 { Some(self.shader(gpu, mem, regs, shader_va(5), Stage::Fragment, cbufs[4], attribute_types, output_types, None)?) } else { None };
++        if let Some(f) = &fs
++            && bisect::skip(f.va, draw.count)
++        {
++            return Ok(());
++        }
+         self.lap(2, &mut lap);
+         for s in std::iter::once(&vs).chain(fs.as_ref()) {
+             if !s.shader.unsupported.is_empty() && crate::env_var!("KIRIKAE_DRAW_PARTIAL").is_none() {
+diff --git a/crates/rt/src/gpu/vulkan/mod.rs b/crates/rt/src/gpu/vulkan/mod.rs
+index 003553a..577e88f 100644
+--- a/crates/rt/src/gpu/vulkan/mod.rs
++++ b/crates/rt/src/gpu/vulkan/mod.rs
+@@ -9,6 +9,7 @@ use super::buffer_cache::{self, BufferCache};
+ use super::fxhash::FastMap as HashMap;
+ use super::tic;
+ 
++pub mod bisect;
+ mod buffers;
+ mod descriptors;
+ mod diag;
+-- 
+2.43.0
+
