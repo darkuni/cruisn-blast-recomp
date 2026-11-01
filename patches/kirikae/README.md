@@ -428,3 +428,11 @@ registers as preserved, were each caught.
   count from the upper half (F2I.F16.H1), so the count came from the neighbouring 16 bits,
   sometimes billions of iterations, and the driver reset the GPU (VK_ERROR_DEVICE_LOST in the
   second race, the rainy one).
+
+## 0032 - shader scan and bit audit (development tool)
+
+- `cargo run --release -p kirikae-maxwell --features audit --example scan -- <dir>` translates
+  every shader in a `KIRIKAE_SHADER_DUMP` folder and lists unsupported instructions, and with
+  the `audit` feature, every instruction bit the game sets that the translation never reads
+  (how the F2I half selector of 0031 would have been found). The feature is off in normal
+  builds, so the runtime is unchanged.

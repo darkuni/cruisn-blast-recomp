@@ -1,0 +1,144 @@
+From 1ab363a5ead82374150b606cfa056c259cffd4cc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 09:57:54 -0700
+Subject: [PATCH] maxwell: shader scan example and optional bit audit (feature
+ audit)
+
+---
+ crates/maxwell/Cargo.toml       |  4 +++
+ crates/maxwell/examples/scan.rs | 64 +++++++++++++++++++++++++++++++++
+ crates/maxwell/src/decode.rs    | 21 +++++++++++
+ 3 files changed, 89 insertions(+)
+ create mode 100644 crates/maxwell/examples/scan.rs
+
+diff --git a/crates/maxwell/Cargo.toml b/crates/maxwell/Cargo.toml
+index 3df4da7..0e98522 100644
+--- a/crates/maxwell/Cargo.toml
++++ b/crates/maxwell/Cargo.toml
+@@ -5,6 +5,10 @@ version.workspace = true
+ edition.workspace = true
+ license.workspace = true
+ 
++[features]
++# Record which instruction bits the translation reads (examples/scan).
++audit = []
++
+ [dependencies]
+ rspirv = "0.13"
+ 
+diff --git a/crates/maxwell/examples/scan.rs b/crates/maxwell/examples/scan.rs
+new file mode 100644
+index 0000000..82259e2
+--- /dev/null
++++ b/crates/maxwell/examples/scan.rs
+@@ -0,0 +1,64 @@
++//! Translate every Maxwell shader in a folder (KIRIKAE_SHADER_DUMP output) and tally what the
++//! translator does not support.  cargo run --release -p kirikae-maxwell --example scan -- <dir>
++use std::collections::BTreeMap;
++
++use kirikae_maxwell::{NoEnv, Options, Stage, translate};
++
++fn main() {
++    let dir = std::env::args().nth(1).expect("folder");
++    let mut gaps: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
++    let mut errors = Vec::new();
++    let mut count = 0;
++    let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
++    names.sort();
++    for p in names {
++        let name = p.file_name().unwrap().to_string_lossy().into_owned();
++        let stage = if name.ends_with("_fragment.bin") {
++            Stage::Fragment
++        } else if name.ends_with("_vertex_B.bin") || name.ends_with("_vertex_A.bin") {
++            Stage::Vertex
++        } else {
++            continue;
++        };
++        count += 1;
++        let code = std::fs::read(&p).unwrap();
++        match std::panic::catch_unwind(|| translate(&code, &Options::new(stage, 0), &NoEnv)) {
++            Ok(Ok(s)) => {
++                let mut seen = s.unsupported.clone();
++                seen.sort();
++                seen.dedup();
++                for u in seen {
++                    gaps.entry(u).or_default().push(name.clone());
++                }
++            }
++            Ok(Err(e)) => errors.push(format!("{name}: {e:?}")),
++            Err(_) => errors.push(format!("{name}: panicked")),
++        }
++    }
++    println!("{count} shaders");
++    #[cfg(feature = "audit")]
++    {
++        // Bits set in an instruction that neither the opcode match nor the translation read.
++        let mut unread: BTreeMap<(&'static str, u32), (u32, u64)> = BTreeMap::new();
++        for (word, mask) in kirikae_maxwell::decode::audit::take() {
++            let Some(op) = kirikae_maxwell::decode::lookup(word) else { continue };
++            let left = word & !mask & !op.mask;
++            for b in 0..64 {
++                if left >> b & 1 == 1 {
++                    let e = unread.entry((op.name, b)).or_insert((0, word));
++                    e.0 += 1;
++                }
++            }
++        }
++        println!("set but never read (instruction, bit: distinct words, example):");
++        for ((name, b), (n, w)) in &unread {
++            println!("  {name:8} bit {b:2}: {n:5}  e.g. {w:#018x}");
++        }
++    }
++    for (what, list) in &gaps {
++        println!("{:5} shaders: {what}   e.g. {}", list.len(), list.iter().take(4).cloned().collect::<Vec<_>>().join(" "));
++    }
++    for e in &errors {
++        println!("error: {e}");
++    }
++}
+diff --git a/crates/maxwell/src/decode.rs b/crates/maxwell/src/decode.rs
+index 58ae0be..191b615 100644
+--- a/crates/maxwell/src/decode.rs
++++ b/crates/maxwell/src/decode.rs
+@@ -23,6 +23,23 @@ pub fn lookup(w: u64) -> Option<&'static Opcode> {
+     buckets()[(w >> 54) as usize].iter().map(|&i| &OPCODES[i as usize]).find(|op| w & op.mask == op.value)
+ }
+ 
++/// Bit audit (feature "audit"): which bits of each instruction word the translation read, so a
++/// scan can list encoding bits the game sets that the translator never looks at.
++#[cfg(feature = "audit")]
++pub mod audit {
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++    thread_local! {
++        pub static READ: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
++    }
++    pub fn note(word: u64, mask: u64) {
++        READ.with(|r| *r.borrow_mut().entry(word).or_default() |= mask);
++    }
++    pub fn take() -> HashMap<u64, u64> {
++        READ.with(|r| std::mem::take(&mut *r.borrow_mut()))
++    }
++}
++
+ #[derive(Clone, Copy, Debug)]
+ pub struct Insn {
+     pub word: u64,
+@@ -43,10 +60,14 @@ impl Insn {
+     }
+ 
+     pub fn bits(&self, lo: u32, n: u32) -> u64 {
++        #[cfg(feature = "audit")]
++        audit::note(self.word, ((1u64 << n) - 1) << lo);
+         (self.word >> lo) & ((1u64 << n) - 1)
+     }
+ 
+     pub fn bit(&self, b: u32) -> bool {
++        #[cfg(feature = "audit")]
++        audit::note(self.word, 1 << b);
+         self.word >> b & 1 == 1
+     }
+ 
+-- 
+2.43.0
+
