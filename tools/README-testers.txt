@@ -106,6 +106,8 @@ Finding a shader that draws something wrong (only when started with
 cruisn-blast-gpu-diagnostics.bat): while the problem is on screen, press F6 to skip the next
 full-screen or banner shader and F7 for the previous one, until the problem goes away. The
 window title then shows "skipping 0x..." : send that address. F8 stops skipping.
+F9 saves every image drawn in the next frame to the target-dump folder next to the game
+(pictures and raw values), for when a developer asks for a snapshot.
 
 Unofficial fan project, not affiliated with Raw Thrills, GameMill or Nintendo. cruisn-blast.exe
 is made on your computer from your own dump; none of the game's code or data is in this

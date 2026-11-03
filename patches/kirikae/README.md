@@ -445,3 +445,11 @@ registers as preserved, were each caught.
   and F8 stops skipping. The window title and the log name the shader being skipped, so the one
   that draws something wrong is found by looking at the problem and pressing keys until it
   goes away. Without the variable the keys do nothing.
+
+## 0034 - F9 frame snapshot
+
+- With `KIRIKAE_GPU_DIAG=1`, F9 saves every image the GPU drew into during the next frame to
+  `target-dump/` next to the game: a PNG to look at and the raw pixel values, so an image that
+  is too bright can be measured (HDR formats) and the pass that produced it identified.
+  Without the variable the key does nothing.
+- Adds `crates/maxwell/examples/mnemonics.rs`, which lists a dumped shader's instructions.

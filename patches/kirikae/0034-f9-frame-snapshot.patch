@@ -1,0 +1,148 @@
+From 6484bc36c72d0de9f39c506e4a5f678237c9cf40 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 10:33:56 -0700
+Subject: [PATCH] F9 frame snapshot (with KIRIKAE_GPU_DIAG)
+
+---
+ crates/maxwell/examples/mnemonics.rs | 11 +++++++++++
+ crates/rt/src/display.rs             |  6 ++++++
+ crates/rt/src/gpu/mod.rs             |  4 ++--
+ crates/rt/src/gpu/vulkan/bisect.rs   | 19 ++++++++++++++++++-
+ crates/rt/src/gpu/vulkan/readback.rs |  7 ++++---
+ crates/rt/src/services/vi.rs         |  9 ++++++++-
+ 6 files changed, 49 insertions(+), 7 deletions(-)
+ create mode 100644 crates/maxwell/examples/mnemonics.rs
+
+diff --git a/crates/maxwell/examples/mnemonics.rs b/crates/maxwell/examples/mnemonics.rs
+new file mode 100644
+index 0000000..23c63bc
+--- /dev/null
++++ b/crates/maxwell/examples/mnemonics.rs
+@@ -0,0 +1,11 @@
++//! Instruction counts of one dumped shader: cargo run -p kirikae-maxwell --example mnemonics -- <file> <fragment|vertex>
++use kirikae_maxwell::{NoEnv, Options, Stage, translate};
++fn main() {
++    let a: Vec<String> = std::env::args().collect();
++    let stage = if a[2] == "fragment" { Stage::Fragment } else { Stage::Vertex };
++    let s = translate(&std::fs::read(&a[1]).unwrap(), &Options::new(stage, 0), &NoEnv).unwrap();
++    for (m, n) in &s.mnemonics {
++        println!("{n:4} {m}");
++    }
++    println!("textures: {:?}", s.textures);
++}
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index a9994cf..b46fbd6 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -322,6 +322,12 @@ impl ApplicationHandler<Shown> for App {
+                         return;
+                     }
+                     // Shader bisect (gpu/vulkan/bisect.rs): F6 next, F7 previous, F8 off.
++                    if code == KeyCode::F9 {
++                        if fresh {
++                            crate::gpu::vulkan::bisect::request_snapshot();
++                        }
++                        return;
++                    }
+                     if matches!(code, KeyCode::F6 | KeyCode::F7 | KeyCode::F8) {
+                         if fresh {
+                             crate::gpu::vulkan::bisect::step(match code {
+diff --git a/crates/rt/src/gpu/mod.rs b/crates/rt/src/gpu/mod.rs
+index 2ef0c59..2cdc34e 100644
+--- a/crates/rt/src/gpu/mod.rs
++++ b/crates/rt/src/gpu/mod.rs
+@@ -388,9 +388,9 @@ impl Gpu {
+         guard.0.as_ref().is_some_and(|r| r.rendered(cpu, width, height))
+     }
+ 
+-    pub fn dump_images(&self, dir: &std::path::Path, tag: u64) {
++    pub fn dump_images(&self, dir: &std::path::Path, tag: u64, raw: bool) {
+         if let Some(r) = self.renderer.lock().unwrap().0.as_mut() {
+-            r.dump_images(dir, tag);
++            r.dump_images(dir, tag, raw);
+         }
+     }
+ 
+diff --git a/crates/rt/src/gpu/vulkan/bisect.rs b/crates/rt/src/gpu/vulkan/bisect.rs
+index d2262f1..4ea2326 100644
+--- a/crates/rt/src/gpu/vulkan/bisect.rs
++++ b/crates/rt/src/gpu/vulkan/bisect.rs
+@@ -4,9 +4,26 @@
+ //! such as bloom, colour grading and tonemapping, and on-screen banners) is listed in the order it
+ //! was first seen. F6 / F7 skip the next / previous one in that list, F8 stops skipping. The
+ //! window title and the log show which shader is being skipped, so the one that makes the
+-//! problem disappear can be reported by its address. The keys only work with KIRIKAE_GPU_DIAG.
++//! problem disappear can be reported by its address. F9 saves every image the GPU has drawn
++//! into at the next frame (PNG and raw values) to target-dump/ next to the game. The keys only
++//! work with KIRIKAE_GPU_DIAG.
+ 
+ use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++/// F9: save every image the GPU has drawn into at the next frame (target-dump/ next to the game).
++static SNAPSHOT: AtomicBool = AtomicBool::new(false);
++
++pub fn request_snapshot() {
++    if super::diag::wanted_checkpoints() {
++        SNAPSHOT.store(true, Ordering::Relaxed);
++        eprintln!("kirikae: bisect: saving the drawn images of the next frame to target-dump");
++    }
++}
++
++pub fn take_snapshot() -> bool {
++    SNAPSHOT.swap(false, Ordering::Relaxed)
++}
+ 
+ struct State {
+     seen: Vec<u64>,
+diff --git a/crates/rt/src/gpu/vulkan/readback.rs b/crates/rt/src/gpu/vulkan/readback.rs
+index 43da1b2..19c2c18 100644
+--- a/crates/rt/src/gpu/vulkan/readback.rs
++++ b/crates/rt/src/gpu/vulkan/readback.rs
+@@ -74,7 +74,7 @@ impl Renderer {
+         Some(unsafe { std::slice::from_raw_parts(ptr, size as usize) }.to_vec())
+     }
+ 
+-    pub fn dump_images(&mut self, dir: &std::path::Path, tag: u64) {
++    pub fn dump_images(&mut self, dir: &std::path::Path, tag: u64, raw: bool) {
+         let only: Option<Vec<u64>> = std::env::var("KIRIKAE_TARGET_DUMP_ONLY").ok().map(|v| v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect());
+         let derived = crate::env_var!("KIRIKAE_TARGET_DUMP_DERIVED").is_some();
+         let keys: Vec<ImageKey> = self
+@@ -84,9 +84,10 @@ impl Renderer {
+             .map(|(k, _)| *k)
+             .collect();
+         for key in keys {
+-            let layers = if crate::env_var!("KIRIKAE_TARGET_DUMP_RAW").is_some() { self.images[&key].layers } else { 1 };
++            let keep_raw = raw || crate::env_var!("KIRIKAE_TARGET_DUMP_RAW").is_some();
++            let layers = if keep_raw { self.images[&key].layers } else { 1 };
+             let Some(raw) = self.read_raw(key, layers) else { continue };
+-            if crate::env_var!("KIRIKAE_TARGET_DUMP_RAW").is_some() {
++            if keep_raw {
+                 let name = format!("f{tag:06}_{:x}_{:?}_{}x{}.raw", key.cpu, key.format, key.width, key.height);
+                 let _ = std::fs::write(dir.join(name), &raw);
+             }
+diff --git a/crates/rt/src/services/vi.rs b/crates/rt/src/services/vi.rs
+index c5be229..20a9bb5 100644
+--- a/crates/rt/src/services/vi.rs
++++ b/crates/rt/src/services/vi.rs
+@@ -353,9 +353,16 @@ fn present(p: &Process, s: &Slot, transform: u32) {
+         let n = display::FRAMES.load(std::sync::atomic::Ordering::Relaxed) + 1;
+         let every = std::env::var("KIRIKAE_TARGET_DUMP_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(60u64).max(1);
+         if n % every == 1 % every {
+-            p.gpu.dump_images(std::path::Path::new(&dir), n);
++            p.gpu.dump_images(std::path::Path::new(&dir), n, false);
+         }
+     }
++    if crate::gpu::vulkan::bisect::take_snapshot() {
++        let n = display::FRAMES.load(std::sync::atomic::Ordering::Relaxed) + 1;
++        let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("target-dump"))).unwrap_or_else(|| "target-dump".into());
++        let _ = std::fs::create_dir_all(&dir);
++        p.gpu.dump_images(&dir, n, true);
++        eprintln!("kirikae: bisect: frame {n} images saved to {}", dir.display());
++    }
+     let cpu = m.addr + s.offset;
+     let (flip_h, flip_v) = (transform & TRANSFORM_FLIP_H != 0, transform & TRANSFORM_FLIP_V != 0);
+     let dump = display::dump_due() || crate::usage::frame_wanted();
+-- 
+2.43.0
+
