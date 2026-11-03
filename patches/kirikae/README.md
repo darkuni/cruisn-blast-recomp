@@ -460,3 +460,10 @@ registers as preserved, were each caught.
   `KIRIKAE_TRACE_GPU` trace: each draw's shaders, targets, and which image each texture was read
   from) and saves that frame's images. That shows which pass produced an image that comes out
   wrong, and whether a texture was read from a copy of a different size.
+
+## 0036 - F9 trace: constants, targets and images
+
+- The F9 trace also logs the values each draw's shaders read from their constant buffers (first
+  32 words, as floats), which image each render target and each cached texture binding resolves
+  to (with the host address the snapshot files are named by), and whether the texture was read
+  through a cropped copy.

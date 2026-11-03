@@ -1,0 +1,59 @@
+From 60d9cac1bea05a2e817b966d3e007111ac00cbdb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 14:43:31 -0700
+Subject: [PATCH] F9 trace: constant values, target and texture images
+
+---
+ crates/rt/src/gpu/vulkan/descriptors.rs | 6 ++++++
+ crates/rt/src/gpu/vulkan/images.rs      | 3 +++
+ crates/rt/src/gpu/vulkan/textures.rs    | 3 +++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/crates/rt/src/gpu/vulkan/descriptors.rs b/crates/rt/src/gpu/vulkan/descriptors.rs
+index 05e3ea9..b79c5ff 100644
+--- a/crates/rt/src/gpu/vulkan/descriptors.rs
++++ b/crates/rt/src/gpu/vulkan/descriptors.rs
+@@ -81,6 +81,12 @@ impl Renderer {
+                     let _ = std::fs::write(std::path::Path::new(dir).join(format!("{:x}_f{frame}_{n:06}_c{slot}.bin", s.va)), &data);
+                 }
+             }
++            if super::bisect::tracing() {
++                // F9 trace: the values this draw's shader reads (first 32 words) as floats.
++                let data = gpu.read(mem, addr, size.min(128)).unwrap_or_default();
++                let words: Vec<String> = data.chunks_exact(4).map(|w| format!("{}", f32::from_le_bytes(w.try_into().unwrap()))).collect();
++                eprintln!("gpu: cbuf {stage:?} c[{slot}] {addr:#x} size {size:#x}: {}", words.join(" "));
++            }
+             let (buffer, offset) = self.guest_buffer(gpu, mem, addr, size, ubo_align, buffer_cache::Kind::Constant)?;
+             out.push(Descriptor::Buffer(base + slot as u32, vk::DescriptorType::UNIFORM_BUFFER, buffer, offset, size));
+         }
+diff --git a/crates/rt/src/gpu/vulkan/images.rs b/crates/rt/src/gpu/vulkan/images.rs
+index 6963239..33e3fb0 100644
+--- a/crates/rt/src/gpu/vulkan/images.rs
++++ b/crates/rt/src/gpu/vulkan/images.rs
+@@ -278,6 +278,9 @@ impl Renderer {
+         let fmt = formats::color_target(s.format)?;
+         let cpu = gpu.translate(s.va)?;
+         let (key, created) = self.target_image(cpu, fmt.vk, s.width, s.height)?;
++        if super::bisect::tracing() {
++            eprintln!("gpu: target {:#x} {}x{} {:?} is image {:#x} {}x{}{}", s.va, s.width, s.height, fmt.vk, key.cpu, key.width, key.height, if created { " (new)" } else { "" });
++        }
+         if created && upload && key.width == s.width && key.height == s.height
+             && let Some(data) = read_surface(gpu, mem, s, fmt.bytes) {
+                 self.upload(key, &[(s.width, s.height, data)]);
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index a8b5f77..0c27a38 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -146,6 +146,9 @@ impl Renderer {
+         }
+         let tex_key = TexKey { tic, tsc, dim, array, shadow };
+         if let Some(e) = self.tex_cache.get(&tex_key).copied().filter(|e| !self.draw_targets.contains(&e.image)) {
++            if super::bisect::tracing() {
++                eprintln!("gpu: texture {:#x} {}x{} {:?} uses image {:#x} {}x{} {:?} (cached){}", header.address, header.width, header.height, format.vk, e.image.cpu, e.image.width, e.image.height, e.image.format, if e.crop.is_some() { " cropped" } else { "" });
++            }
+             if let Some(k) = e.refresh {
+                 self.refresh_texture(gpu, mem, k, &header, &format, layers);
+             }
+-- 
+2.43.0
+
