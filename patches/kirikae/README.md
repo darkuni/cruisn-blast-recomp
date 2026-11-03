@@ -453,3 +453,10 @@ registers as preserved, were each caught.
   is too bright can be measured (HDR formats) and the pass that produced it identified.
   Without the variable the key does nothing.
 - Adds `crates/maxwell/examples/mnemonics.rs`, which lists a dumped shader's instructions.
+
+## 0035 - F9 traces the snapshot frame
+
+- F9 now waits for the start of the next frame, logs every GPU command of that whole frame (the
+  `KIRIKAE_TRACE_GPU` trace: each draw's shaders, targets, and which image each texture was read
+  from) and saves that frame's images. That shows which pass produced an image that comes out
+  wrong, and whether a texture was read from a copy of a different size.

@@ -1,0 +1,69 @@
+From f9d88fb992d94760fb678badefd9de3eccab3c67 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:53:26 -0700
+Subject: [PATCH] F9 also traces the snapshot frame
+
+---
+ crates/rt/src/gpu/mod.rs           |  3 +++
+ crates/rt/src/gpu/vulkan/bisect.rs | 22 ++++++++++++++++++++--
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/crates/rt/src/gpu/mod.rs b/crates/rt/src/gpu/mod.rs
+index 2cdc34e..e05a006 100644
+--- a/crates/rt/src/gpu/mod.rs
++++ b/crates/rt/src/gpu/mod.rs
+@@ -854,6 +854,9 @@ pub(crate) fn trace_uploads() -> bool {
+ }
+ 
+ pub(crate) fn trace() -> bool {
++    if vulkan::bisect::tracing() {
++        return true;
++    }
+     static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+     let range = *RANGE.get_or_init(|| {
+         std::env::var_os("KIRIKAE_TRACE_GPU")?;
+diff --git a/crates/rt/src/gpu/vulkan/bisect.rs b/crates/rt/src/gpu/vulkan/bisect.rs
+index 4ea2326..831b205 100644
+--- a/crates/rt/src/gpu/vulkan/bisect.rs
++++ b/crates/rt/src/gpu/vulkan/bisect.rs
+@@ -11,8 +11,12 @@
+ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+-/// F9: save every image the GPU has drawn into at the next frame (target-dump/ next to the game).
++/// F9: save every image the GPU has drawn into at the next whole frame (target-dump/ next to the
++/// game), and log every command of that frame (the GPU trace: each draw's shaders, targets and the
++/// image each texture was read from) to the log.
+ static SNAPSHOT: AtomicBool = AtomicBool::new(false);
++/// The frame being snapshotted is being drawn: the GPU trace is on.
++static TRACING: AtomicBool = AtomicBool::new(false);
+ 
+ pub fn request_snapshot() {
+     if super::diag::wanted_checkpoints() {
+@@ -21,8 +25,22 @@ pub fn request_snapshot() {
+     }
+ }
+ 
++/// At each present: true when the frame just presented is the traced one, so its images are saved
++/// now. A request starts the trace at the next present, so the saved frame is traced from its start.
+ pub fn take_snapshot() -> bool {
+-    SNAPSHOT.swap(false, Ordering::Relaxed)
++    if TRACING.swap(false, Ordering::Relaxed) {
++        return true;
++    }
++    if SNAPSHOT.swap(false, Ordering::Relaxed) {
++        TRACING.store(true, Ordering::Relaxed);
++        eprintln!("kirikae: bisect: tracing the next frame");
++    }
++    false
++}
++
++/// The GPU trace is on for the frame being snapshotted.
++pub fn tracing() -> bool {
++    TRACING.load(Ordering::Relaxed)
+ }
+ 
+ struct State {
+-- 
+2.43.0
+
