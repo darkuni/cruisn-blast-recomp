@@ -1,0 +1,108 @@
+From 60949d8b7c8db5b9129442b320e0a74f83adb710 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 08:04:17 -0700
+Subject: [PATCH] F10 texture blackout test
+
+---
+ crates/rt/src/display.rs             |  8 ++++++
+ crates/rt/src/gpu/vulkan/bisect.rs   | 37 ++++++++++++++++++++++++++--
+ crates/rt/src/gpu/vulkan/textures.rs |  8 +++---
+ 3 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index b46fbd6..ddfc9e9 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -328,6 +328,14 @@ impl ApplicationHandler<Shown> for App {
+                         }
+                         return;
+                     }
++                    if code == KeyCode::F10 {
++                        if fresh {
++                            crate::gpu::vulkan::bisect::next_texture_test();
++                            self.since = Instant::now() - std::time::Duration::from_secs(2);
++                            self.update_title();
++                        }
++                        return;
++                    }
+                     if matches!(code, KeyCode::F6 | KeyCode::F7 | KeyCode::F8) {
+                         if fresh {
+                             crate::gpu::vulkan::bisect::step(match code {
+diff --git a/crates/rt/src/gpu/vulkan/bisect.rs b/crates/rt/src/gpu/vulkan/bisect.rs
+index 831b205..c16404e 100644
+--- a/crates/rt/src/gpu/vulkan/bisect.rs
++++ b/crates/rt/src/gpu/vulkan/bisect.rs
+@@ -9,7 +9,34 @@
+ //! work with KIRIKAE_GPU_DIAG.
+ 
+ use std::sync::Mutex;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++
++/// F10: replace a class of textures with black, to see whether the glow comes from them.
++/// 0 off, 1 BC6H cube maps (reflection probes), 2 every cube map, 3 every BC6H texture
++/// (probes and HDR lightmaps).
++static TEXTURE_TEST: AtomicU8 = AtomicU8::new(0);
++const TEXTURE_TESTS: [&str; 4] = ["", "BC6H cube maps black", "all cube maps black", "all BC6H textures black"];
++
++pub fn next_texture_test() {
++    if !super::diag::wanted_checkpoints() {
++        return;
++    }
++    let n = (TEXTURE_TEST.load(Ordering::Relaxed) + 1) % TEXTURE_TESTS.len() as u8;
++    TEXTURE_TEST.store(n, Ordering::Relaxed);
++    eprintln!("kirikae: bisect: texture test {n}: {}", if n == 0 { "off" } else { TEXTURE_TESTS[n as usize] });
++}
++
++/// The texture (TIC components and texture type) is blacked out by the F10 test.
++pub fn black_texture(components: u32, texture_type: u32) -> bool {
++    let bc6h = matches!(components, 0x10 | 0x11);
++    let cube = matches!(texture_type, 3 | 8);
++    match TEXTURE_TEST.load(Ordering::Relaxed) {
++        1 => bc6h && cube,
++        2 => cube,
++        3 => bc6h,
++        _ => false,
++    }
++}
+ 
+ /// F9: save every image the GPU has drawn into at the next whole frame (target-dump/ next to the
+ /// game), and log every command of that frame (the GPU trace: each draw's shaders, targets and the
+@@ -82,5 +109,11 @@ pub fn step(dir: i32) {
+ /// For the window title.
+ pub fn status() -> Option<String> {
+     let s = STATE.lock().unwrap();
+-    s.skipping.map(|i| format!("skipping {:#x} ({}/{})", s.seen[i], i + 1, s.seen.len()))
++    let skip = s.skipping.map(|i| format!("skipping {:#x} ({}/{})", s.seen[i], i + 1, s.seen.len()));
++    let t = TEXTURE_TEST.load(Ordering::Relaxed);
++    let tex = (t != 0).then(|| format!("F10 test {t}: {}", TEXTURE_TESTS[t as usize]));
++    match (skip, tex) {
++        (Some(a), Some(b)) => Some(format!("{a} - {b}")),
++        (a, b) => a.or(b),
++    }
+ }
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index 0c27a38..1e5e7a8 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -116,12 +116,14 @@ impl Renderer {
+             let view = self.view_of(key, key.format, [vk::ComponentSwizzle::IDENTITY; 4], view_type);
+             return Ok((view, self.sampler(&sampler_state)));
+         }
+-        if let Some(spec) = crate::env_var!("KIRIKAE_TEX_SOLID")
+-            && let Some(byte) = spec.to_string_lossy().split(',').find_map(|e| {
++        let blackout = sampler_state.compare.is_none() && super::bisect::black_texture(header.components, header.texture_type);
++        if let Some(byte) = if blackout { Some(0u8) } else { None }.or_else(|| {
++            let spec = crate::env_var!("KIRIKAE_TEX_SOLID")?;
++            spec.to_string_lossy().split(',').find_map(|e| {
+                 let (a, v) = e.split_once(':')?;
+                 (u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()? == header.address).then(|| v.parse::<u8>().ok()).flatten()
+             })
+-            && sampler_state.compare.is_none()
++        }) && sampler_state.compare.is_none()
+         {
+             let key = ImageKey { cpu: u64::MAX - 8 - byte as u64, format: vk::Format::R8G8B8A8_UNORM, width: 1, height: 1 };
+             if !self.images.contains_key(&key) {
+-- 
+2.43.0
+

@@ -467,3 +467,10 @@ registers as preserved, were each caught.
   32 words, as floats), which image each render target and each cached texture binding resolves
   to (with the host address the snapshot files are named by), and whether the texture was read
   through a cropped copy.
+
+## 0037 - F10 texture blackout test
+
+- With `KIRIKAE_GPU_DIAG=1`, F10 cycles through replacing a class of textures with black: BC6H
+  cube maps (reflection probes), every cube map, every BC6H texture (probes and HDR lightmaps),
+  then off. The window title shows the current test. Pressed while the picture is wrong, it shows
+  at once whether those textures cause it.
