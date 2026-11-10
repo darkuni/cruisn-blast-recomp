@@ -1,0 +1,107 @@
+From a17094ee58e5991c23631f1be715be0cb1e03703 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 08:11:45 -0700
+Subject: [PATCH] F5 texture re-read test; texture change check covers all
+ levels and layers
+
+---
+ crates/rt/src/display.rs             |  6 ++++++
+ crates/rt/src/gpu/vulkan/bisect.rs   | 14 ++++++++++++++
+ crates/rt/src/gpu/vulkan/present.rs  |  9 +++++++++
+ crates/rt/src/gpu/vulkan/textures.rs | 15 +++++++++++++--
+ 4 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/crates/rt/src/display.rs b/crates/rt/src/display.rs
+index ddfc9e9..edc1d5c 100644
+--- a/crates/rt/src/display.rs
++++ b/crates/rt/src/display.rs
+@@ -328,6 +328,12 @@ impl ApplicationHandler<Shown> for App {
+                         }
+                         return;
+                     }
++                    if code == KeyCode::F5 {
++                        if fresh {
++                            crate::gpu::vulkan::bisect::request_texture_flush();
++                        }
++                        return;
++                    }
+                     if code == KeyCode::F10 {
+                         if fresh {
+                             crate::gpu::vulkan::bisect::next_texture_test();
+diff --git a/crates/rt/src/gpu/vulkan/bisect.rs b/crates/rt/src/gpu/vulkan/bisect.rs
+index c16404e..6964269 100644
+--- a/crates/rt/src/gpu/vulkan/bisect.rs
++++ b/crates/rt/src/gpu/vulkan/bisect.rs
+@@ -26,6 +26,20 @@ pub fn next_texture_test() {
+     eprintln!("kirikae: bisect: texture test {n}: {}", if n == 0 { "off" } else { TEXTURE_TESTS[n as usize] });
+ }
+ 
++/// F5: forget every texture copied from game memory, so each is read again from what the memory
++/// holds now. If a wrong picture comes right, a texture copy had gone stale.
++static FLUSH: AtomicBool = AtomicBool::new(false);
++
++pub fn request_texture_flush() {
++    if super::diag::wanted_checkpoints() {
++        FLUSH.store(true, Ordering::Relaxed);
++    }
++}
++
++pub fn take_texture_flush() -> bool {
++    FLUSH.swap(false, Ordering::Relaxed)
++}
++
+ /// The texture (TIC components and texture type) is blacked out by the F10 test.
+ pub fn black_texture(components: u32, texture_type: u32) -> bool {
+     let bc6h = matches!(components, 0x10 | 0x11);
+diff --git a/crates/rt/src/gpu/vulkan/present.rs b/crates/rt/src/gpu/vulkan/present.rs
+index 2309a1f..6706865 100644
+--- a/crates/rt/src/gpu/vulkan/present.rs
++++ b/crates/rt/src/gpu/vulkan/present.rs
+@@ -61,6 +61,15 @@ impl Renderer {
+ 
+     pub(super) fn present_image(&mut self, key: ImageKey, width: u32, height: u32, flip_h: bool, flip_v: bool) -> Presented {
+         self.mark_frame();
++        if super::bisect::take_texture_flush() {
++            let copies: Vec<ImageKey> = self.images.iter().filter(|(k, i)| k.cpu & super::textures::DERIVED == 0 && i.source.is_some() && !i.gpu_dirty).map(|(k, _)| *k).collect();
++            for k in &copies {
++                self.destroy_image(*k);
++            }
++            self.tex_cache.clear();
++            self.tex_at.clear();
++            eprintln!("kirikae: bisect: F5: forgot {} texture copies; they are read again from game memory", copies.len());
++        }
+         let srgb = matches!(key.format, vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32);
+         let dump = crate::env_var!("KIRIKAE_PRESENT_DUMP").filter(|_| self.stats.presents.is_multiple_of(60));
+         let readback = match (&dump, &self.swapchain) {
+diff --git a/crates/rt/src/gpu/vulkan/textures.rs b/crates/rt/src/gpu/vulkan/textures.rs
+index 1e5e7a8..1883f51 100644
+--- a/crates/rt/src/gpu/vulkan/textures.rs
++++ b/crates/rt/src/gpu/vulkan/textures.rs
+@@ -588,11 +588,22 @@ pub(super) fn read_texture(gpu: &Gpu, mem: &GuestMemory, h: &TextureHeader, f: &
+ pub(super) fn texture_hash(gpu: &Gpu, mem: &GuestMemory, h: &TextureHeader, f: &TexFormat, levels: u32, layers: u32) -> Option<u64> {
+     let first = texture_source(gpu, mem, h, f)?;
+     let mut hash = hash64(&first);
++    // The smaller mip levels too: a game that loads a new texture into memory an old one used
++    // (Unity's pools, from one track to the next) can leave level 0 looking the same while the
++    // levels a rough or distant surface reads change.
++    let whole = layer_size(h, f, levels);
++    if levels > 1
++        && let Some(whole) = whole
++        && whole > first.len() as u64
++        && let Some(rest) = gpu.bytes(mem, h.address + first.len() as u64, whole - first.len() as u64)
++    {
++        hash = (hash ^ hash64(&rest)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(7);
++    }
+     if layers > 1
+-        && let Some(stride) = layer_size(h, f, levels)
++        && let Some(stride) = whole
+     {
+         for layer in 1..layers as u64 {
+-            let Some(bytes) = gpu.bytes(mem, h.address + layer * stride, first.len() as u64) else { break };
++            let Some(bytes) = gpu.bytes(mem, h.address + layer * stride, stride) else { break };
+             for gob in bytes.chunks(512).step_by(16) {
+                 hash = (hash ^ hash64(gob)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5) ^ layer;
+             }
+-- 
+2.43.0
+

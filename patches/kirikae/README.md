@@ -474,3 +474,13 @@ registers as preserved, were each caught.
   cube maps (reflection probes), every cube map, every BC6H texture (probes and HDR lightmaps),
   then off. The window title shows the current test. Pressed while the picture is wrong, it shows
   at once whether those textures cause it.
+
+## 0038 - Texture changes in smaller mip levels; F5 re-read test
+
+- The check for a texture whose memory the game has rewritten now covers every mip level and the
+  whole of every cube face or array layer, not just level 0. Cruis'n Blast's four-race circuit
+  loads each track's textures into memory the previous track used; a change that left level 0
+  alike kept the previous track's copy (suspected cause of the races 3-4 glow, which never
+  shows when a track is raced on its own).
+- With `KIRIKAE_GPU_DIAG=1`, F5 forgets every texture copied from game memory so that each is
+  read again from what the memory holds now: if a wrong picture comes right, a copy was stale.
