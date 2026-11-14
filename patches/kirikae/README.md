@@ -484,3 +484,14 @@ registers as preserved, were each caught.
   shows when a track is raced on its own).
 - With `KIRIKAE_GPU_DIAG=1`, F5 forgets every texture copied from game memory so that each is
   read again from what the memory holds now: if a wrong picture comes right, a copy was stale.
+
+## 0039 - PlayStation and other controllers on Windows
+
+- Windows read only XInput (Xbox pads), so a DualSense or DualShock 4 did nothing unless Steam
+  Input was translating it. The runtime now also reads every other controller through gilrs
+  (Windows.Gaming.Input with SDL's controller database): DualSense, DualShock 4, Switch Pro,
+  8BitDo and generic HID pads. XInput still comes first when both are connected.
+- On all systems the controller in use is the one last pressed or moved, so a second controller
+  left on, or the Steam Deck's own controls, does not take over.
+- Rumble works on these controllers too, where the system supports it.
+- The log names every controller found, with its USB vendor and product id.

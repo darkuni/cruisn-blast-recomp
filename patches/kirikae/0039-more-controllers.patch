@@ -1,0 +1,214 @@
+From fc157c05d30c9284eb8adc2ce7f0a991583ad7e0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 14 Nov 2026 13:19:02 -0700
+Subject: [PATCH] PlayStation, Switch Pro and other HID controllers on Windows;
+ rumble on them
+
+---
+ crates/rt/Cargo.toml   |   5 +-
+ crates/rt/src/input.rs | 122 ++++++++++++++++++++++++++++++++---------
+ 2 files changed, 98 insertions(+), 29 deletions(-)
+
+diff --git a/crates/rt/Cargo.toml b/crates/rt/Cargo.toml
+index e64632e..b4992d6 100644
+--- a/crates/rt/Cargo.toml
++++ b/crates/rt/Cargo.toml
+@@ -22,11 +22,12 @@ winit = "0.30"
+ default = ["h264"]
+ h264 = ["dep:openh264"]
+ 
++[dependencies.gilrs]
++version = "0.11"
++
+ [target.'cfg(unix)'.dependencies]
+ libc = "0.2"
+ 
+-[target.'cfg(not(windows))'.dependencies]
+-gilrs = "0.11"
+ 
+ [dev-dependencies]
+ kirikae-testkit.workspace = true
+diff --git a/crates/rt/src/input.rs b/crates/rt/src/input.rs
+index 3671a1f..15ca642 100644
+--- a/crates/rt/src/input.rs
++++ b/crates/rt/src/input.rs
+@@ -254,6 +254,7 @@ mod gamepad {
+     }
+ 
+     pub fn rumble(low: f32, high: f32) {
++        super::hid_pads::rumble(low, high);
+         let mut pads = PADS.lock().unwrap();
+         let Some(pads) = pads.as_mut() else { return };
+         let (Some(set), Some(i)) = (pads.set_state, pads.active) else { return };
+@@ -266,7 +267,14 @@ mod gamepad {
+         }
+     }
+ 
++    /// An XInput controller (Xbox pads, and anything Steam Input presents as one), otherwise any
++    /// other controller (PlayStation, Switch Pro, generic HID) through Windows.Gaming.Input.
+     pub fn poll() -> Option<RawPad> {
++        let hid = super::hid_pads::poll();
++        xinput().or(hid)
++    }
++
++    fn xinput() -> Option<RawPad> {
+         let mut pads = PADS.lock().unwrap();
+         let pads = pads.get_or_insert_with(|| {
+             let (get_state, set_state) = load();
+@@ -294,38 +302,45 @@ mod gamepad {
+     }
+ }
+ 
+-#[cfg(not(windows))]
+-mod gamepad {
++/// Every controller the system knows that XInput does not cover: DualSense and DualShock 4,
++/// Switch Pro, 8BitDo and other HID pads (SDL's controller database maps their buttons). On
++/// Linux and the Steam Deck this is every controller; on Windows it backs up XInput, through
++/// Windows.Gaming.Input.
++mod hid_pads {
+     use std::sync::{Mutex, OnceLock};
+     use std::time::Duration;
+ 
+-    use gilrs::{Axis, Button, Gilrs};
++    use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Replay, Ticks};
++    use gilrs::{Axis, Button, GamepadId, Gilrs};
+ 
+     use crate::bindings::{RawPad, xb};
+ 
+     static STATE: Mutex<Option<RawPad>> = Mutex::new(None);
+-
+-    fn read(gilrs: &Gilrs) -> Option<RawPad> {
+-        const MAP: [(Button, u16); 14] = [
+-            (Button::DPadUp, xb::DPUP),
+-            (Button::DPadDown, xb::DPDOWN),
+-            (Button::DPadLeft, xb::DPLEFT),
+-            (Button::DPadRight, xb::DPRIGHT),
+-            (Button::Start, xb::START),
+-            (Button::Select, xb::BACK),
+-            (Button::LeftThumb, xb::LSTICK),
+-            (Button::RightThumb, xb::RSTICK),
+-            (Button::LeftTrigger, xb::LB),
+-            (Button::RightTrigger, xb::RB),
+-            (Button::South, xb::A),
+-            (Button::East, xb::B),
+-            (Button::West, xb::X),
+-            (Button::North, xb::Y),
+-        ];
+-        let (_, pad) = gilrs.gamepads().find(|(_, g)| g.is_connected())?;
++    /// Wanted motor strengths (low, high), set by the game, applied by the pad thread.
++    static MOTORS: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
++
++    const MAP: [(Button, u16); 14] = [
++        (Button::DPadUp, xb::DPUP),
++        (Button::DPadDown, xb::DPDOWN),
++        (Button::DPadLeft, xb::DPLEFT),
++        (Button::DPadRight, xb::DPRIGHT),
++        (Button::Start, xb::START),
++        (Button::Select, xb::BACK),
++        (Button::LeftThumb, xb::LSTICK),
++        (Button::RightThumb, xb::RSTICK),
++        (Button::LeftTrigger, xb::LB),
++        (Button::RightTrigger, xb::RB),
++        (Button::South, xb::A),
++        (Button::East, xb::B),
++        (Button::West, xb::X),
++        (Button::North, xb::Y),
++    ];
++
++    fn read(gilrs: &Gilrs, id: GamepadId) -> Option<RawPad> {
++        let pad = gilrs.connected_gamepad(id)?;
+         let buttons = MAP.iter().filter(|(b, _)| pad.is_pressed(*b)).fold(0, |acc, (_, n)| acc | n);
+         let ax = |a: Axis| (pad.value(a).clamp(-1.0, 1.0) * 32767.0) as i16;
+-        let trig = |b: Button| (pad.button_data(b).map_or(if pad.is_pressed(b) { 1.0 } else { 0.0 }, |d| d.value()) * 255.0) as u8;
++        let trig = |b: Button| (pad.button_data(b).map_or(if pad.is_pressed(b) { 1.0 } else { 0.0 }, |d| d.value()).clamp(0.0, 1.0) * 255.0) as u8;
+         Some(RawPad {
+             buttons,
+             lt: trig(Button::LeftTrigger2),
+@@ -337,20 +352,70 @@ mod gamepad {
+         })
+     }
+ 
+-    pub fn rumble(_low: f32, _high: f32) {}
++    pub fn rumble(low: f32, high: f32) {
++        *MOTORS.lock().unwrap() = (low, high);
++    }
+ 
+     fn run() {
+         let mut gilrs = match Gilrs::new() {
+             Ok(g) => g,
+             Err(e) => {
+-                eprintln!("kirikae: gamepads unavailable ({e})");
++                eprintln!("kirikae: controllers other than XInput unavailable ({e})");
+                 return;
+             }
+         };
++        for (_, g) in gilrs.gamepads() {
++            eprintln!("kirikae: controller: {} ({:04x}:{:04x})", g.name(), g.vendor_id().unwrap_or(0), g.product_id().unwrap_or(0));
++        }
++        // The pad in use: the one a button or stick last moved on, so a second controller left
++        // switched on (or the Steam Deck's own controls) does not take over.
++        let mut active: Option<GamepadId> = None;
++        let mut effect: Option<(GamepadId, gilrs::ff::Effect)> = None;
++        let mut applied = (0.0f32, 0.0f32);
+         loop {
+             gilrs.next_event_blocking(Some(Duration::from_millis(8)));
+-            while gilrs.next_event().is_some() {}
+-            *STATE.lock().unwrap() = read(&gilrs);
++            while let Some(ev) = gilrs.next_event() {
++                match ev.event {
++                    gilrs::EventType::Connected => {
++                        let g = gilrs.gamepad(ev.id);
++                        eprintln!("kirikae: controller connected: {} ({:04x}:{:04x})", g.name(), g.vendor_id().unwrap_or(0), g.product_id().unwrap_or(0));
++                    }
++                    gilrs::EventType::Disconnected => {
++                        if active == Some(ev.id) {
++                            active = None;
++                        }
++                    }
++                    gilrs::EventType::ButtonPressed(..) => active = Some(ev.id),
++                    gilrs::EventType::AxisChanged(_, v, _) if v.abs() > 0.5 => active = Some(ev.id),
++                    _ => {}
++                }
++            }
++            let id = active.filter(|id| gilrs.connected_gamepad(*id).is_some()).or_else(|| gilrs.gamepads().next().map(|(id, _)| id));
++            *STATE.lock().unwrap() = id.and_then(|id| read(&gilrs, id));
++
++            let wanted = *MOTORS.lock().unwrap();
++            if let Some(id) = id
++                && (wanted != applied || effect.as_ref().is_some_and(|(e, _)| *e != id))
++            {
++                applied = wanted;
++                effect = None;
++                let ff = gilrs.connected_gamepad(id).is_some_and(|g| g.is_ff_supported());
++                if ff && (wanted.0 > 0.0 || wanted.1 > 0.0) {
++                    let magnitude = |v: f32| (v.clamp(0.0, 1.0) * u16::MAX as f32) as u16;
++                    let play = Replay { play_for: Ticks::from_ms(1000), ..Default::default() };
++                    let built = EffectBuilder::new()
++                        .add_effect(BaseEffect { kind: BaseEffectType::Strong { magnitude: magnitude(wanted.0) }, scheduling: play, ..Default::default() })
++                        .add_effect(BaseEffect { kind: BaseEffectType::Weak { magnitude: magnitude(wanted.1) }, scheduling: play, ..Default::default() })
++                        .gamepads(&[id])
++                        .repeat(gilrs::ff::Repeat::Infinitely)
++                        .finish(&mut gilrs);
++                    if let Ok(e) = built
++                        && e.play().is_ok()
++                    {
++                        effect = Some((id, e));
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -363,6 +428,9 @@ mod gamepad {
+     }
+ }
+ 
++#[cfg(not(windows))]
++use hid_pads as gamepad;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-- 
+2.43.0
+

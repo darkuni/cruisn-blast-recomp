@@ -51,7 +51,10 @@ being compiled for your GPU so races don't stutter. Later launches are faster.
 
 CONTROLS
 --------
-Xbox-style controllers work out of the box (XInput), with rumble.
+Controllers work out of the box, with rumble where the system supports it: Xbox pads,
+PlayStation 5 DualSense and PlayStation 4 DualShock 4 (USB or Bluetooth), Switch Pro,
+8BitDo and other gamepads. With several connected, the one you last pressed is used.
+The log (cruisn-blast.log) lists every controller found; if one does nothing, send it in.
 
 Keyboard (Switch button = key):
   Steer               A / D or Left / Right
