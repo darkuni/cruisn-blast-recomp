@@ -495,3 +495,12 @@ registers as preserved, were each caught.
   left on, or the Steam Deck's own controls, does not take over.
 - Rumble works on these controllers too, where the system supports it.
 - The log names every controller found, with its USB vendor and product id.
+
+## 0040 - PlayStation controllers read directly (Windows)
+
+- Windows.Gaming.Input did not report a DualSense on a tester's laptop (the v1.3 log listed no
+  controller at all), so PlayStation pads are now read straight from their HID reports, as SDL
+  and Steam do: DualSense, DualSense Edge and DualShock 4, by USB or Bluetooth (over Bluetooth
+  the pad is asked for its calibration, which switches it to full reports). Rumble by USB.
+- Order on Windows: XInput, then a PlayStation pad, then any other controller through gilrs.
+- The log says which controller was found and how, and says so when gilrs finds none at start.

@@ -1,0 +1,414 @@
+From e8feee53c215d9375cec586e896e743885d8c305 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 08:12:21 -0700
+Subject: [PATCH] Read DualSense and DualShock 4 directly over HID on Windows
+
+---
+ Cargo.lock               |  26 ++++-
+ crates/rt/Cargo.toml     |   3 +
+ crates/rt/src/input.rs   |  14 ++-
+ crates/rt/src/lib.rs     |   2 +
+ crates/rt/src/ps_pads.rs | 239 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 275 insertions(+), 9 deletions(-)
+ create mode 100644 crates/rt/src/ps_pads.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 17e566b..0526afb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -219,7 +219,7 @@ dependencies = [
+  "objc2-foundation 0.3.2",
+  "parking_lot",
+  "percent-encoding",
+- "windows-sys 0.61.2",
++ "windows-sys 0.52.0",
+  "x11rb",
+ ]
+ 
+@@ -1395,7 +1395,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.61.2",
++ "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+@@ -1883,6 +1883,19 @@ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+ 
++[[package]]
++name = "hidapi"
++version = "2.6.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6"
++dependencies = [
++ "cc",
++ "cfg-if",
++ "libc",
++ "pkg-config",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "icu_collections"
+ version = "2.4.0"
+@@ -2216,6 +2229,7 @@ dependencies = [
+  "ash",
+  "cpal",
+  "gilrs",
++ "hidapi",
+  "kirikae-a64",
+  "kirikae-loader",
+  "kirikae-maxwell",
+@@ -3467,7 +3481,7 @@ dependencies = [
+  "errno",
+  "libc",
+  "linux-raw-sys 0.12.1",
+- "windows-sys 0.61.2",
++ "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+@@ -3857,10 +3871,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+ dependencies = [
+  "fastrand",
+- "getrandom 0.4.3",
++ "getrandom 0.3.4",
+  "once_cell",
+  "rustix 1.1.5",
+- "windows-sys 0.61.2",
++ "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+@@ -4575,7 +4589,7 @@ version = "0.1.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+ dependencies = [
+- "windows-sys 0.61.2",
++ "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+diff --git a/crates/rt/Cargo.toml b/crates/rt/Cargo.toml
+index b4992d6..17ff453 100644
+--- a/crates/rt/Cargo.toml
++++ b/crates/rt/Cargo.toml
+@@ -25,6 +25,9 @@ h264 = ["dep:openh264"]
+ [dependencies.gilrs]
+ version = "0.11"
+ 
++[target.'cfg(windows)'.dependencies]
++hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
++
+ [target.'cfg(unix)'.dependencies]
+ libc = "0.2"
+ 
+diff --git a/crates/rt/src/input.rs b/crates/rt/src/input.rs
+index 15ca642..d650a11 100644
+--- a/crates/rt/src/input.rs
++++ b/crates/rt/src/input.rs
+@@ -255,6 +255,7 @@ mod gamepad {
+ 
+     pub fn rumble(low: f32, high: f32) {
+         super::hid_pads::rumble(low, high);
++        crate::ps_pads::rumble(low, high);
+         let mut pads = PADS.lock().unwrap();
+         let Some(pads) = pads.as_mut() else { return };
+         let (Some(set), Some(i)) = (pads.set_state, pads.active) else { return };
+@@ -267,11 +268,13 @@ mod gamepad {
+         }
+     }
+ 
+-    /// An XInput controller (Xbox pads, and anything Steam Input presents as one), otherwise any
+-    /// other controller (PlayStation, Switch Pro, generic HID) through Windows.Gaming.Input.
++    /// An XInput controller (Xbox pads, and anything Steam Input presents as one), then a
++    /// PlayStation controller read directly, then any other controller (Switch Pro, 8BitDo,
++    /// generic HID) through Windows.Gaming.Input.
+     pub fn poll() -> Option<RawPad> {
+         let hid = super::hid_pads::poll();
+-        xinput().or(hid)
++        let ps = crate::ps_pads::poll();
++        xinput().or(ps).or(hid)
+     }
+ 
+     fn xinput() -> Option<RawPad> {
+@@ -364,9 +367,14 @@ mod hid_pads {
+                 return;
+             }
+         };
++        let mut found = 0;
+         for (_, g) in gilrs.gamepads() {
++            found += 1;
+             eprintln!("kirikae: controller: {} ({:04x}:{:04x})", g.name(), g.vendor_id().unwrap_or(0), g.product_id().unwrap_or(0));
+         }
++        if found == 0 {
++            eprintln!("kirikae: controllers: none found at start (connected ones are logged as they appear)");
++        }
+         // The pad in use: the one a button or stick last moved on, so a second controller left
+         // switched on (or the Steam Deck's own controls) does not take over.
+         let mut active: Option<GamepadId> = None;
+diff --git a/crates/rt/src/lib.rs b/crates/rt/src/lib.rs
+index e3b6f24..8860363 100644
+--- a/crates/rt/src/lib.rs
++++ b/crates/rt/src/lib.rs
+@@ -21,6 +21,8 @@ pub mod sampler;
+ pub mod horizon;
+ pub mod host1x;
+ pub mod input;
++#[cfg(windows)]
++mod ps_pads;
+ pub mod interp;
+ pub mod ipc;
+ pub mod kernel;
+diff --git a/crates/rt/src/ps_pads.rs b/crates/rt/src/ps_pads.rs
+new file mode 100644
+index 0000000..a09152f
+--- /dev/null
++++ b/crates/rt/src/ps_pads.rs
+@@ -0,0 +1,239 @@
++//! PlayStation controllers read directly over HID (Windows): DualSense, DualSense Edge and
++//! DualShock 4, by USB or Bluetooth. Windows.Gaming.Input does not report these on every system,
++//! and XInput never does, so without this a PlayStation pad only worked through Steam Input.
++//! The report layouts are the ones Sony's controllers send (the same ones SDL and Linux's
++//! hid-playstation driver read).
++
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++use hidapi::{HidApi, HidDevice};
++
++use crate::bindings::{RawPad, xb};
++
++const SONY: u16 = 0x054c;
++
++#[derive(Clone, Copy, PartialEq)]
++enum Kind {
++    DualSense,
++    DualShock4,
++}
++
++fn kind(product: u16) -> Option<Kind> {
++    match product {
++        0x0ce6 | 0x0df2 => Some(Kind::DualSense),
++        0x05c4 | 0x09cc | 0x0ba0 => Some(Kind::DualShock4),
++        _ => None,
++    }
++}
++
++static STATE: Mutex<Option<RawPad>> = Mutex::new(None);
++static MOTORS: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
++
++pub fn rumble(low: f32, high: f32) {
++    *MOTORS.lock().unwrap() = (low, high);
++}
++
++pub fn poll() -> Option<RawPad> {
++    static STARTED: OnceLock<()> = OnceLock::new();
++    STARTED.get_or_init(|| {
++        let _ = std::thread::Builder::new().name("kirikae-ps-pad".into()).spawn(run);
++    });
++    *STATE.lock().unwrap()
++}
++
++/// The sticks, triggers and buttons of a full input report, from the left stick X byte on (the
++/// DualSense and the DualShock 4 order these differently).
++fn parse(kind: Kind, d: &[u8]) -> Option<RawPad> {
++    // (lx, ly, rx, ry, l2, r2, buttons0, buttons1, buttons2)
++    let (lx, ly, rx, ry, l2, r2, b0, b1, b2) = match kind {
++        Kind::DualSense if d.len() >= 10 => (d[0], d[1], d[2], d[3], d[4], d[5], d[7], d[8], d[9]),
++        Kind::DualShock4 if d.len() >= 9 => (d[0], d[1], d[2], d[3], d[7], d[8], d[4], d[5], d[6]),
++        _ => return None,
++    };
++    let mut buttons = match b0 & 0x0f {
++        0 => xb::DPUP,
++        1 => xb::DPUP | xb::DPRIGHT,
++        2 => xb::DPRIGHT,
++        3 => xb::DPDOWN | xb::DPRIGHT,
++        4 => xb::DPDOWN,
++        5 => xb::DPDOWN | xb::DPLEFT,
++        6 => xb::DPLEFT,
++        7 => xb::DPUP | xb::DPLEFT,
++        _ => 0,
++    };
++    for (bit, b) in [(0x10, xb::X), (0x20, xb::A), (0x40, xb::B), (0x80, xb::Y)] {
++        if b0 & bit != 0 {
++            buttons |= b;
++        }
++    }
++    for (bit, b) in [(0x01, xb::LB), (0x02, xb::RB), (0x10, xb::BACK), (0x20, xb::START), (0x40, xb::LSTICK), (0x80, xb::RSTICK)] {
++        if b1 & bit != 0 {
++            buttons |= b;
++        }
++    }
++    let _ = b2; // PS button, touchpad click, mute: nothing on the Switch side to give them.
++    let x = |v: u8| ((v as i32 - 128) * 256).clamp(-32767, 32767) as i16;
++    let y = |v: u8| ((128 - v as i32) * 256).clamp(-32767, 32767) as i16;
++    Some(RawPad { buttons, lt: l2, rt: r2, lx: x(lx), ly: y(ly), rx: x(rx), ry: y(ry) })
++}
++
++/// One input report: the pad state, or None for a report that carries none.
++fn read_report(kind: Kind, r: &[u8]) -> Option<RawPad> {
++    match (kind, r.first()?) {
++        // USB, and the DualSense's full Bluetooth report (one header byte more).
++        (Kind::DualSense, 0x01) if r.len() >= 11 => parse(kind, &r[1..]),
++        (Kind::DualSense, 0x31) => parse(kind, r.get(2..)?),
++        (Kind::DualShock4, 0x01) => parse(kind, &r[1..]),
++        (Kind::DualShock4, 0x11) => parse(kind, r.get(3..)?),
++        _ => None,
++    }
++}
++
++/// The DualSense's short Bluetooth report (sent until the controller is asked for its full
++/// reports): sticks, then buttons, then triggers.
++fn read_short_bt(r: &[u8]) -> Option<RawPad> {
++    if r.len() < 10 || r[0] != 0x01 {
++        return None;
++    }
++    let d = [r[1], r[2], r[3], r[4], r[8], r[9], 0, r[5], r[6], r[7]];
++    parse(Kind::DualSense, &d)
++}
++
++struct Open {
++    dev: HidDevice,
++    kind: Kind,
++    bluetooth: bool,
++    motors: (f32, f32),
++}
++
++fn open(api: &mut HidApi) -> Option<Open> {
++    let _ = api.refresh_devices();
++    for info in api.device_list() {
++        if info.vendor_id() != SONY {
++            continue;
++        }
++        let Some(kind) = kind(info.product_id()) else { continue };
++        let Ok(dev) = info.open_device(api) else { continue };
++        let bluetooth = matches!(info.bus_type(), hidapi::BusType::Bluetooth);
++        // Over Bluetooth both pads send a short report until their calibration is read; reading
++        // it switches them to the full report.
++        if bluetooth {
++            let mut buf = [0u8; 64];
++            buf[0] = if kind == Kind::DualSense { 0x05 } else { 0x02 };
++            let _ = dev.get_feature_report(&mut buf);
++        }
++        let name = if kind == Kind::DualSense { "DualSense" } else { "DualShock 4" };
++        eprintln!(
++            "kirikae: controller: {name} ({:04x}:{:04x}) by {}, read directly",
++            info.vendor_id(),
++            info.product_id(),
++            if bluetooth { "Bluetooth" } else { "USB" }
++        );
++        return Some(Open { dev, kind, bluetooth, motors: (0.0, 0.0) });
++    }
++    None
++}
++
++fn apply_rumble(p: &mut Open) {
++    let wanted = *MOTORS.lock().unwrap();
++    if wanted == p.motors || p.bluetooth {
++        // Bluetooth output reports need a checksum and a different layout; rumble is USB only.
++        return;
++    }
++    p.motors = wanted;
++    let strong = (wanted.0.clamp(0.0, 1.0) * 255.0) as u8;
++    let weak = (wanted.1.clamp(0.0, 1.0) * 255.0) as u8;
++    let _ = match p.kind {
++        Kind::DualSense => {
++            let mut r = [0u8; 48];
++            r[0] = 0x02;
++            r[1] = 0x03; // rumble emulation, motor values below are valid
++            r[3] = weak;
++            r[4] = strong;
++            p.dev.write(&r)
++        }
++        Kind::DualShock4 => {
++            let mut r = [0u8; 32];
++            r[0] = 0x05;
++            r[1] = 0x01; // motors only (leave the light bar alone)
++            r[4] = weak;
++            r[5] = strong;
++            p.dev.write(&r)
++        }
++    };
++}
++
++fn run() {
++    let mut api = match HidApi::new() {
++        Ok(a) => a,
++        Err(e) => {
++            eprintln!("kirikae: PlayStation controllers unavailable ({e})");
++            return;
++        }
++    };
++    let mut pad: Option<Open> = None;
++    let mut last_look = Instant::now() - Duration::from_secs(10);
++    let mut buf = [0u8; 128];
++    loop {
++        let Some(p) = pad.as_mut() else {
++            *STATE.lock().unwrap() = None;
++            if last_look.elapsed() >= Duration::from_secs(2) {
++                last_look = Instant::now();
++                pad = open(&mut api);
++            } else {
++                std::thread::sleep(Duration::from_millis(100));
++            }
++            continue;
++        };
++        match p.dev.read_timeout(&mut buf, 50) {
++            Ok(0) => {}
++            Ok(n) => {
++                let r = &buf[..n];
++                let state = read_report(p.kind, r).or_else(|| if p.bluetooth && p.kind == Kind::DualSense { read_short_bt(r) } else { None });
++                if let Some(s) = state {
++                    *STATE.lock().unwrap() = Some(s);
++                }
++            }
++            Err(_) => {
++                eprintln!("kirikae: controller: PlayStation controller disconnected");
++                pad = None;
++                continue;
++            }
++        }
++        apply_rumble(p);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn dualsense_usb_cross_and_dpad() {
++        let mut r = [0u8; 64];
++        r[0] = 0x01;
++        r[1..5].copy_from_slice(&[128, 0, 128, 255]);
++        r[5] = 255; // L2
++        r[8] = 0x20 | 2; // cross, d-pad right
++        r[9] = 0x20; // options
++        let p = read_report(Kind::DualSense, &r).unwrap();
++        assert_eq!(p.buttons, xb::A | xb::DPRIGHT | xb::START);
++        assert_eq!(p.lt, 255);
++        assert!(p.ly > 32000 && p.ry < -32000);
++    }
++
++    #[test]
++    fn dualshock4_usb_circle_r1() {
++        let mut r = [0u8; 64];
++        r[0] = 0x01;
++        r[1..5].copy_from_slice(&[255, 128, 128, 128]);
++        r[5] = 0x40 | 8; // circle, d-pad released
++        r[6] = 0x02; // R1
++        r[9] = 200; // R2
++        let p = read_report(Kind::DualShock4, &r).unwrap();
++        assert_eq!(p.buttons, xb::B | xb::RB);
++        assert_eq!(p.rt, 200);
++        assert!(p.lx > 32000);
++    }
++}
+-- 
+2.43.0
+
